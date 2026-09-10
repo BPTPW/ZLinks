@@ -10,6 +10,10 @@ import SwiftUI
 struct MainTabView: View {
     var body: some View {
         TabView {
+            MyCameraView()
+                .tabItem {
+                    Label("我的相机", systemImage: "camera.fill")
+                }
             GalleryView()
                 .tabItem {
                     Label("图库", systemImage: "photo.on.rectangle")
@@ -19,30 +23,7 @@ struct MainTabView: View {
                 .tabItem {
                     Label("拍摄", systemImage: "camera.aperture")
                 }
-
-            MyCameraView()
-                .tabItem {
-                    Label("我的相机", systemImage: "camera.fill")
-                }
         }
-    }
-}
-
-struct GalleryView: View {
-    var body: some View {
-        Color.clear
-    }
-}
-
-struct CaptureView: View {
-    var body: some View {
-        Color.clear
-    }
-}
-
-struct MyCameraView: View {
-    var body: some View {
-        Color.clear
     }
 }
 
