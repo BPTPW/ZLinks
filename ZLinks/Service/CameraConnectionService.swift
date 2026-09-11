@@ -76,6 +76,7 @@ final class CameraConnectionService: ObservableObject {
         var handle: UInt32 { id }
         var filename: String
         var objectFormat: UInt16
+        var fileSize: UInt64
         var isVideo: Bool
         var captureDate: Date?
         var durationSeconds: Int?
@@ -344,6 +345,21 @@ final class CameraConnectionService: ObservableObject {
             return UIImage(data: data)
         } catch {
             appendLog("[图库] 缩略图异常 \(galleryItemLabel(handle: handle, filename: filename)) error=\(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Downloads the original object bytes without decoding or recompressing them.
+    func objectData(for handle: UInt32) async -> Data? {
+        if let cached = objectImageCache[handle] { return cached }
+        guard case .connected = state, let commandConnection else { return nil }
+        do {
+            let response = try await operation(.getObject, parameters: [handle], dataPhase: .receive, on: commandConnection, logStyle: .silent)
+            guard response.code == PTPResponseCode.ok.rawValue, let data = response.data, !data.isEmpty else { return nil }
+            objectImageCache[handle] = data
+            return data
+        } catch {
+            appendLog("[图库] 原始文件下载失败 handle=0x\(String(format: "%08X", handle)) error=\(error.localizedDescription)")
             return nil
         }
     }
@@ -807,6 +823,7 @@ final class CameraConnectionService: ObservableObject {
                         id: handle,
                         filename: info.filename,
                         objectFormat: info.objectFormat,
+                        fileSize: info.fileSize,
                         isVideo: isVideo,
                         captureDate: info.captureDate ?? info.modificationDate,
                         durationSeconds: isVideo ? durationCache[handle] : nil
@@ -924,6 +941,7 @@ final class CameraConnectionService: ObservableObject {
 
     private struct ParsedObjectInfo {
         var objectFormat: UInt16
+        var fileSize: UInt64
         var filename: String
         var captureDate: Date?
         var modificationDate: Date?
@@ -953,6 +971,7 @@ final class CameraConnectionService: ObservableObject {
         }
 
         let objectFormat = data.uint16(at: 4)
+        let fileSize = UInt64(data.uint32(at: 8))
         var offset = 52
         let filename = try readPTPString(from: data, offset: offset)
         offset = filename.nextOffset
@@ -962,6 +981,7 @@ final class CameraConnectionService: ObservableObject {
 
         return ParsedObjectInfo(
             objectFormat: objectFormat,
+            fileSize: fileSize,
             filename: filename.value,
             captureDate: parsePTPDateTime(captureDate.value),
             modificationDate: parsePTPDateTime(modificationDate.value)

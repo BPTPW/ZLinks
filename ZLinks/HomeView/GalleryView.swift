@@ -5,6 +5,8 @@
 
 import SwiftUI
 import UIKit
+import Photos
+import UniformTypeIdentifiers
 
 struct GalleryView: View {
     @EnvironmentObject private var camera: CameraConnectionService
@@ -17,6 +19,11 @@ struct GalleryView: View {
     @State private var isThumbnailPumpRunning = false
     @State private var selectedDirectoryID: UInt32?
     @State private var isDirectorySwitching = false
+    @State private var isSelectionMode = false
+    @State private var selectedHandles: Set<UInt32> = []
+    @State private var isTransferPresented = false
+    @State private var transferItems: [CameraConnectionService.GalleryItem] = []
+    @State private var transferRequiresConfirmation = false
     @State private var selectedItem: CameraConnectionService.GalleryItem?
     @Namespace private var galleryTransition
 
@@ -54,18 +61,17 @@ struct GalleryView: View {
                     directoryPicker
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        Task { await reloadGallery(force: true) }
-                    } label: {
-                        if isRefreshing && !isDirectorySwitching {
-                            ProgressView()
-                        } else {
-                            Image(systemName: "arrow.clockwise")
-                                .font(.body.weight(.semibold))
+                    if isSelectionMode {
+                        Button { exitSelectionMode() } label: { Image(systemName: "xmark") }
+                            .accessibilityLabel("取消多选")
+                    } else {
+                        HStack(spacing: 20) {
+                            Button { enterSelectionMode() } label: { Image(systemName: "checkmark.circle") }
+                            Button { Task { await reloadGallery(force: true) } } label: { Image(systemName: "arrow.clockwise") }
+                                .disabled(!isConnected || isRefreshing || isDirectorySwitching)
                         }
+                        .padding(.horizontal, 6)
                     }
-                    .disabled(!isConnected || isRefreshing || isDirectorySwitching)
-                    .accessibilityLabel("刷新图库")
                 }
             }
             .task(id: connectionTaskID) {
@@ -76,11 +82,18 @@ struct GalleryView: View {
                     selectedDirectoryID = newValue
                 }
             }
+            .toolbar(isSelectionMode ? .hidden : .automatic, for: .tabBar)
+            .safeAreaInset(edge: .bottom) {
+                if isSelectionMode { selectionToolbar }
+            }
+            .sheet(isPresented: $isTransferPresented) {
+                TransferSheet(items: transferItems, camera: camera, requiresConfirmation: transferRequiresConfirmation).id(transferItems.map(\.handle).map(String.init).joined(separator: ","))
+            }
             .navigationDestination(item: $selectedItem) { item in
                 GalleryPreviewView(
                     item: item,
                     thumbnail: thumbnailImages[item.handle],
-                    camera: camera
+                    camera: camera, onSave: { startTransfer(items: [item], requiresConfirmation: false) }
                 )
                 .toolbar(.hidden, for: .navigationBar)
                 .toolbar(.hidden, for: .tabBar)
@@ -173,7 +186,9 @@ struct GalleryView: View {
                             item: item,
                             image: thumbnailImages[item.handle],
                             cornerRadius: cornerRadius,
-                            hasFailed: failedThumbnails.contains(item.handle)
+                            hasFailed: failedThumbnails.contains(item.handle),
+                            isSelected: selectedHandles.contains(item.handle),
+                            selectionMode: isSelectionMode
                         )
                         .frame(maxWidth: .infinity)
                         .aspectRatio(1, contentMode: .fit)
@@ -181,7 +196,14 @@ struct GalleryView: View {
                         .contentShape(Rectangle())
                         .matchedTransitionSource(id: item.handle, in: galleryTransition)
                         .onTapGesture {
-                            selectedItem = item
+                            if isSelectionMode {
+                                if item.isVideo { return }
+                                if selectedHandles.contains(item.handle) { selectedHandles.remove(item.handle) } else { selectedHandles.insert(item.handle) }
+                            } else { selectedItem = item }
+                        }
+                        .contextMenu {
+                            Button { enterSelectionMode(selecting: item.handle) } label: { Label("多选", systemImage: "checkmark.circle") }
+                            if !item.isVideo { Button { startTransfer(items: [item], requiresConfirmation: false) } label: { Label("下载", systemImage: "square.and.arrow.down") } }
                         }
                         .onAppear {
                             handleCellAppear(item)
@@ -199,6 +221,34 @@ struct GalleryView: View {
                 await reloadGallery(force: true)
             }
         }
+    }
+
+    private var selectionToolbar: some View {
+        HStack {
+            Button {
+                let items = camera.galleryItems.filter { selectedHandles.contains($0.handle) && !$0.isVideo }
+                guard !items.isEmpty else { return }
+                startTransfer(items: items, requiresConfirmation: true)
+            } label: { Image(systemName: "square.and.arrow.down") }
+            .buttonStyle(.glass)
+            .disabled(selectedHandles.isEmpty)
+            Spacer()
+        }
+        .padding(.horizontal, 20).frame(maxWidth: .infinity).frame(height: 49)
+        .background(.bar)
+    }
+
+    private func enterSelectionMode(selecting handle: UInt32? = nil) {
+        isSelectionMode = true
+        if let handle { selectedHandles.insert(handle) }
+    }
+    private func exitSelectionMode() { isSelectionMode = false; selectedHandles.removeAll() }
+    private func startTransfer(items: [CameraConnectionService.GalleryItem], requiresConfirmation: Bool) {
+        transferItems = items
+        transferRequiresConfirmation = requiresConfirmation
+        isTransferPresented = false
+        DispatchQueue.main.async { isTransferPresented = true }
+        exitSelectionMode()
     }
 
     private func statusPlaceholder(title: String, systemImage: String, message: String) -> some View {
@@ -337,6 +387,7 @@ private struct GalleryPreviewView: View {
     let item: CameraConnectionService.GalleryItem
     let thumbnail: UIImage?
     let camera: CameraConnectionService
+    let onSave: () -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var image: UIImage?
@@ -372,9 +423,9 @@ private struct GalleryPreviewView: View {
                             Button { dismiss() } label: {
                                 Image(systemName: "chevron.left")
                                     .font(.title3.weight(.semibold))
-                                    .frame(width: 44, height: 44)
-                                    .background(.ultraThinMaterial, in: Circle())
+                                    .frame(width: 32, height: 32)
                             }
+                            .buttonStyle(.glass)
                             .accessibilityLabel("返回图库")
                             Spacer()
                             Text(item.filename)
@@ -386,6 +437,10 @@ private struct GalleryPreviewView: View {
                         .padding(.horizontal, 16)
                         .padding(.top, 8)
                         Spacer()
+                        HStack {
+                            Button { onSave() } label: { Image(systemName: "square.and.arrow.down") }.buttonStyle(.glass)
+                            Spacer()
+                        }.padding(.horizontal, 16).padding(.bottom, 12)
                     }
                     .transition(.opacity)
                 }
@@ -498,6 +553,8 @@ private struct GalleryThumbnailCell: View {
     let image: UIImage?
     let cornerRadius: CGFloat
     let hasFailed: Bool
+    let isSelected: Bool
+    let selectionMode: Bool
 
     var body: some View {
         Rectangle()
@@ -521,6 +578,7 @@ private struct GalleryThumbnailCell: View {
                 }
             }
             .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .overlay { if selectionMode && isSelected { Color.white.opacity(0.42); Image(systemName: "checkmark.circle.fill").font(.title2).foregroundStyle(.blue).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing).padding(6) } }
             .overlay(alignment: .bottomTrailing) {
                 if item.isVideo {
                     Text(Self.durationText(for: item.durationSeconds))
@@ -557,4 +615,71 @@ private struct GalleryThumbnailCell: View {
 #Preview {
     GalleryView()
         .environmentObject(CameraConnectionService())
+}
+
+private struct TransferSheet: View {
+    let items: [CameraConnectionService.GalleryItem]
+    let camera: CameraConnectionService
+    let requiresConfirmation: Bool
+    @Environment(\.dismiss) private var dismiss
+    @State private var phase: Phase = .confirm
+    @State private var current = 0
+    @State private var received = 0
+    @State private var failed = 0
+    @State private var cancelled = 0
+    @State private var bytesReceived: UInt64 = 0
+    @State private var totalBytes: UInt64 = 0
+    @State private var currentName = ""
+    @State private var transferTask: Task<Void, Never>?
+    @State private var showCancelConfirmation = false
+    enum Phase { case confirm, transferring, completed }
+    init(items: [CameraConnectionService.GalleryItem], camera: CameraConnectionService, requiresConfirmation: Bool) { self.items = items; self.camera = camera; self.requiresConfirmation = requiresConfirmation; _phase = State(initialValue: requiresConfirmation ? .confirm : .transferring) }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 14) {
+                if phase == .confirm { Text("保存 \(items.count) 张图片到相册").font(.headline); Spacer(); Button("确认") { begin() }.buttonStyle(.borderedProminent); Button("取消") { dismiss() } }
+                else if phase == .transferring { transferringView }
+                else { Text("成功接收\(received)个文件 失败\(failed)个\(cancelled > 0 ? " 取消传输\(cancelled)个" : "")").multilineTextAlignment(.center); Spacer(); Button("完成") { dismiss() }.buttonStyle(.borderedProminent) }
+            }.padding(20).navigationTitle(phase == .transferring ? "传输中" : phase == .completed ? "传输完成" : "确认下载").navigationBarTitleDisplayMode(.inline)
+        }.presentationDetents([.height(250)]).interactiveDismissDisabled(phase == .transferring)
+        .onAppear { if phase == .transferring && transferTask == nil { begin() } }
+        .onDisappear { transferTask?.cancel() }
+    }
+    private var progress: Double { totalBytes > 0 ? min(Double(bytesReceived) / Double(totalBytes), 1) : (items.isEmpty ? 0 : Double(current) / Double(items.count)) }
+    private var transferringView: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack { Text("已接收 \(received)/\(items.count)"); Spacer(); Text("\(Int(progress * 100))%") }
+            ProgressView(value: progress)
+            HStack { Text("正在接收 \(currentName)").lineLimit(1); Spacer(); Text("处理中") }.font(.caption)
+            Spacer()
+            HStack { Spacer(); Button("取消") { showCancelConfirmation = true } }
+                .confirmationDialog("取消传输？", isPresented: $showCancelConfirmation) {
+                    Button("取消传输", role: .destructive) { transferTask?.cancel(); cancelled = max(items.count - current, 0); phase = .completed }
+                    Button("继续传输", role: .cancel) {}
+                }
+        }
+    }
+    private func begin() {
+        phase = .transferring; current = 0; totalBytes = items.reduce(0) { $0 + $1.fileSize }
+        transferTask = Task { @MainActor in
+            let auth = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+            guard auth == .authorized || auth == .limited else { failed = items.count; phase = .completed; return }
+            for (index, item) in items.enumerated() {
+                if Task.isCancelled { cancelled = items.count - index; break }
+                current = index; currentName = item.filename
+                guard let data = await camera.objectData(for: item.handle) else { failed += 1; continue }
+                bytesReceived += UInt64(data.count)
+                let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + "-" + item.filename)
+                do { try data.write(to: url, options: .atomic); try await save(url: url); received += 1 } catch { failed += 1 }; try? FileManager.default.removeItem(at: url)
+            }
+            phase = .completed
+        }
+    }
+    private func save(url: URL) async throws {
+        try await PHPhotoLibrary.shared().performChanges {
+            let request = PHAssetCreationRequest.forAsset()
+            request.addResource(with: .photo, fileURL: url, options: nil)
+        }
+    }
 }
