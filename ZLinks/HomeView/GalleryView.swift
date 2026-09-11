@@ -477,7 +477,9 @@ struct GalleryView: View {
             guard visibleHandles.contains(item.handle) else { continue }
 
             if let image = await camera.thumbnailImage(for: item.thumbnailHandle) {
-                thumbnailImages[item.handle] = image
+                withAnimation(.easeIn(duration: 0.28)) {
+                    thumbnailImages[item.handle] = image
+                }
             } else if visibleHandles.contains(item.handle) {
                 failedThumbnails.insert(item.handle)
             }
@@ -587,35 +589,33 @@ private struct GalleryPreviewView: View {
 
                 if controlsVisible {
                     VStack {
-                        HStack(alignment: .top) {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Button { dismiss() } label: {
-                                    Image(systemName: "chevron.left")
-                                        .font(.title3.weight(.semibold))
-                                        .frame(width: 32, height: 32)
-                                        .foregroundStyle(.primary)
-                                }
-                                .buttonStyle(.plain)
-                                .frame(width: 42, height: 42)
-                                .glassEffect(.regular.interactive(), in: .circle)
-                                .accessibilityLabel("返回图库")
+                        ZStack(alignment: .top) {
+                            HStack(alignment: .top) {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Button { dismiss() } label: {
+                                        Image(systemName: "chevron.left")
+                                            .font(.title3.weight(.semibold))
+                                            .frame(width: 32, height: 32)
+                                            .foregroundStyle(.primary)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .frame(width: 42, height: 42)
+                                    .glassEffect(.regular.interactive(), in: .circle)
+                                    .accessibilityLabel("返回图库")
 
-                                if let format = item.photoFormat {
-                                    Text(format.title)
-                                        .font(.caption.weight(.semibold))
-                                        .foregroundStyle(.primary)
-                                        .padding(.horizontal, 10)
-                                        .padding(.vertical, 5)
-                                        .glassEffect(.regular, in: .capsule)
+                                    if let format = item.photoFormat {
+                                        Text(format.title)
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(.primary)
+                                            .padding(.horizontal, 10)
+                                            .padding(.vertical, 5)
+                                            .glassEffect(.regular, in: .capsule)
+                                    }
                                 }
+                                Spacer()
                             }
-                            Spacer()
-                            Text(item.filename)
-                                .font(.subheadline.weight(.medium))
-                                .lineLimit(1)
-                                .padding(.horizontal, 12)
+                            captureTimestampView
                         }
-                        .foregroundStyle(isImmersive ? .white : .primary)
                         .padding(.horizontal, 16)
                         .padding(.top, 8)
                         Spacer()
@@ -669,20 +669,86 @@ private struct GalleryPreviewView: View {
 
     private var isImmersive: Bool { scale > 1.01 || !controlsVisible }
 
+    @ViewBuilder
+    private var captureTimestampView: some View {
+        if let captureDateParts {
+            VStack() {
+                Text(captureDateParts.date)
+                    .font(.caption.weight(.semibold))
+                    
+                Text(captureDateParts.time)
+                    .font(.caption)
+            }
+            .fontDesign(.rounded)
+            .foregroundStyle(isImmersive ? .white : .primary)
+            .padding(.horizontal, 22)
+            .padding(.vertical, 7)
+            .glassEffect(.regular, in: .capsule)
+            .allowsHitTesting(false)
+        }
+    }
+
+    private var captureDateParts: (date: String, time: String)? {
+        guard let captureDate = item.captureDate else { return nil }
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .autoupdatingCurrent
+        let currentYear = calendar.component(.year, from: .now)
+        let captureYear = calendar.component(.year, from: captureDate)
+
+        let dateFormatter = DateFormatter()
+        dateFormatter.locale = Locale(identifier: "zh_CN")
+        dateFormatter.calendar = calendar
+        dateFormatter.timeZone = .autoupdatingCurrent
+        dateFormatter.dateFormat = captureYear == currentYear ? "MM月dd日" : "yyyy年MM月dd日"
+
+        let timeFormatter = DateFormatter()
+        timeFormatter.locale = chineseTimeLocale
+        timeFormatter.calendar = Calendar.autoupdatingCurrent
+        timeFormatter.timeZone = .autoupdatingCurrent
+        timeFormatter.dateStyle = .none
+        timeFormatter.timeStyle = .short
+
+        return (
+            dateFormatter.string(from: captureDate),
+            timeFormatter.string(from: captureDate)
+        )
+    }
+
+    private var chineseTimeLocale: Locale {
+        let hourCycle = Locale.autoupdatingCurrent.hourCycle
+        let hourCycleOverride: String
+
+        switch hourCycle {
+        case .oneToTwelve:
+            hourCycleOverride = "h12"
+        case .oneToTwentyFour, .zeroToTwentyThree:
+            hourCycleOverride = "h23"
+        @unknown default:
+            hourCycleOverride = "h23"
+        }
+
+        return Locale(identifier: "zh-Hans-CN@hours=\(hourCycleOverride)")
+    }
+
 
     @ViewBuilder
     private var previewImage: some View {
-        if let image = image ?? thumbnail {
-            Image(uiImage: image)
-                .resizable()
-                .scaledToFit()
-                .allowedDynamicRange(.high)
-                .overlay(alignment: .center) {
-                    if isLoading { Color.clear }
-                }
+        if let image {
+            renderedImage(image)
+                .transition(.opacity)
+        } else if let thumbnail {
+            renderedImage(thumbnail)
         } else {
             Color.clear
         }
+    }
+
+    private func renderedImage(_ image: UIImage) -> some View {
+        Image(uiImage: image)
+            .resizable()
+            .scaledToFit()
+            .allowedDynamicRange(.high)
     }
 
     private var magnificationGesture: some Gesture {
@@ -725,9 +791,11 @@ private struct GalleryPreviewView: View {
         Task {
             let loaded = await camera.objectImage(for: item.previewHandle)
             await MainActor.run {
-                image = loaded
-                hasLoadFailed = loaded == nil
-                isLoading = false
+                withAnimation(.easeIn(duration: 0.28)) {
+                    image = loaded
+                    hasLoadFailed = loaded == nil
+                    isLoading = false
+                }
             }
         }
     }
@@ -770,6 +838,7 @@ private struct GalleryThumbnailCell: View {
                             .scaledToFill()
                             .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
                             .clipped()
+                            .transition(.opacity)
                     } else if hasFailed {
                         Image(systemName: item.isVideo ? "video" : "photo")
                             .font(.system(size: 18, weight: .semibold))
