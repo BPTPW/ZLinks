@@ -109,6 +109,7 @@ final class CameraConnectionService: ObservableObject {
     @Published private(set) var selectedGalleryDirectoryID: UInt32?
     @Published private(set) var galleryItems: [GalleryItem] = []
     @Published private(set) var debugLog = ""
+    @Published private(set) var isReconnecting = false
 
     private var commandConnection: NWConnection?
     private var eventConnection: NWConnection?
@@ -119,14 +120,49 @@ final class CameraConnectionService: ObservableObject {
     private var thumbnailCache: [UInt32: Data] = [:]
     private var objectImageCache: [UInt32: Data] = [:]
     private var durationCache: [UInt32: Int] = [:]
+    private var lastEndpoint: NWEndpoint?
+    private var lastDisplayHost: String?
+    private var reconnectTask: Task<Void, Never>?
+    private var connectionGeneration = UUID()
+    private var foregroundObserver: NSObjectProtocol?
+
+    init() {
+        foregroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleAppDidBecomeActive()
+            }
+        }
+    }
+
+    deinit {
+        if let foregroundObserver {
+            NotificationCenter.default.removeObserver(foregroundObserver)
+        }
+    }
 
     func connect(host: String) async {
         await connect(endpoint: .hostPort(host: .init(host), port: 15740), displayHost: host)
     }
 
     func connect(endpoint: NWEndpoint, displayHost: String) async {
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        lastEndpoint = endpoint
+        lastDisplayHost = displayHost
+        await connect(endpoint: endpoint, displayHost: displayHost, preservingSession: false)
+    }
+
+    private func connect(endpoint: NWEndpoint, displayHost: String, preservingSession: Bool) async {
         appendLog("开始连接 endpoint=\(displayHost):15740")
-        disconnect()
+        if preservingSession {
+            disconnectConnections()
+        } else {
+            disconnect()
+        }
         state = .connecting
 
         do {
@@ -198,15 +234,24 @@ final class CameraConnectionService: ObservableObject {
             lensInfo = await readLensInfo(on: command)
             connectedHost = displayHost
             state = .connected
+            isReconnecting = false
             appendLog("连接成功")
         } catch {
             appendLog("连接失败 error=\(String(reflecting: error)) description=\(error.localizedDescription)")
             disconnectConnections()
-            state = .failed(error.localizedDescription)
+            if preservingSession {
+                state = .disconnected
+                isReconnecting = false
+            } else {
+                state = .failed(error.localizedDescription)
+            }
         }
     }
 
     func disconnect() {
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        isReconnecting = false
         disconnectConnections()
         cameraInfo = nil
         connectedHost = nil
@@ -219,6 +264,59 @@ final class CameraConnectionService: ObservableObject {
         objectImageCache = [:]
         durationCache = [:]
         state = .disconnected
+    }
+
+    private func handleAppDidBecomeActive() {
+        guard case .connected = state, reconnectTask == nil else { return }
+        let commandReady = commandConnection?.state == .ready
+        let eventReady = eventConnection?.state == .ready
+        guard !commandReady || !eventReady else { return }
+        beginAutomaticReconnect(reason: "应用回到前台后检测到连接已断开")
+    }
+
+    private func handleTransportFailure(_ connection: NWConnection, generation: UUID, reason: String) {
+        guard generation == connectionGeneration else { return }
+        guard commandConnection === connection || eventConnection === connection else { return }
+        guard case .connected = state else { return }
+        appendLog("检测到相机连接断开 reason=\(reason)")
+        beginAutomaticReconnect(reason: reason)
+    }
+
+    private func noteTransportError(_ connection: NWConnection, reason: String) {
+        handleTransportFailure(connection, generation: connectionGeneration, reason: reason)
+    }
+
+    private func beginAutomaticReconnect(reason: String) {
+        guard reconnectTask == nil, let endpoint = lastEndpoint, let displayHost = lastDisplayHost else {
+            state = .disconnected
+            return
+        }
+        reconnectTask = Task { [weak self] in
+            guard let self else { return }
+            self.isReconnecting = true
+            self.state = .connecting
+            self.appendLog("开始自动重连 reason=\(reason)")
+
+            for attempt in 1...3 {
+                if Task.isCancelled { return }
+                if attempt > 1 {
+                    try? await Task.sleep(for: .seconds(1))
+                }
+                self.appendLog("自动重连第 \(attempt)/3 次")
+                await self.connect(endpoint: endpoint, displayHost: displayHost, preservingSession: true)
+                if case .connected = self.state {
+                    self.reconnectTask = nil
+                    return
+                }
+                if attempt < 3 {
+                    self.state = .connecting
+                    self.isReconnecting = true
+                }
+            }
+
+            self.appendLog("自动重连失败，已变为未连接")
+            self.disconnect()
+        }
     }
 
     func refreshCameraStatus() async {
@@ -520,19 +618,28 @@ final class CameraConnectionService: ObservableObject {
     }
 
     private func start(_ connection: NWConnection) async throws {
+        let generation = connectionGeneration
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             connection.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
-                    Task { @MainActor in self.appendLog("NWConnection state=ready") }
+                    Task { @MainActor in
+                        self.appendLog("NWConnection state=ready")
+                    }
                     connection.stateUpdateHandler = nil
                     continuation.resume()
                 case .failed(let error):
-                    Task { @MainActor in self.appendLog("NWConnection state=failed error=\(String(reflecting: error))") }
+                    Task { @MainActor in
+                        self.appendLog("NWConnection state=failed error=\(String(reflecting: error))")
+                        self.handleTransportFailure(connection, generation: generation, reason: error.localizedDescription)
+                    }
                     connection.stateUpdateHandler = nil
                     continuation.resume(throwing: error)
                 case .cancelled:
-                    Task { @MainActor in self.appendLog("NWConnection state=cancelled") }
+                    Task { @MainActor in
+                        self.appendLog("NWConnection state=cancelled")
+                        self.handleTransportFailure(connection, generation: generation, reason: "连接已取消")
+                    }
                     connection.stateUpdateHandler = nil
                     continuation.resume(throwing: CameraConnectionError.connectionCancelled)
                 default:
@@ -540,6 +647,30 @@ final class CameraConnectionService: ObservableObject {
                 }
             }
             connection.start(queue: .main)
+        }
+        monitorConnection(connection)
+    }
+
+    private func monitorConnection(_ connection: NWConnection) {
+        let generation = connectionGeneration
+        connection.stateUpdateHandler = { [weak self, weak connection] state in
+            guard let self, let connection else { return }
+            switch state {
+            case .ready:
+                Task { @MainActor in self.appendLog("NWConnection state=ready") }
+            case .failed(let error):
+                Task { @MainActor in
+                    self.appendLog("NWConnection state=failed error=\(String(reflecting: error))")
+                    self.handleTransportFailure(connection, generation: generation, reason: error.localizedDescription)
+                }
+            case .cancelled:
+                Task { @MainActor in
+                    self.appendLog("NWConnection state=cancelled")
+                    self.handleTransportFailure(connection, generation: generation, reason: "连接已取消")
+                }
+            default:
+                break
+            }
         }
     }
 
@@ -552,14 +683,19 @@ final class CameraConnectionService: ObservableObject {
         case .silent:
             break
         }
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            connection.send(content: packet, completion: .contentProcessed { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume()
-                }
-            })
+        do {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                connection.send(content: packet, completion: .contentProcessed { error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume()
+                    }
+                })
+            }
+        } catch {
+            noteTransportError(connection, reason: error.localizedDescription)
+            throw error
         }
     }
 
@@ -588,16 +724,22 @@ final class CameraConnectionService: ObservableObject {
         var collected = Data()
         while collected.count < count {
             let remaining = count - collected.count
-            let chunk = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
-                connection.receive(minimumIncompleteLength: 1, maximumLength: remaining) { data, _, isComplete, error in
-                    if let error {
-                        continuation.resume(throwing: error)
-                    } else if let data, !data.isEmpty {
-                        continuation.resume(returning: data)
-                    } else if isComplete {
-                        continuation.resume(throwing: CameraConnectionError.connectionCancelled)
+            let chunk: Data
+            do {
+                chunk = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
+                    connection.receive(minimumIncompleteLength: 1, maximumLength: remaining) { data, _, isComplete, error in
+                        if let error {
+                            continuation.resume(throwing: error)
+                        } else if let data, !data.isEmpty {
+                            continuation.resume(returning: data)
+                        } else if isComplete {
+                            continuation.resume(throwing: CameraConnectionError.connectionCancelled)
+                        }
                     }
                 }
+            } catch {
+                noteTransportError(connection, reason: error.localizedDescription)
+                throw error
             }
             collected.append(chunk)
         }
@@ -605,6 +747,7 @@ final class CameraConnectionService: ObservableObject {
     }
 
     private func disconnectConnections() {
+        connectionGeneration = UUID()
         commandConnection?.cancel()
         eventConnection?.cancel()
         commandConnection = nil

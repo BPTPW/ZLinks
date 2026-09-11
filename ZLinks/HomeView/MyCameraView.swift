@@ -367,6 +367,9 @@ struct MyCameraView: View {
     }
 
     private var cameraSubtitle: String {
+        if camera.isReconnecting {
+            return "正在恢复与相机的连接"
+        }
         if let cameraInfo = camera.cameraInfo {
             return "\(cameraInfo.manufacturer) · \(cameraInfo.model)"
         }
@@ -402,7 +405,7 @@ struct MyCameraView: View {
         case .connected:
             return "已连接"
         case .connecting:
-            return "连接中"
+            return camera.isReconnecting ? "正在重连" : "连接中"
         case .disconnected:
             return "未连接"
         case .failed:
@@ -415,7 +418,7 @@ struct MyCameraView: View {
         case .connected:
             return "断开相机"
         case .connecting:
-            return "正在连接"
+            return camera.isReconnecting ? "正在重连" : "正在连接"
         case .disconnected, .failed:
             return "连接相机"
         }
