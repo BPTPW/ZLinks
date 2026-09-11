@@ -7,6 +7,9 @@ import Photos
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
+import ImageIO
+import MapKit
+import CoreLocation
 
 struct GalleryView: View {
     @EnvironmentObject private var camera: CameraConnectionService
@@ -569,6 +572,9 @@ private struct GalleryPreviewView: View {
     @State private var settledOffset: CGSize = .zero
     @State private var controlsVisible = true
     @State private var dragOffset: CGFloat = 0
+    @State private var isMetadataPresented = false
+    @State private var metadata: GalleryMetadata?
+    @State private var isMetadataLoading = false
 
     var body: some View {
         GeometryReader { proxy in
@@ -641,7 +647,22 @@ private struct GalleryPreviewView: View {
                                 .glassEffect(.regular.interactive(), in: .circle)
                             }
                             Spacer()
-                        }.padding(.horizontal, 16).padding(.bottom, 12)
+                            if !item.isVideo {
+                                Button {
+                                    isMetadataPresented = true
+                                } label: {
+                                    Image(systemName: "info")
+                                        .font(.body.weight(.semibold))
+                                        .foregroundStyle(.primary)
+                                }
+                                .buttonStyle(.plain)
+                                .frame(width: 42, height: 42)
+                                .glassEffect(.regular.interactive(), in: .circle)
+                                .accessibilityLabel("照片信息")
+                            }
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 12)
                     }
                     .transition(.opacity)
                 }
@@ -664,6 +685,15 @@ private struct GalleryPreviewView: View {
             .animation(.easeInOut(duration: 0.2), value: controlsVisible)
             .animation(.interactiveSpring(response: 0.28, dampingFraction: 0.82), value: dragOffset)
             .onChange(of: proxy.size) { _, _ in clampOffset() }
+            .sheet(isPresented: $isMetadataPresented) {
+                GalleryMetadataSheet(
+                    metadata: metadata,
+                    isLoading: isMetadataLoading
+                )
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+                .task { await loadMetadata() }
+            }
         }
     }
 
@@ -800,6 +830,21 @@ private struct GalleryPreviewView: View {
         }
     }
 
+    private func loadMetadata() async {
+        guard !isMetadataLoading else { return }
+        if metadata != nil { return }
+
+        isMetadataLoading = true
+        defer { isMetadataLoading = false }
+
+        guard let data = await camera.objectData(for: item.previewHandle) else {
+            metadata = GalleryMetadata(sections: [], coordinate: nil)
+            return
+        }
+
+        metadata = GalleryMetadataParser.parse(data: data)
+    }
+
     private func toggleControls() {
         withAnimation { controlsVisible.toggle() }
     }
@@ -816,6 +861,332 @@ private struct GalleryPreviewView: View {
 
     private func clampOffset() {
         if scale <= 1.01 { offset = .zero; settledOffset = .zero }
+    }
+}
+
+private struct GalleryMetadata: Equatable {
+    struct Section: Identifiable, Equatable {
+        struct Row: Identifiable, Equatable {
+            let id: String
+            let label: String
+            let value: String
+        }
+
+        let id: String
+        let title: String
+        let rows: [Row]
+    }
+
+    let sections: [Section]
+    let coordinate: CLLocationCoordinate2D?
+
+    static func == (lhs: GalleryMetadata, rhs: GalleryMetadata) -> Bool {
+        lhs.sections == rhs.sections
+            && lhs.coordinate?.latitude == rhs.coordinate?.latitude
+            && lhs.coordinate?.longitude == rhs.coordinate?.longitude
+    }
+}
+
+private enum GalleryMetadataParser {
+    private struct Builder {
+        var rows: [GalleryMetadata.Section.Row] = []
+
+        mutating func add(_ label: String, _ value: String?) {
+            guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return }
+            rows.append(.init(id: label, label: label, value: value))
+        }
+    }
+
+    static func parse(data: Data) -> GalleryMetadata {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any]
+        else {
+            return GalleryMetadata(sections: [], coordinate: nil)
+        }
+
+        var sections: [GalleryMetadata.Section] = []
+        var gpsCoordinate: CLLocationCoordinate2D?
+
+        var image = Builder()
+        image.add("格式", imageFormat(CGImageSourceGetType(source)))
+        image.add("宽度", integerText(properties[kCGImagePropertyPixelWidth as String]))
+        image.add("高度", integerText(properties[kCGImagePropertyPixelHeight as String]))
+        image.add("位深", integerText(properties[kCGImagePropertyDepth as String]))
+        image.add("颜色模型", stringValue(properties[kCGImagePropertyColorModel as String]))
+        image.add("色彩空间", stringValue(properties[kCGImagePropertyProfileName as String]))
+        image.add("方向", orientationText(properties[kCGImagePropertyOrientation as String]))
+        appendSection(&sections, title: "图像", rows: image.rows)
+
+        if let tiff = dictionary(properties[kCGImagePropertyTIFFDictionary as String]) {
+            var builder = Builder()
+            builder.add("品牌", stringValue(tiff[kCGImagePropertyTIFFMake as String]))
+            builder.add("型号", stringValue(tiff[kCGImagePropertyTIFFModel as String]))
+            builder.add("软件", stringValue(tiff[kCGImagePropertyTIFFSoftware as String]))
+            builder.add("作者", stringValue(tiff[kCGImagePropertyTIFFArtist as String]))
+            builder.add("版权", stringValue(tiff[kCGImagePropertyTIFFCopyright as String]))
+            builder.add("拍摄时间", stringValue(tiff[kCGImagePropertyTIFFDateTime as String]))
+            appendSection(&sections, title: "相机", rows: builder.rows)
+        }
+
+        if let exif = dictionary(properties[kCGImagePropertyExifDictionary as String]) {
+            var builder = Builder()
+            builder.add("原始拍摄时间", stringValue(exif[kCGImagePropertyExifDateTimeOriginal as String]))
+            builder.add("数字化时间", stringValue(exif[kCGImagePropertyExifDateTimeDigitized as String]))
+            builder.add("曝光时间", exposureTimeText(exif[kCGImagePropertyExifExposureTime as String]))
+            builder.add("光圈", fNumberText(exif[kCGImagePropertyExifFNumber as String]))
+            builder.add("ISO", isoText(exif[kCGImagePropertyExifISOSpeedRatings as String]))
+            builder.add("焦距", focalLengthText(exif[kCGImagePropertyExifFocalLength as String]))
+            builder.add("35mm 等效焦距", focalLengthText(exif[kCGImagePropertyExifFocalLenIn35mmFilm as String]))
+            builder.add("曝光补偿", evText(exif[kCGImagePropertyExifExposureBiasValue as String]))
+            builder.add("测光模式", stringValue(exif[kCGImagePropertyExifMeteringMode as String]))
+            builder.add("闪光灯", stringValue(exif[kCGImagePropertyExifFlash as String]))
+            builder.add("白平衡", stringValue(exif[kCGImagePropertyExifWhiteBalance as String]))
+            builder.add("镜头品牌", stringValue(exif[kCGImagePropertyExifLensMake as String]))
+            builder.add("镜头型号", stringValue(exif[kCGImagePropertyExifLensModel as String]))
+            builder.add("镜头序列号", stringValue(exif[kCGImagePropertyExifLensSerialNumber as String]))
+            builder.add("机身序列号", stringValue(exif[kCGImagePropertyExifBodySerialNumber as String]))
+            builder.add("相机所有者", stringValue(exif[kCGImagePropertyExifCameraOwnerName as String]))
+            builder.add("用户备注", stringValue(exif[kCGImagePropertyExifUserComment as String]))
+            appendSection(&sections, title: "EXIF", rows: builder.rows)
+        }
+
+        if let gps = dictionary(properties[kCGImagePropertyGPSDictionary as String]) {
+            var builder = Builder()
+            let latitude = rationalCoordinate(gps[kCGImagePropertyGPSLatitude as String])
+            let longitude = rationalCoordinate(gps[kCGImagePropertyGPSLongitude as String])
+            let latitudeRef = stringValue(gps[kCGImagePropertyGPSLatitudeRef as String])?.uppercased()
+            let longitudeRef = stringValue(gps[kCGImagePropertyGPSLongitudeRef as String])?.uppercased()
+            let signedLatitude = signedCoordinate(latitude, reference: latitudeRef, negativeReference: "S")
+            let signedLongitude = signedCoordinate(longitude, reference: longitudeRef, negativeReference: "W")
+
+            if let signedLatitude, let signedLongitude,
+               (-90...90).contains(signedLatitude), (-180...180).contains(signedLongitude)
+            {
+                gpsCoordinate = CLLocationCoordinate2D(latitude: signedLatitude, longitude: signedLongitude)
+                builder.add("纬度", String(format: "%.6f° %@", abs(signedLatitude), signedLatitude < 0 ? "S" : "N"))
+                builder.add("经度", String(format: "%.6f° %@", abs(signedLongitude), signedLongitude < 0 ? "W" : "E"))
+            }
+            builder.add("海拔", distanceText(gps[kCGImagePropertyGPSAltitude as String], unit: "m"))
+            builder.add("GPS 时间", stringValue(gps[kCGImagePropertyGPSTimeStamp as String]))
+            builder.add("方向", angleText(gps[kCGImagePropertyGPSImgDirection as String]))
+            builder.add("定位误差", distanceText(gps[kCGImagePropertyGPSHPositioningError as String], unit: "m"))
+            appendSection(&sections, title: "GPS", rows: builder.rows)
+        }
+
+        if let iptc = dictionary(properties[kCGImagePropertyIPTCDictionary as String]) {
+            var builder = Builder()
+            builder.add("标题", stringValue(iptc[kCGImagePropertyIPTCHeadline as String]))
+            builder.add("说明", stringValue(iptc[kCGImagePropertyIPTCCaptionAbstract as String]))
+            builder.add("作者", stringValue(iptc[kCGImagePropertyIPTCByline as String]))
+            builder.add("城市", stringValue(iptc[kCGImagePropertyIPTCCity as String]))
+            builder.add("国家", stringValue(iptc[kCGImagePropertyIPTCCountryPrimaryLocationName as String]))
+            builder.add("关键词", stringValue(iptc[kCGImagePropertyIPTCKeywords as String]))
+            appendSection(&sections, title: "IPTC", rows: builder.rows)
+        }
+
+        return GalleryMetadata(sections: sections, coordinate: gpsCoordinate)
+    }
+
+    private static func appendSection(
+        _ sections: inout [GalleryMetadata.Section],
+        title: String,
+        rows: [GalleryMetadata.Section.Row]
+    ) {
+        guard !rows.isEmpty else { return }
+        sections.append(.init(id: title, title: title, rows: rows))
+    }
+
+    private static func dictionary(_ value: Any?) -> [String: Any]? {
+        guard let value else { return nil }
+        return (value as? NSDictionary) as? [String: Any]
+    }
+
+    private static func stringValue(_ value: Any?) -> String? {
+        if let string = value as? String { return string }
+        if let number = value as? NSNumber { return number.stringValue }
+        if let values = value as? [Any] {
+            let strings = values.compactMap { stringValue($0) }
+            return strings.isEmpty ? nil : strings.joined(separator: ", ")
+        }
+        return nil
+    }
+
+    private static func integerText(_ value: Any?) -> String? {
+        guard let number = value as? NSNumber else { return stringValue(value) }
+        return number.int64Value.formatted()
+    }
+
+    private static func imageFormat(_ type: CFString?) -> String? {
+        guard let type else { return nil }
+        let value = type as String
+        switch value.lowercased() {
+        case "public.jpeg": return "JPEG"
+        case "public.heic": return "HEIC"
+        case "public.tiff": return "TIFF"
+        case "com.adobe.raw-image": return "RAW"
+        default: return value
+        }
+    }
+
+    private static func orientationText(_ value: Any?) -> String? {
+        guard let number = value as? NSNumber else { return nil }
+        let names = [1: "正常", 2: "水平翻转", 3: "旋转 180°", 4: "垂直翻转", 5: "水平翻转并旋转 270°", 6: "旋转 90°", 7: "水平翻转并旋转 90°", 8: "旋转 270°"]
+        return names[number.intValue] ?? number.stringValue
+    }
+
+    private static func exposureTimeText(_ value: Any?) -> String? {
+        guard let seconds = rationalValue(value) else { return nil }
+        if seconds >= 1 { return String(format: "%.2f s", seconds) }
+        guard seconds > 0 else { return nil }
+        return String(format: "1/%d s", max(Int((1 / seconds).rounded()), 1))
+    }
+
+    private static func fNumberText(_ value: Any?) -> String? {
+        guard let value = rationalValue(value) else { return nil }
+        return String(format: "ƒ/%.1f", value)
+    }
+
+    private static func focalLengthText(_ value: Any?) -> String? {
+        guard let value = rationalValue(value) ?? doubleValue(value) else { return nil }
+        return String(format: "%.1f mm", value)
+    }
+
+    private static func isoText(_ value: Any?) -> String? {
+        if let values = value as? [Any], let first = values.first { return integerText(first) }
+        return integerText(value)
+    }
+
+    private static func evText(_ value: Any?) -> String? {
+        guard let value = rationalValue(value) else { return nil }
+        return String(format: "%+.2f EV", value)
+    }
+
+    private static func distanceText(_ value: Any?, unit: String) -> String? {
+        guard let value = rationalValue(value) ?? doubleValue(value) else { return nil }
+        return String(format: "%.1f %@", value, unit)
+    }
+
+    private static func angleText(_ value: Any?) -> String? {
+        guard let value = rationalValue(value) ?? doubleValue(value) else { return nil }
+        return String(format: "%.1f°", value)
+    }
+
+    private static func rationalCoordinate(_ value: Any?) -> Double? {
+        if let parts = value as? [Any], parts.count >= 3 {
+            let degrees = rationalValue(parts[0]) ?? 0
+            let minutes = rationalValue(parts[1]) ?? 0
+            let seconds = rationalValue(parts[2]) ?? 0
+            return degrees + minutes / 60 + seconds / 3600
+        }
+        return rationalValue(value) ?? doubleValue(value)
+    }
+
+    private static func signedCoordinate(_ value: Double?, reference: String?, negativeReference: String) -> Double? {
+        guard let value else { return nil }
+        return reference == negativeReference ? -abs(value) : abs(value)
+    }
+
+    private static func rationalValue(_ value: Any?) -> Double? {
+        if let number = value as? NSNumber { return number.doubleValue }
+        if let values = value as? [Any], values.count == 2,
+           let numerator = doubleValue(values[0]), let denominator = doubleValue(values[1]), denominator != 0
+        {
+            return numerator / denominator
+        }
+        if let dictionary = value as? [String: Any],
+           let numerator = doubleValue(dictionary["numerator"]),
+           let denominator = doubleValue(dictionary["denominator"]), denominator != 0
+        {
+            return numerator / denominator
+        }
+        return doubleValue(value)
+    }
+
+    private static func doubleValue(_ value: Any?) -> Double? {
+        if let number = value as? NSNumber { return number.doubleValue }
+        if let string = value as? String { return Double(string) }
+        return nil
+    }
+}
+
+private struct GalleryMetadataSheet: View {
+    let metadata: GalleryMetadata?
+    let isLoading: Bool
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if isLoading {
+                    ProgressView("正在解析照片信息…")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if let metadata, !metadata.sections.isEmpty {
+                    List {
+                        ForEach(metadata.sections) { section in
+                            Section(section.title) {
+                                ForEach(section.rows) { row in
+                                    LabeledContent(row.label) {
+                                        Text(row.value)
+                                            .multilineTextAlignment(.trailing)
+                                    }
+                                }
+                            }
+                        }
+
+                        if let coordinate = metadata.coordinate {
+                            GalleryMetadataMapView(coordinate: coordinate)
+                                .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
+                        }
+                    }
+                    .listStyle(.insetGrouped)
+                } else {
+                    ContentUnavailableView("没有可用信息", systemImage: "info.circle", description: Text("这张照片没有可解析的 EXIF 数据。"))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+            .navigationTitle("照片信息")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+}
+
+private struct GalleryMetadataMapView: View {
+    let coordinate: CLLocationCoordinate2D
+    @State private var placeName = "拍摄位置"
+
+    var body: some View {
+        Map(initialPosition: .region(
+            MKCoordinateRegion(
+                center: coordinate,
+                span: MKCoordinateSpan(latitudeDelta: 0.02, longitudeDelta: 0.02)
+            )
+        )) {
+            Marker(placeName, coordinate: coordinate)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 200)
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .task(id: coordinateIdentifier) {
+            if let name = await fetchPlaceName() {
+                placeName = name
+            }
+        }
+    }
+
+    private var coordinateIdentifier: String {
+        "\(coordinate.latitude),\(coordinate.longitude)"
+    }
+
+    private func fetchPlaceName() async -> String? {
+        let geocoder = CLGeocoder()
+        let location = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
+
+        do {
+            let placemarks = try await geocoder.reverseGeocodeLocation(location)
+            guard let placemark = placemarks.first else { return nil }
+            return placemark.name ?? placemark.locality
+        } catch {
+            return nil
+        }
     }
 }
 
