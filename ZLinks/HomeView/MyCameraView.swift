@@ -6,7 +6,7 @@
 import SwiftUI
 
 struct MyCameraView: View {
-    @StateObject private var camera = CameraConnectionService()
+    @EnvironmentObject private var camera: CameraConnectionService
     @State private var isConnectionSheetPresented = false
     @State private var isDebugLogPresented = false
 

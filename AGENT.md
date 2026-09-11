@@ -201,6 +201,19 @@ Joining a camera AP does not guarantee simultaneous cellular routing. `joinOnce`
 - `ZLinks/Service/CameraDiscoveryService.swift`: active-subnet discovery by TCP port probe.
 - `ZLinks/Service/CameraWiFiService.swift`: iOS-managed AP network join request.
 - `ZLinks/HomeView/MyCameraView.swift`: camera status UI, lens info card, connection sheet, and the full-screen connection log drawer opened from the toolbar info button.
+- `ZLinks/HomeView/GalleryView.swift`: camera storage gallery grid. Loads object handles/info over PTP, shows a 4-column newest-first thumbnail list, and overlays video duration when available.
+- `CameraConnectionService` is owned by `ZLinksApp` and shared across tabs through `environmentObject`.
+
+## Gallery / Media Listing
+
+Gallery browsing uses standard PTP operations after an existing session is open:
+
+1. `GetObjectHandles` (`0x1007`) for all objects on storage
+2. `GetObjectInfo` (`0x1008`) to filter media and sort by capture/modification date (newest first)
+3. `GetThumb` (`0x100A`) for JPEG thumbnails
+4. Optional MTP `GetObjectPropValue` (`0x9803`) with Duration `0xDC89` for video length
+
+Folders/associations are skipped. Image/video detection uses ObjectFormat plus filename extension (JPG/NEF/MOV/MP4, etc.). Thumbnail and duration requests share the command connection through a serial operation gate so concurrent cell loads cannot interleave PTP/IP transactions.
 
 ## Lens Info
 

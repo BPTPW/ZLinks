@@ -6,6 +6,7 @@
 import Foundation
 import Network
 import Combine
+import UIKit
 
 @MainActor
 final class CameraConnectionService: ObservableObject {
@@ -70,17 +71,32 @@ final class CameraConnectionService: ObservableObject {
         static let disconnected = LensInfo()
     }
 
+    struct GalleryItem: Identifiable, Equatable {
+        let id: UInt32
+        var handle: UInt32 { id }
+        var filename: String
+        var objectFormat: UInt16
+        var isVideo: Bool
+        var captureDate: Date?
+        var durationSeconds: Int?
+    }
+
     @Published private(set) var state: State = .disconnected
     @Published private(set) var cameraInfo: CameraInfo?
     @Published private(set) var connectedHost: String?
     @Published private(set) var cameraStatus = CameraStatus()
     @Published private(set) var lensInfo = LensInfo.disconnected
+    @Published private(set) var galleryItems: [GalleryItem] = []
     @Published private(set) var debugLog = ""
 
     private var commandConnection: NWConnection?
     private var eventConnection: NWConnection?
     private var connectionNumber: UInt32?
     private var transactionID: UInt32 = 0
+    private var isOperationBusy = false
+    private var operationWaiters: [CheckedContinuation<Void, Never>] = []
+    private var thumbnailCache: [UInt32: Data] = [:]
+    private var durationCache: [UInt32: Int] = [:]
 
     func connect(host: String) async {
         await connect(endpoint: .hostPort(host: .init(host), port: 15740), displayHost: host)
@@ -174,6 +190,9 @@ final class CameraConnectionService: ObservableObject {
         connectedHost = nil
         cameraStatus = CameraStatus()
         lensInfo = .disconnected
+        galleryItems = []
+        thumbnailCache = [:]
+        durationCache = [:]
         state = .disconnected
     }
 
@@ -184,6 +203,57 @@ final class CameraConnectionService: ObservableObject {
         lensInfo = await readLensInfo(on: commandConnection)
     }
 
+    func refreshGallery() async {
+        guard case .connected = state, let commandConnection else {
+            galleryItems = []
+            return
+        }
+
+        appendLog("开始刷新图库")
+        thumbnailCache = [:]
+        durationCache = [:]
+        do {
+            let items = try await loadGalleryItems(on: commandConnection)
+            galleryItems = items
+            appendLog("图库刷新完成 count=\(items.count) videos=\(items.filter(\.isVideo).count)")
+        } catch {
+            appendLog("图库刷新失败 error=\(String(reflecting: error)) description=\(error.localizedDescription)")
+        }
+    }
+
+    func thumbnailImage(for handle: UInt32) async -> UIImage? {
+        if let cached = thumbnailCache[handle], let image = UIImage(data: cached) {
+            return image
+        }
+        guard case .connected = state, let commandConnection else { return nil }
+
+        do {
+            let response = try await operation(
+                .getThumb,
+                parameters: [handle],
+                dataPhase: .receive,
+                on: commandConnection,
+                logPayloadHex: false
+            )
+            guard response.code == PTPResponseCode.ok.rawValue, let data = response.data, !data.isEmpty else {
+                return nil
+            }
+            thumbnailCache[handle] = data
+            return UIImage(data: data)
+        } catch {
+            appendLog("缩略图获取失败 handle=0x\(String(format: "%08X", handle)) error=\(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func videoDurationSeconds(for handle: UInt32) async -> Int? {
+        if let cached = durationCache[handle] {
+            return cached
+        }
+        guard case .connected = state, let commandConnection else { return nil }
+        return await fetchVideoDurationSeconds(handle: handle, on: commandConnection)
+    }
+
     func clearDebugLog() {
         debugLog = ""
     }
@@ -192,8 +262,12 @@ final class CameraConnectionService: ObservableObject {
         _ code: PTPOperationCode,
         parameters: [UInt32],
         dataPhase: DataPhase?,
-        on connection: NWConnection
+        on connection: NWConnection,
+        logPayloadHex: Bool = true
     ) async throws -> PTPResponse {
+        await acquireOperationSlot()
+        defer { releaseOperationSlot() }
+
         let currentTransactionID = max(transactionID &+ 1, 1)
         transactionID = currentTransactionID
 
@@ -212,11 +286,11 @@ final class CameraConnectionService: ObservableObject {
             operationPayload.append(uint32Data(parameter))
         }
         appendLog("[command] OperationRequest name=\(code.debugName) code=0x\(String(format: "%04X", code.rawValue)) transaction=\(currentTransactionID) parameters=\(parameters.map { String(format: "0x%08X", $0) }.joined(separator: ","))")
-        try await send(ptpIPPacket(type: .operationRequest, payload: operationPayload), on: connection)
+        try await send(ptpIPPacket(type: .operationRequest, payload: operationPayload), on: connection, logPayloadHex: logPayloadHex)
 
         var receivedData = Data()
         while true {
-            let packet = try await receivePacket(on: connection)
+            let packet = try await receivePacket(on: connection, logPayloadHex: logPayloadHex)
             switch packet.type {
             case PTPIPPacketType.startData.rawValue:
                 guard packet.payload.count >= 12 else {
@@ -286,8 +360,12 @@ final class CameraConnectionService: ObservableObject {
         }
     }
 
-    private func send(_ packet: Data, on connection: NWConnection) async throws {
-        appendLog("发送 PTP/IP type=\(packet.packetTypeName) totalBytes=\(packet.count) hex=\(packet.hexDump)")
+    private func send(_ packet: Data, on connection: NWConnection, logPayloadHex: Bool = true) async throws {
+        if logPayloadHex {
+            appendLog("发送 PTP/IP type=\(packet.packetTypeName) totalBytes=\(packet.count) hex=\(packet.hexDump)")
+        } else {
+            appendLog("发送 PTP/IP type=\(packet.packetTypeName) totalBytes=\(packet.count)")
+        }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             connection.send(content: packet, completion: .contentProcessed { error in
                 if let error {
@@ -299,7 +377,7 @@ final class CameraConnectionService: ObservableObject {
         }
     }
 
-    private func receivePacket(on connection: NWConnection) async throws -> PTPIPPacket {
+    private func receivePacket(on connection: NWConnection, logPayloadHex: Bool = true) async throws -> PTPIPPacket {
         let header = try await receiveExactly(8, on: connection)
         let totalLength = Int(header.uint32(at: 0))
         guard totalLength >= 8 else {
@@ -309,7 +387,11 @@ final class CameraConnectionService: ObservableObject {
         let type = header.uint32(at: 4)
         let payload = totalLength > 8 ? try await receiveExactly(totalLength - 8, on: connection) : Data()
         let packet = PTPIPPacket(type: type, payload: payload)
-        appendLog("接收 PTP/IP type=\(packet.typeName) totalBytes=\(totalLength) payloadBytes=\(payload.count) hex=\(packet.hexDump)")
+        if logPayloadHex {
+            appendLog("接收 PTP/IP type=\(packet.typeName) totalBytes=\(totalLength) payloadBytes=\(payload.count) hex=\(packet.hexDump)")
+        } else {
+            appendLog("接收 PTP/IP type=\(packet.typeName) totalBytes=\(totalLength) payloadBytes=\(payload.count)")
+        }
         return packet
     }
 
@@ -341,7 +423,270 @@ final class CameraConnectionService: ObservableObject {
         connectionNumber = nil
     }
 
-    private func readCameraStatus(on connection: NWConnection) async -> CameraStatus {
+    private func acquireOperationSlot() async {
+        if !isOperationBusy {
+            isOperationBusy = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            operationWaiters.append(continuation)
+        }
+    }
+
+    private func releaseOperationSlot() {
+        if operationWaiters.isEmpty {
+            isOperationBusy = false
+        } else {
+            let next = operationWaiters.removeFirst()
+            next.resume()
+        }
+    }
+
+    private func loadGalleryItems(on connection: NWConnection) async throws -> [GalleryItem] {
+        let handles = try await fetchObjectHandles(on: connection)
+        appendLog("图库 objectHandles count=\(handles.count)")
+
+        var items: [GalleryItem] = []
+        items.reserveCapacity(handles.count)
+
+        for handle in handles {
+            do {
+                guard let info = try await fetchObjectInfo(handle: handle, on: connection) else {
+                    continue
+                }
+                guard isGalleryMedia(objectFormat: info.objectFormat, filename: info.filename) else {
+                    continue
+                }
+
+                let isVideo = isVideoMedia(objectFormat: info.objectFormat, filename: info.filename)
+
+                items.append(
+                    GalleryItem(
+                        id: handle,
+                        filename: info.filename,
+                        objectFormat: info.objectFormat,
+                        isVideo: isVideo,
+                        captureDate: info.captureDate ?? info.modificationDate,
+                        durationSeconds: isVideo ? durationCache[handle] : nil
+                    )
+                )
+            } catch {
+                appendLog("ObjectInfo 跳过 handle=0x\(String(format: "%08X", handle)) error=\(error.localizedDescription)")
+                continue
+            }
+        }
+
+        items.sort { lhs, rhs in
+            switch (lhs.captureDate, rhs.captureDate) {
+            case let (l?, r?):
+                if l != r { return l > r }
+            case (_?, nil):
+                return true
+            case (nil, _?):
+                return false
+            case (nil, nil):
+                break
+            }
+            return lhs.handle > rhs.handle
+        }
+        return items
+    }
+
+    private func fetchObjectHandles(on connection: NWConnection) async throws -> [UInt32] {
+        // Prefer "all storages" query first; fall back to each StorageID if needed.
+        if let handles = try? await fetchObjectHandles(
+            storageID: 0xFFFF_FFFF,
+            on: connection
+        ), !handles.isEmpty {
+            return handles
+        }
+
+        let storageIDs = try await fetchStorageIDs(on: connection)
+        var handles: [UInt32] = []
+        for storageID in storageIDs {
+            let part = try await fetchObjectHandles(storageID: storageID, on: connection)
+            handles.append(contentsOf: part)
+        }
+        return handles
+    }
+
+    private func fetchStorageIDs(on connection: NWConnection) async throws -> [UInt32] {
+        let response = try await operation(
+            .getStorageIDs,
+            parameters: [],
+            dataPhase: .receive,
+            on: connection,
+            logPayloadHex: false
+        )
+        guard response.code == PTPResponseCode.ok.rawValue, let data = response.data, data.count >= 4 else {
+            throw CameraConnectionError.ptpResponse(response.code)
+        }
+        let count = Int(data.uint32(at: 0))
+        let needed = 4 + count * 4
+        guard count >= 0, data.count >= needed else {
+            throw CameraConnectionError.malformedPacket
+        }
+        return (0..<count).map { data.uint32(at: 4 + $0 * 4) }
+    }
+
+    private func fetchObjectHandles(storageID: UInt32, on connection: NWConnection) async throws -> [UInt32] {
+        // format all, association = entire hierarchy
+        let response = try await operation(
+            .getObjectHandles,
+            parameters: [storageID, 0x0000_0000, 0xFFFF_FFFF],
+            dataPhase: .receive,
+            on: connection,
+            logPayloadHex: false
+        )
+        guard response.code == PTPResponseCode.ok.rawValue, let data = response.data, data.count >= 4 else {
+            throw CameraConnectionError.ptpResponse(response.code)
+        }
+
+        let count = Int(data.uint32(at: 0))
+        let needed = 4 + count * 4
+        guard data.count >= needed else {
+            throw CameraConnectionError.malformedPacket
+        }
+
+        var handles: [UInt32] = []
+        handles.reserveCapacity(count)
+        for index in 0..<count {
+            handles.append(data.uint32(at: 4 + index * 4))
+        }
+        return handles
+    }
+
+    private struct ParsedObjectInfo {
+        var objectFormat: UInt16
+        var filename: String
+        var captureDate: Date?
+        var modificationDate: Date?
+    }
+
+    private func fetchObjectInfo(handle: UInt32, on connection: NWConnection) async throws -> ParsedObjectInfo? {
+        let response = try await operation(
+            .getObjectInfo,
+            parameters: [handle],
+            dataPhase: .receive,
+            on: connection,
+            logPayloadHex: false
+        )
+        guard response.code == PTPResponseCode.ok.rawValue, let data = response.data else {
+            return nil
+        }
+        return try parseObjectInfo(data)
+    }
+
+    private func parseObjectInfo(_ data: Data) throws -> ParsedObjectInfo {
+        // ObjectInfo fixed header is 52 bytes before Filename string.
+        guard data.count >= 52 else {
+            throw CameraConnectionError.malformedPacket
+        }
+
+        let objectFormat = data.uint16(at: 4)
+        var offset = 52
+        let filename = try readPTPString(from: data, offset: offset)
+        offset = filename.nextOffset
+        let captureDate = try readPTPString(from: data, offset: offset)
+        offset = captureDate.nextOffset
+        let modificationDate = try readPTPString(from: data, offset: offset)
+
+        return ParsedObjectInfo(
+            objectFormat: objectFormat,
+            filename: filename.value,
+            captureDate: parsePTPDateTime(captureDate.value),
+            modificationDate: parsePTPDateTime(modificationDate.value)
+        )
+    }
+
+    private func fetchVideoDurationSeconds(handle: UInt32, on connection: NWConnection) async -> Int? {
+        if let cached = durationCache[handle] {
+            return cached
+        }
+
+        // MTP ObjectPropCode Duration = 0xDC89, typically milliseconds.
+        guard let response = try? await operation(
+            .getObjectPropValue,
+            parameters: [handle, 0x0000_DC89],
+            dataPhase: .receive,
+            on: connection,
+            logPayloadHex: false
+        ), response.code == PTPResponseCode.ok.rawValue,
+           let data = response.data,
+           let raw = readIntegerValue(from: data),
+           raw > 0 else {
+            return nil
+        }
+
+        let seconds: Int
+        if raw >= 1000 {
+            seconds = Int(raw / 1000)
+        } else {
+            seconds = Int(raw)
+        }
+        durationCache[handle] = seconds
+        if let index = galleryItems.firstIndex(where: { $0.handle == handle }) {
+            var items = galleryItems
+            items[index].durationSeconds = seconds
+            galleryItems = items
+        }
+        return seconds
+    }
+
+    private func isGalleryMedia(objectFormat: UInt16, filename: String) -> Bool {
+        // Skip folders / associations and generic non-media scripts.
+        if objectFormat == 0x3001 || objectFormat == 0x3002 || objectFormat == 0x3006 {
+            return false
+        }
+        if isImageMedia(objectFormat: objectFormat, filename: filename) {
+            return true
+        }
+        if isVideoMedia(objectFormat: objectFormat, filename: filename) {
+            return true
+        }
+        return false
+    }
+
+    private func isImageMedia(objectFormat: UInt16, filename: String) -> Bool {
+        switch objectFormat {
+        case 0x3801, 0x3802, 0x3804, 0x3808, 0x380D, 0x3811, 0xB802, 0xB80A:
+            return true
+        default:
+            break
+        }
+        let ext = fileExtension(filename)
+        return ["JPG", "JPEG", "HEIC", "HEIF", "TIF", "TIFF", "PNG", "NEF", "NRW", "DNG", "CR2", "CR3", "ARW"].contains(ext)
+    }
+
+    private func isVideoMedia(objectFormat: UInt16, filename: String) -> Bool {
+        switch objectFormat {
+        case 0x3008, 0x3009, 0x300A, 0x300B, 0x300C, 0x300D, 0xB982, 0xB984:
+            return true
+        default:
+            break
+        }
+        let ext = fileExtension(filename)
+        return ["MOV", "MP4", "M4V", "AVI", "MPEG", "MPG", "MTS", "MXF"].contains(ext)
+    }
+
+    private func fileExtension(_ filename: String) -> String {
+        guard let dot = filename.lastIndex(of: ".") else { return "" }
+        return String(filename[filename.index(after: dot)...]).uppercased()
+    }
+
+    private func parsePTPDateTime(_ value: String) -> Date? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 15 else { return nil }
+        let core = String(trimmed.prefix(15))
+
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone.current
+        formatter.dateFormat = "yyyyMMdd'T'HHmmss"
+        return formatter.date(from: core)
+    }
+
+        private func readCameraStatus(on connection: NWConnection) async -> CameraStatus {
         var status = CameraStatus()
 
         // These are standard PTP properties. Nikon may omit one or expose a
@@ -731,7 +1076,11 @@ private enum PTPOperationCode: UInt16 {
     case getStorageIDs = 0x1004
     case getStorageInfo = 0x1005
     case getNumObjects = 0x1006
+    case getObjectHandles = 0x1007
+    case getObjectInfo = 0x1008
+    case getThumb = 0x100A
     case getDevicePropValue = 0x1015
+    case getObjectPropValue = 0x9803
 
     var debugName: String {
         switch self {
@@ -740,7 +1089,11 @@ private enum PTPOperationCode: UInt16 {
         case .getStorageIDs: return "GetStorageIDs"
         case .getStorageInfo: return "GetStorageInfo"
         case .getNumObjects: return "GetNumObjects"
+        case .getObjectHandles: return "GetObjectHandles"
+        case .getObjectInfo: return "GetObjectInfo"
+        case .getThumb: return "GetThumb"
         case .getDevicePropValue: return "GetDevicePropValue"
+        case .getObjectPropValue: return "GetObjectPropValue"
         }
     }
 }
@@ -812,7 +1165,7 @@ private func utf16NullTerminatedString(_ string: String) -> Data {
 
 private extension Data {
     var hexDump: String {
-        let limit = 4096
+        let limit = 256
         let bytes = prefix(limit).map { String(format: "%02X", $0) }.joined(separator: " ")
         return count > limit ? "\(bytes) ... [truncated, total=\(count)]" : bytes
     }

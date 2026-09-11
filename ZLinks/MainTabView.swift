@@ -8,6 +8,8 @@
 import SwiftUI
 
 struct MainTabView: View {
+    @EnvironmentObject private var camera: CameraConnectionService
+
     var body: some View {
         TabView {
             MyCameraView()
@@ -24,9 +26,11 @@ struct MainTabView: View {
                     Label("拍摄", systemImage: "camera.aperture")
                 }
         }
+        .environmentObject(camera)
     }
 }
 
 #Preview {
     MainTabView()
+        .environmentObject(CameraConnectionService())
 }
