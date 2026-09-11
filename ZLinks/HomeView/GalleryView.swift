@@ -15,6 +15,8 @@ struct GalleryView: View {
     @State private var failedThumbnails: Set<UInt32> = []
     @State private var visibleHandles: Set<UInt32> = []
     @State private var isThumbnailPumpRunning = false
+    @State private var selectedDirectoryID: UInt32?
+    @State private var isDirectorySwitching = false
 
     private let spacing: CGFloat = 3
     private let cornerRadius: CGFloat = 6
@@ -44,26 +46,67 @@ struct GalleryView: View {
                 }
             }
             .navigationTitle("图库")
-            .navigationBarTitleDisplayMode(.large)
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .principal) {
+                    directoryPicker
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         Task { await reloadGallery(force: true) }
                     } label: {
-                        if isRefreshing {
+                        if isRefreshing && !isDirectorySwitching {
                             ProgressView()
                         } else {
                             Image(systemName: "arrow.clockwise")
                                 .font(.body.weight(.semibold))
                         }
                     }
-                    .disabled(!isConnected || isRefreshing)
+                    .disabled(!isConnected || isRefreshing || isDirectorySwitching)
                     .accessibilityLabel("刷新图库")
                 }
             }
             .task(id: connectionTaskID) {
                 await reloadGallery(force: false)
             }
+            .onChange(of: camera.selectedGalleryDirectoryID) { _, newValue in
+                if selectedDirectoryID != newValue {
+                    selectedDirectoryID = newValue
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var directoryPicker: some View {
+        if isConnected, !camera.galleryDirectories.isEmpty {
+            Picker(
+                "目录",
+                selection: Binding(
+                    get: { selectedDirectoryID ?? camera.selectedGalleryDirectoryID },
+                    set: { newValue in
+                        guard let newValue else { return }
+                        guard newValue != selectedDirectoryID else { return }
+                        selectedDirectoryID = newValue
+                        Task { await switchDirectory(to: newValue) }
+                    }
+                )
+            ) {
+                ForEach(camera.galleryDirectories) { directory in
+                    Text(directory.pickerTitle)
+                        .tag(Optional(directory.id))
+                }
+            }
+            .pickerStyle(.menu)
+            .tint(.primary)
+            .disabled(isRefreshing || isDirectorySwitching)
+            .accessibilityLabel("选择图库目录")
+        } else if isConnected, isRefreshing {
+            ProgressView()
+                .controlSize(.small)
+        } else {
+            Text("图库")
+                .font(.headline)
         }
     }
 
@@ -89,8 +132,8 @@ struct GalleryView: View {
 
     @ViewBuilder
     private var connectedContent: some View {
-        if isRefreshing && camera.galleryItems.isEmpty {
-            ProgressView("正在读取图库…")
+        if (isRefreshing || isDirectorySwitching) && camera.galleryItems.isEmpty {
+            ProgressView(isDirectorySwitching ? "正在切换目录…" : "正在读取图库…")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if let loadError, camera.galleryItems.isEmpty {
             statusPlaceholder(
@@ -98,18 +141,22 @@ struct GalleryView: View {
                 systemImage: "exclamationmark.triangle",
                 message: loadError
             )
+        } else if camera.galleryDirectories.isEmpty {
+            statusPlaceholder(
+                title: "暂无目录",
+                systemImage: "folder",
+                message: "相机存储中没有可浏览的目录。"
+            )
         } else if camera.galleryItems.isEmpty {
             statusPlaceholder(
                 title: "暂无媒体",
                 systemImage: "photo",
-                message: "相机存储中没有可显示的照片或视频。"
+                message: "当前目录没有可显示的照片或视频。"
             )
         } else {
             ScrollView {
                 LazyVGrid(columns: columns, spacing: spacing) {
                     ForEach(camera.galleryItems) { item in
-                        // Outer size is owned by the grid column width; height is forced 1:1.
-                        // The image is only drawn inside and cannot change the cell size.
                         GalleryThumbnailCell(
                             item: item,
                             image: thumbnailImages[item.handle],
@@ -160,11 +207,13 @@ struct GalleryView: View {
             thumbnailImages = [:]
             failedThumbnails = []
             visibleHandles = []
+            selectedDirectoryID = nil
             loadError = nil
             return
         }
 
-        if !force, !camera.galleryItems.isEmpty {
+        if !force, !camera.galleryItems.isEmpty, !camera.galleryDirectories.isEmpty {
+            selectedDirectoryID = camera.selectedGalleryDirectoryID
             return
         }
 
@@ -172,23 +221,36 @@ struct GalleryView: View {
         loadError = nil
         defer { isRefreshing = false }
 
-        if force {
-            thumbnailImages = [:]
-            failedThumbnails = []
-            visibleHandles = []
+        thumbnailImages = [:]
+        failedThumbnails = []
+        visibleHandles = []
+
+        await camera.refreshGallery(selectingDirectoryID: selectedDirectoryID)
+        selectedDirectoryID = camera.selectedGalleryDirectoryID
+
+        if camera.galleryDirectories.isEmpty {
+            loadError = nil
         }
 
-        let previousHandles = Set(camera.galleryItems.map(\.handle))
-        await camera.refreshGallery()
+        await pumpVisibleThumbnails()
+    }
 
-        let currentHandles = Set(camera.galleryItems.map(\.handle))
-        let removed = previousHandles.subtracting(currentHandles)
-        for handle in removed {
-            thumbnailImages.removeValue(forKey: handle)
-            failedThumbnails.remove(handle)
-            visibleHandles.remove(handle)
-        }
+    @MainActor
+    private func switchDirectory(to directoryID: UInt32) async {
+        guard isConnected else { return }
+        guard !isDirectorySwitching else { return }
 
+        isDirectorySwitching = true
+        loadError = nil
+        defer { isDirectorySwitching = false }
+
+        // Clear UI immediately on switch.
+        thumbnailImages = [:]
+        failedThumbnails = []
+        visibleHandles = []
+
+        await camera.selectGalleryDirectory(id: directoryID)
+        selectedDirectoryID = camera.selectedGalleryDirectoryID
         await pumpVisibleThumbnails()
     }
 
@@ -213,7 +275,6 @@ struct GalleryView: View {
 
         while isConnected {
             guard let item = nextVisibleItemNeedingWork() else {
-                // Allow a concurrent onAppear to land before stopping the pump.
                 await Task.yield()
                 if nextVisibleItemNeedingWork() == nil {
                     break
@@ -230,7 +291,6 @@ struct GalleryView: View {
                 continue
             }
 
-            // Only fetch while the cell remains in the lazy viewport.
             guard visibleHandles.contains(item.handle) else { continue }
 
             if let image = await camera.thumbnailImage(for: item.handle) {
@@ -243,7 +303,6 @@ struct GalleryView: View {
 
     @MainActor
     private func nextVisibleItemNeedingWork() -> CameraConnectionService.GalleryItem? {
-        // Keep gallery order so visible rows fill left-to-right, top-to-bottom.
         for item in camera.galleryItems where visibleHandles.contains(item.handle) {
             let needsDuration = item.isVideo && item.durationSeconds == nil
             let needsThumb =
@@ -264,8 +323,6 @@ private struct GalleryThumbnailCell: View {
     let hasFailed: Bool
 
     var body: some View {
-        // Layout size comes only from the parent 1:1 frame. Image content is drawn
-        // inside with scaledToFill and never contributes to intrinsic size.
         Rectangle()
             .fill(Color.secondary.opacity(0.12))
             .overlay {

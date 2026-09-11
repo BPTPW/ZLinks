@@ -391,7 +391,7 @@ struct MyCameraView: View {
         case .connecting:
             return .blue
         case .disconnected:
-            return .secondary
+            return .primary
         case .failed:
             return .red
         }
@@ -776,6 +776,7 @@ private struct CameraConnectionSheet: View {
             Label("高级选项", systemImage: "slider.horizontal.3")
                 .font(.headline)
         }
+        .tint(.primary)
     }
 
 }

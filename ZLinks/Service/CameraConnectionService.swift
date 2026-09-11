@@ -81,11 +81,31 @@ final class CameraConnectionService: ObservableObject {
         var durationSeconds: Int?
     }
 
+    struct GalleryDirectory: Identifiable, Equatable, Hashable {
+        /// Stable ID for picker selection. Root synthetic directory uses 0.
+        let id: UInt32
+        var handle: UInt32 { id }
+        let storageID: UInt32
+        let name: String
+        /// Display path like `DCIM/100NCZ_5` when available.
+        let path: String
+        /// True for the synthetic root entry used when media sits outside folders.
+        let isSyntheticRoot: Bool
+
+        var pickerTitle: String {
+            if isSyntheticRoot { return name }
+            if !path.isEmpty { return path }
+            return name.isEmpty ? String(format: "0x%08X", handle) : name
+        }
+    }
+
     @Published private(set) var state: State = .disconnected
     @Published private(set) var cameraInfo: CameraInfo?
     @Published private(set) var connectedHost: String?
     @Published private(set) var cameraStatus = CameraStatus()
     @Published private(set) var lensInfo = LensInfo.disconnected
+    @Published private(set) var galleryDirectories: [GalleryDirectory] = []
+    @Published private(set) var selectedGalleryDirectoryID: UInt32?
     @Published private(set) var galleryItems: [GalleryItem] = []
     @Published private(set) var debugLog = ""
 
@@ -191,6 +211,8 @@ final class CameraConnectionService: ObservableObject {
         cameraStatus = CameraStatus()
         lensInfo = .disconnected
         galleryItems = []
+        galleryDirectories = []
+        selectedGalleryDirectoryID = nil
         thumbnailCache = [:]
         durationCache = [:]
         state = .disconnected
@@ -203,26 +225,88 @@ final class CameraConnectionService: ObservableObject {
         lensInfo = await readLensInfo(on: commandConnection)
     }
 
-    func refreshGallery() async {
+    /// Refresh directory list, keep/select a directory, then load that directory's media.
+    func refreshGallery(selectingDirectoryID directoryID: UInt32? = nil) async {
         guard case .connected = state, let commandConnection else {
             galleryItems = []
+            galleryDirectories = []
+            selectedGalleryDirectoryID = nil
             appendLog("[图库] 未连接相机，跳过刷新")
             return
         }
 
-        let startedAt = Date()
-        appendLog("[图库] 开始刷新媒体列表")
+        appendLog("[图库] 开始刷新目录列表")
+        do {
+            let directories = try await loadGalleryDirectories(on: commandConnection)
+            galleryDirectories = directories
+            appendLog("[图库] 目录列表完成 count=\(directories.count)")
+
+            let preferred = directoryID ?? selectedGalleryDirectoryID
+            let selected = directories.first(where: { $0.id == preferred })?.id ?? directories.first?.id
+            selectedGalleryDirectoryID = selected
+
+            guard let selected else {
+                galleryItems = []
+                thumbnailCache = [:]
+                durationCache = [:]
+                appendLog("[图库] 没有可选择的目录")
+                return
+            }
+
+            await loadGalleryMedia(forDirectoryID: selected, clearCaches: true)
+        } catch {
+            appendLog("[图库] 目录列表失败 error=\(error.localizedDescription)")
+        }
+    }
+
+    /// Switch directory: clear current gallery and load the chosen folder.
+    func selectGalleryDirectory(id: UInt32) async {
+        guard galleryDirectories.contains(where: { $0.id == id }) else {
+            appendLog("[图库] 目录不存在 handle=0x\(String(format: "%08X", id))")
+            return
+        }
+        if selectedGalleryDirectoryID == id, !galleryItems.isEmpty {
+            return
+        }
+        selectedGalleryDirectoryID = id
+        galleryItems = []
         thumbnailCache = [:]
         durationCache = [:]
+        await loadGalleryMedia(forDirectoryID: id, clearCaches: true)
+    }
+
+    private func loadGalleryMedia(forDirectoryID directoryID: UInt32, clearCaches: Bool) async {
+        guard case .connected = state, let commandConnection else {
+            galleryItems = []
+            appendLog("[图库] 未连接相机，跳过媒体加载")
+            return
+        }
+        guard let directory = galleryDirectories.first(where: { $0.id == directoryID }) else {
+            galleryItems = []
+            appendLog("[图库] 媒体加载失败：目录无效")
+            return
+        }
+
+        if clearCaches {
+            thumbnailCache = [:]
+            durationCache = [:]
+        }
+
+        let startedAt = Date()
+        appendLog("[图库] 开始加载目录 \(directory.pickerTitle) path=\(directory.path) handle=0x\(String(format: "%08X", directory.handle))")
         do {
-            let items = try await loadGalleryItems(on: commandConnection)
+            let items = try await loadMediaItems(in: directory, on: commandConnection)
             galleryItems = items
             let photos = items.filter { !$0.isVideo }.count
             let videos = items.filter(\.isVideo).count
             let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
-            appendLog("[图库] 媒体列表完成 photos=\(photos) videos=\(videos) total=\(items.count) elapsedMs=\(elapsedMs)")
+            appendLog(
+                "[图库] 目录媒体完成 dir=\(directory.pickerTitle) photos=\(photos) videos=\(videos) " +
+                "total=\(items.count) elapsedMs=\(elapsedMs)"
+            )
         } catch {
-            appendLog("[图库] 媒体列表失败 error=\(error.localizedDescription)")
+            galleryItems = []
+            appendLog("[图库] 目录媒体失败 dir=\(directory.pickerTitle) error=\(error.localizedDescription)")
         }
     }
 
@@ -491,29 +575,185 @@ final class CameraConnectionService: ObservableObject {
         }
     }
 
-    private func loadGalleryItems(on connection: NWConnection) async throws -> [GalleryItem] {
-        appendLog("[图库] 正在获取对象句柄…")
-        let handles = try await fetchObjectHandles(on: connection)
-        appendLog("[图库] 对象句柄就绪 count=\(handles.count)")
-
-        if handles.isEmpty {
-            appendLog("[图库] 存储中没有对象")
+    private func loadGalleryDirectories(on connection: NWConnection) async throws -> [GalleryDirectory] {
+        let storageIDs = try await fetchStorageIDs(on: connection)
+        if storageIDs.isEmpty {
+            appendLog("[图库] 未发现可用存储")
             return []
         }
+        appendLog(
+            "[图库] 存储数量 count=\(storageIDs.count) ids=" +
+            storageIDs.map { String(format: "0x%08X", $0) }.joined(separator: ",")
+        )
+
+        var directories: [GalleryDirectory] = []
+        var seenDirectoryHandles = Set<UInt32>()
+        var rootHasDirectMedia = false
+
+        for storageID in storageIDs {
+            // Seed from root objects.
+            var seedHandles: [UInt32] = []
+            if let root = try? await fetchObjectHandles(
+                storageID: storageID,
+                objectFormat: 0,
+                parent: 0xFFFF_FFFF,
+                on: connection
+            ) {
+                appendLog(
+                    "[图库] 根目录句柄 storageID=0x\(String(format: "%08X", storageID)) count=\(root.count)"
+                )
+                seedHandles.append(contentsOf: root)
+            }
+
+            // Walk folders breadth-first. Keep folders that directly contain media.
+            var queue: [(handle: UInt32?, pathPrefix: String)] = [(nil, "")]
+            // nil handle means "inspect seed/root children".
+            var queued = Set<UInt32>()
+            var index = 0
+
+            // First process root seed as path ""
+            while index < queue.count {
+                let node = queue[index]
+                index += 1
+
+                let childHandles: [UInt32]
+                if let folderHandle = node.handle {
+                    do {
+                        childHandles = try await fetchObjectHandles(
+                            storageID: storageID,
+                            objectFormat: 0,
+                            parent: folderHandle,
+                            on: connection
+                        )
+                    } catch {
+                        appendLog(
+                            "[图库] 目录子项失败 parent=0x\(String(format: "%08X", folderHandle)) " +
+                            "error=\(error.localizedDescription)"
+                        )
+                        continue
+                    }
+                } else {
+                    childHandles = seedHandles
+                }
+
+                var directMediaCount = 0
+                var subfolders: [(handle: UInt32, name: String)] = []
+
+                for child in childHandles {
+                    guard let info = try? await fetchObjectInfo(handle: child, on: connection) else {
+                        continue
+                    }
+                    if isAssociationObject(objectFormat: info.objectFormat) {
+                        subfolders.append((child, info.filename))
+                        continue
+                    }
+                    if isGalleryMedia(objectFormat: info.objectFormat, filename: info.filename) {
+                        directMediaCount += 1
+                    }
+                }
+
+                if let folderHandle = node.handle {
+                    if !seenDirectoryHandles.contains(folderHandle) {
+                        seenDirectoryHandles.insert(folderHandle)
+                        let name = node.pathPrefix.split(separator: "/").last.map(String.init) ?? node.pathPrefix
+                        let directory = GalleryDirectory(
+                            id: folderHandle,
+                            storageID: storageID,
+                            name: name.isEmpty ? String(format: "0x%08X", folderHandle) : name,
+                            path: node.pathPrefix,
+                            isSyntheticRoot: false
+                        )
+                        directories.append(directory)
+                        appendLog(
+                            "[图库] 可选目录 \(directory.pickerTitle) path=\(directory.path) " +
+                            "media=\(directMediaCount) handle=0x\(String(format: "%08X", folderHandle))"
+                        )
+                    }
+                } else if directMediaCount > 0 {
+                    rootHasDirectMedia = true
+                }
+
+                for subfolder in subfolders where !queued.contains(subfolder.handle) {
+                    queued.insert(subfolder.handle)
+                    let nextPath: String
+                    if node.pathPrefix.isEmpty {
+                        nextPath = subfolder.name
+                    } else {
+                        nextPath = node.pathPrefix + "/" + subfolder.name
+                    }
+                    queue.append((subfolder.handle, nextPath))
+                }
+            }
+        }
+
+        if rootHasDirectMedia {
+            // Synthetic root entry for media living outside folders.
+            let root = GalleryDirectory(
+                id: 0,
+                storageID: storageIDs[0],
+                name: "根目录",
+                path: "/",
+                isSyntheticRoot: true
+            )
+            directories.insert(root, at: 0)
+            appendLog("[图库] 加入合成根目录（根级直接媒体）")
+        }
+
+        // Stable order: path/name ascending, root first.
+        directories.sort { lhs, rhs in
+            if lhs.isSyntheticRoot != rhs.isSyntheticRoot {
+                return lhs.isSyntheticRoot && !rhs.isSyntheticRoot
+            }
+            let l = lhs.path.isEmpty ? lhs.name : lhs.path
+            let r = rhs.path.isEmpty ? rhs.name : rhs.path
+            if l != r { return l.localizedStandardCompare(r) == .orderedAscending }
+            return lhs.handle < rhs.handle
+        }
+
+        return directories
+    }
+
+    private func loadMediaItems(
+        in directory: GalleryDirectory,
+        on connection: NWConnection
+    ) async throws -> [GalleryItem] {
+        let rootHandles = try await fetchObjectHandles(
+            storageID: directory.storageID,
+            objectFormat: 0,
+            parent: directory.isSyntheticRoot ? 0xFFFF_FFFF : directory.handle,
+            on: connection
+        )
+
+        appendLog("[图库] 读取目录内容 dir=\(directory.pickerTitle) children=\(rootHandles.count)")
 
         var items: [GalleryItem] = []
-        items.reserveCapacity(handles.count)
         var skippedNonMedia = 0
         var skippedErrors = 0
+        var visited = Set<UInt32>()
+        var queue: [UInt32] = rootHandles
         var processed = 0
-        let progressStep = max(handles.count / 10, 25)
 
-        appendLog("[图库] 开始解析 ObjectInfo total=\(handles.count)")
-        for handle in handles {
+        while !queue.isEmpty {
+            let handle = queue.removeFirst()
+            if !visited.insert(handle).inserted { continue }
             processed += 1
             do {
                 guard let info = try await fetchObjectInfo(handle: handle, on: connection) else {
                     skippedErrors += 1
+                    continue
+                }
+                if isAssociationObject(objectFormat: info.objectFormat) {
+                    let descendants = try await fetchObjectHandles(
+                        storageID: directory.storageID,
+                        objectFormat: 0,
+                        parent: handle,
+                        on: connection
+                    )
+                    queue.append(contentsOf: descendants)
+                    appendLog(
+                        "[图库] 递归目录 parent=0x\(String(format: "%08X", handle)) " +
+                        "children=\(descendants.count)"
+                    )
                     continue
                 }
                 guard isGalleryMedia(objectFormat: info.objectFormat, filename: info.filename) else {
@@ -538,13 +778,12 @@ final class CameraConnectionService: ObservableObject {
                     "[图库] ObjectInfo 跳过 handle=0x\(String(format: "%08X", handle)) " +
                     "error=\(error.localizedDescription)"
                 )
-                continue
             }
 
-            if processed == handles.count || processed % progressStep == 0 {
+            if processed % 25 == 0 || queue.isEmpty {
                 appendLog(
-                    "[图库] ObjectInfo 进度 \(processed)/\(handles.count) " +
-                    "media=\(items.count) skippedNonMedia=\(skippedNonMedia) errors=\(skippedErrors)"
+                    "[图库] 目录解析进度 dir=\(directory.pickerTitle) processed=\(processed) pending=\(queue.count) " +
+                    "media=\(items.count)"
                 )
             }
         }
@@ -564,42 +803,10 @@ final class CameraConnectionService: ObservableObject {
         }
 
         appendLog(
-            "[图库] ObjectInfo 解析结束 media=\(items.count) " +
+            "[图库] 目录解析结束 dir=\(directory.pickerTitle) media=\(items.count) " +
             "skippedNonMedia=\(skippedNonMedia) errors=\(skippedErrors)"
         )
         return items
-    }
-
-    private func fetchObjectHandles(on connection: NWConnection) async throws -> [UInt32] {
-        // Prefer "all storages" query first; fall back to each StorageID if needed.
-        do {
-            let handles = try await fetchObjectHandles(storageID: 0xFFFF_FFFF, on: connection)
-            if !handles.isEmpty {
-                appendLog("[图库] 使用全存储句柄查询 storageID=0xFFFFFFFF count=\(handles.count)")
-                return handles
-            }
-            appendLog("[图库] 全存储句柄查询返回空，改为分存储查询")
-        } catch {
-            appendLog("[图库] 全存储句柄查询失败，改为分存储查询 error=\(error.localizedDescription)")
-        }
-
-        let storageIDs = try await fetchStorageIDs(on: connection)
-        appendLog("[图库] 存储数量 count=\(storageIDs.count) ids=\(storageIDs.map { String(format: "0x%08X", $0) }.joined(separator: ","))")
-
-        var handles: [UInt32] = []
-        for storageID in storageIDs {
-            do {
-                let part = try await fetchObjectHandles(storageID: storageID, on: connection)
-                appendLog("[图库] 存储句柄 storageID=0x\(String(format: "%08X", storageID)) count=\(part.count)")
-                handles.append(contentsOf: part)
-            } catch {
-                appendLog(
-                    "[图库] 存储句柄失败 storageID=0x\(String(format: "%08X", storageID)) " +
-                    "error=\(error.localizedDescription)"
-                )
-            }
-        }
-        return handles
     }
 
     private func fetchStorageIDs(on connection: NWConnection) async throws -> [UInt32] {
@@ -620,14 +827,20 @@ final class CameraConnectionService: ObservableObject {
             appendLog("[图库] GetStorageIDs 数据异常 bytes=\(data.count) count=\(count)")
             throw CameraConnectionError.malformedPacket
         }
-        return (0..<count).map { data.uint32(at: 4 + $0 * 4) }
+        let ids = (0..<count).map { data.uint32(at: 4 + $0 * 4) }
+        let present = ids.filter { ($0 & 0x0000_FFFF) != 0 }
+        return present.isEmpty ? ids : present
     }
 
-    private func fetchObjectHandles(storageID: UInt32, on connection: NWConnection) async throws -> [UInt32] {
-        // format all, association = entire hierarchy
+    private func fetchObjectHandles(
+        storageID: UInt32,
+        objectFormat: UInt32,
+        parent: UInt32,
+        on connection: NWConnection
+    ) async throws -> [UInt32] {
         let response = try await operation(
             .getObjectHandles,
-            parameters: [storageID, 0x0000_0000, 0xFFFF_FFFF],
+            parameters: [storageID, objectFormat, parent],
             dataPhase: .receive,
             on: connection,
             logStyle: .silent
@@ -635,7 +848,7 @@ final class CameraConnectionService: ObservableObject {
         guard response.code == PTPResponseCode.ok.rawValue, let data = response.data, data.count >= 4 else {
             appendLog(
                 "[图库] GetObjectHandles 失败 storageID=0x\(String(format: "%08X", storageID)) " +
-                "code=0x\(String(format: "%04X", response.code))"
+                "parent=0x\(String(format: "%08X", parent)) code=0x\(String(format: "%04X", response.code))"
             )
             throw CameraConnectionError.ptpResponse(response.code)
         }
@@ -645,7 +858,7 @@ final class CameraConnectionService: ObservableObject {
         guard data.count >= needed else {
             appendLog(
                 "[图库] GetObjectHandles 数据异常 storageID=0x\(String(format: "%08X", storageID)) " +
-                "bytes=\(data.count) count=\(count)"
+                "parent=0x\(String(format: "%08X", parent)) bytes=\(data.count) count=\(count)"
             )
             throw CameraConnectionError.malformedPacket
         }
@@ -663,6 +876,10 @@ final class CameraConnectionService: ObservableObject {
             return "\(filename) handle=0x\(String(format: "%08X", handle))"
         }
         return "handle=0x\(String(format: "%08X", handle))"
+    }
+
+    private func isAssociationObject(objectFormat: UInt16) -> Bool {
+        objectFormat == 0x3001
     }
 
     private struct ParsedObjectInfo {
@@ -691,7 +908,6 @@ final class CameraConnectionService: ObservableObject {
     }
 
     private func parseObjectInfo(_ data: Data) throws -> ParsedObjectInfo {
-        // ObjectInfo fixed header is 52 bytes before Filename string.
         guard data.count >= 52 else {
             throw CameraConnectionError.malformedPacket
         }
