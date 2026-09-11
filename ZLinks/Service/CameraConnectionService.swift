@@ -427,8 +427,20 @@ final class CameraConnectionService: ObservableObject {
         return CameraInfo(
             manufacturer: manufacturer.value.isEmpty ? "Nikon" : manufacturer.value,
             model: model.value.isEmpty ? "未知型号" : model.value,
-            serialNumber: serial.value
+            serialNumber: Self.normalizedSerialNumber(serial.value)
         )
+    }
+
+
+    private static func normalizedSerialNumber(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return trimmed }
+        // Nikon DeviceInfo often left-pads the serial with zeros.
+        if trimmed.allSatisfy({ $0.isNumber }) {
+            let stripped = String(trimmed.drop(while: { $0 == "0" }))
+            return stripped.isEmpty ? "0" : stripped
+        }
+        return trimmed
     }
 
     private func skipUInt16Array(in data: Data, at offset: Int) throws -> Int {

@@ -14,7 +14,7 @@ final class CameraDiscoveryService: ObservableObject {
         let host: String
 
         var id: String { host }
-        var name: String { "PTP/IP 相机 · \(host)" }
+        var name: String { host }
         var endpoint: NWEndpoint { .hostPort(host: .init(host), port: 15740) }
     }
 

@@ -8,16 +8,14 @@ import SwiftUI
 struct MyCameraView: View {
     @StateObject private var camera = CameraConnectionService()
     @State private var isConnectionSheetPresented = false
+    @State private var isDebugLogPresented = false
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 20) {
                     cameraStatusCard
-
-                    if case .connected = camera.state {
-                        connectionDetails
-                    } else {
+                    if camera.state != .connected {
                         preparationSection
                     }
                 }
@@ -27,11 +25,34 @@ struct MyCameraView: View {
             }
             .navigationTitle("我的相机")
             .navigationBarTitleDisplayMode(.large)
+            .toolbar {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button {
+                        Task { await camera.refreshCameraStatus() }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.body.weight(.semibold))
+                    }
+                    .disabled(camera.state != .connected)
+                    .accessibilityLabel("刷新相机状态")
+
+                    Button {
+                        isDebugLogPresented = true
+                    } label: {
+                        Image(systemName: "info.circle")
+                            .font(.body.weight(.semibold))
+                    }
+                    .accessibilityLabel("连接日志")
+                }
+            }
             .sheet(isPresented: $isConnectionSheetPresented) {
                 CameraConnectionSheet(camera: camera)
                     .presentationDetents([.large])
                     .presentationDragIndicator(.visible)
                     .presentationCornerRadius(28)
+            }
+            .fullScreenCover(isPresented: $isDebugLogPresented) {
+                CameraDebugLogView(camera: camera)
             }
         }
     }
@@ -55,7 +76,16 @@ struct MyCameraView: View {
 
                 Spacer(minLength: 0)
 
-                statusLabel
+                VStack(alignment: .trailing, spacing: 8) {
+                    statusLabel
+                    batteryBadge
+                }
+            }
+
+            if case .connected = camera.state {
+                storageSection
+
+                detailRow("相机地址", value: camera.connectedHost ?? "--")
             }
 
             Divider()
@@ -87,65 +117,56 @@ struct MyCameraView: View {
         }
     }
 
-    private var connectionDetails: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            HStack {
-                Text("相机状态")
-                    .font(.headline)
-                Spacer()
-                Button {
-                    Task { await camera.refreshCameraStatus() }
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .buttonStyle(.glass)
-                .accessibilityLabel("刷新相机状态")
-            }
+    private var batteryBadge: some View {
+        HStack(spacing: 6) {
+            Text(batteryText)
+                .font(.subheadline.monospacedDigit().weight(.semibold))
+            Image(systemName: batterySymbol)
+                .font(.subheadline.weight(.semibold))
+        }
+        .foregroundStyle(batteryTint)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .accessibilityLabel("电量 \(batteryText)")
+    }
 
-            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
-                statusMetric(
-                    title: "电量",
-                    value: camera.cameraStatus.batteryLevel.map { "\($0)%" } ?? "不可用",
-                    symbol: batterySymbol
-                )
-                statusMetric(
-                    title: "存储空间",
-                    value: storageValue,
-                    symbol: "sdcard"
-                )
-                statusMetric(
-                    title: "可用空间",
-                    value: camera.cameraStatus.storageFreeBytes.map(formatBytes) ?? "不可用",
-                    symbol: "externaldrive"
-                )
-                statusMetric(
-                    title: "媒体文件",
-                    value: camera.cameraStatus.mediaObjectCount.map { "\($0)" } ?? "不可用",
-                    symbol: "photo.stack"
-                )
-            }
-
-            VStack(spacing: 12) {
-                detailRow("网络地址", value: camera.connectedHost ?? "-")
+    private var storageSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "externaldrive.fill")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.blue)
+                Text("存储空间")
+                    .font(.subheadline.weight(.semibold))
+                Spacer(minLength: 8)
                 if let storageName = camera.cameraStatus.storageName, !storageName.isEmpty {
-                    detailRow("存储卡", value: storageName)
+                    Text(storageName)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
-                if let serialNumber = camera.cameraInfo?.serialNumber, !serialNumber.isEmpty {
-                    detailRow("序列号", value: serialNumber)
-                }
-                detailRow("协议", value: "PTP/IP")
+            }
+
+            ProgressView(value: storageUsedRatio)
+                .tint(.blue)
+                .scaleEffect(x: 1, y: 1.35, anchor: .center)
+
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(storageUsageText)
+                    .font(.subheadline.monospacedDigit().weight(.medium))
+                Spacer(minLength: 0)
             }
         }
-        .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .glassEffect(.regular, in: .rect(cornerRadius: 20))
+        .padding(14)
+        .background(.primary.opacity(0.02), in: RoundedRectangle(cornerRadius: 16))
     }
 
     private var preparationSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("连接准备")
                 .font(.headline)
-            Text("请先让 iPhone 与相机处于同一个 Wi-Fi 网络，或加入相机创建的 Wi-Fi 网络。连接后会读取相机品牌、型号和序列号。")
+            Text("请先让 iPhone 与相机处于同一个 Wi-Fi 网络，或加入相机创建的 Wi-Fi 网络。连接后会读取相机品牌、型号和存储状态。")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -233,19 +254,34 @@ struct MyCameraView: View {
         }
     }
 
-    private func detailRow(_ title: String, value: String) -> some View {
-        HStack {
-            Text(title)
-                .foregroundStyle(.secondary)
-            Spacer()
-            Text(value)
-                .multilineTextAlignment(.trailing)
+    private var batteryText: String {
+        guard case .connected = camera.state,
+              let level = camera.cameraStatus.batteryLevel else {
+            return "--%"
         }
-        .font(.subheadline)
+        return "\(level)%"
+    }
+
+    private var batteryTint: Color {
+        guard case .connected = camera.state,
+              let level = camera.cameraStatus.batteryLevel else {
+            return .secondary
+        }
+        switch level {
+        case 0..<20:
+            return .red
+        case 20..<40:
+            return .orange
+        default:
+            return .green
+        }
     }
 
     private var batterySymbol: String {
-        guard let level = camera.cameraStatus.batteryLevel else { return "battery.0" }
+        guard case .connected = camera.state,
+              let level = camera.cameraStatus.batteryLevel else {
+            return "battery.0percent"
+        }
         switch level {
         case 76...:
             return "battery.100percent"
@@ -253,35 +289,43 @@ struct MyCameraView: View {
             return "battery.75percent"
         case 26...50:
             return "battery.50percent"
-        default:
+        case 1...25:
             return "battery.25percent"
+        default:
+            return "battery.0percent"
         }
     }
 
-    private var storageValue: String {
+    private var storageUsedRatio: Double {
+        guard let free = camera.cameraStatus.storageFreeBytes,
+              let total = camera.cameraStatus.storageTotalBytes,
+              total > 0 else {
+            return 0
+        }
+        let used = total > free ? total - free : 0
+        return min(max(Double(used) / Double(total), 0), 1)
+    }
+
+    private var storageUsageText: String {
         guard let free = camera.cameraStatus.storageFreeBytes,
               let total = camera.cameraStatus.storageTotalBytes else {
-            return "不可用"
+            return "-- / --"
         }
-        return "\(formatBytes(free)) / \(formatBytes(total))"
+        let used = total > free ? total - free : 0
+        return "\(formatBytes(used)) / \(formatBytes(total))"
     }
 
-    private func statusMetric(title: String, value: String, symbol: String) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Image(systemName: symbol)
-                .font(.headline)
-                .foregroundStyle(.blue)
-            Text(value)
-                .font(.headline)
-                .lineLimit(1)
-                .minimumScaleFactor(0.75)
+
+    private func detailRow(_ title: String, value: String) -> some View {
+        HStack(alignment: .firstTextBaseline) {
             Text(title)
-                .font(.caption)
                 .foregroundStyle(.secondary)
+            Spacer(minLength: 12)
+            Text(value)
+                .multilineTextAlignment(.trailing)
+                .textSelection(.enabled)
         }
-        .frame(maxWidth: .infinity, minHeight: 92, alignment: .leading)
-        .padding(14)
-        .background(.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 16))
+        .font(.subheadline)
     }
 
     private func formatBytes(_ bytes: UInt64) -> String {
@@ -305,6 +349,8 @@ private struct CameraConnectionSheet: View {
     @State private var isConnecting = false
     @State private var cameraSSID = "NIKON_"
     @State private var cameraPassword = ""
+    @State private var isAdvancedOptionsExpanded = false
+    @State private var manualHost = ""
 
     var body: some View {
         NavigationStack {
@@ -325,6 +371,7 @@ private struct CameraConnectionSheet: View {
                             cameraWiFiForm
                         }
                         discoveredCameras
+                        advancedOptions
 
                         if case .failed(let message) = camera.state {
                             Label(message, systemImage: "exclamationmark.triangle.fill")
@@ -334,12 +381,10 @@ private struct CameraConnectionSheet: View {
                                 .padding(14)
                                 .background(.red.opacity(0.1), in: RoundedRectangle(cornerRadius: 14))
                         }
-
-                        scanButton
-                        debugLogPanel
                     }
                     .padding(20)
                 }
+                .scrollDismissesKeyboard(.interactively)
             }
             .navigationTitle("连接相机")
             .navigationBarTitleDisplayMode(.inline)
@@ -507,61 +552,99 @@ private struct CameraConnectionSheet: View {
         }
     }
 
-    private var scanButton: some View {
-        Button {
-            discovery.start()
-        } label: {
-            HStack(spacing: 10) {
-                if discovery.isSearching {
-                    ProgressView()
-                }
-                Text(discovery.isSearching ? "正在扫描相机" : "重新扫描相机")
-            }
-            .font(.headline)
-            .frame(maxWidth: .infinity)
-        }
-        .buttonStyle(.glassProminent)
-        .disabled(discovery.isSearching || isConnecting || selectedMode == .accessPoint && wifi.state != .joined)
-        .accessibilityIdentifier("scanCameraNetworkButton")
-    }
-
-    private var debugLogPanel: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Label("详细连接日志", systemImage: "doc.text.magnifyingglass")
-                    .font(.headline)
-                Spacer()
-                Button {
-                    camera.clearDebugLog()
-                } label: {
-                    Image(systemName: "trash")
-                }
-                .buttonStyle(.glass)
-                .disabled(camera.debugLog.isEmpty)
-                .accessibilityLabel("清空连接日志")
-            }
-
-            if camera.debugLog.isEmpty {
-                Text("连接相机后，这里会显示 TCP、PTP/IP 报文、解析偏移和失败原因。")
+    private var advancedOptions: some View {
+        DisclosureGroup(isExpanded: $isAdvancedOptionsExpanded) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("适用于自动扫描未发现相机，或已知相机 IP 的情况。")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            } else {
-                ScrollView([.vertical, .horizontal]) {
-                    Text(camera.debugLog)
-                        .font(.system(size: 11, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(12)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                TextField("相机 IP，例如 192.168.1.1", text: $manualHost)
+                    .keyboardType(.decimalPad)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .textFieldStyle(.roundedBorder)
+
+                Button {
+                    let host = manualHost.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !host.isEmpty else { return }
+                    isConnecting = true
+                    Task {
+                        await camera.connect(host: host)
+                        isConnecting = false
+                    }
+                } label: {
+                    HStack {
+                        if isConnecting {
+                            ProgressView()
+                        }
+                        Text("连接此地址")
+                        Spacer()
+                        Image(systemName: "link")
+                    }
+                    .frame(maxWidth: .infinity)
                 }
-                .frame(minHeight: 180, maxHeight: 360)
-                .background(.black.opacity(0.05), in: RoundedRectangle(cornerRadius: 10))
+                .buttonStyle(.glassProminent)
+                .disabled(isConnecting || manualHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .padding(.top, 8)
+        } label: {
+            Label("高级选项", systemImage: "slider.horizontal.3")
+                .font(.headline)
+        }
+    }
+
+}
+
+private struct CameraDebugLogView: View {
+    @ObservedObject var camera: CameraConnectionService
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if camera.debugLog.isEmpty {
+                    ContentUnavailableView(
+                        "暂无连接日志",
+                        systemImage: "doc.text.magnifyingglass",
+                        description: Text("连接相机后，TCP、PTP/IP 报文、解析偏移和失败原因会显示在这里。")
+                    )
+                } else {
+                    ScrollView([.vertical, .horizontal]) {
+                        Text(camera.debugLog)
+                            .font(.system(size: 12, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(16)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(.systemGroupedBackground))
+            .navigationTitle("连接日志")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        camera.clearDebugLog()
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .disabled(camera.debugLog.isEmpty)
+                    .accessibilityLabel("清空连接日志")
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("完成") {
+                        dismiss()
+                    }
+                }
             }
         }
-        .padding(.horizontal, 20)
-        .padding(.bottom, 20)
     }
 }
+
+
 
 private struct GuidePanel: View {
     let title: String

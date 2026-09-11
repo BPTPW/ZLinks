@@ -16,7 +16,7 @@ Verified against Nikon Z5 (`FriendlyName=Z5_2_8064268`, firmware string `V1.20`)
    - command connection: PTP/IP Init Command, then PTP operations;
    - event connection: PTP/IP Init Event, kept separate from command traffic.
 4. The command connection opens PTP session `1`, requests `GetDeviceInfo`, then performs optional status reads for battery, storage, and object count.
-5. Connection UI keeps the scan/connect controls and the debug log inside the same `ScrollView` so long packet dumps remain selectable and copyable.
+5. Connection debug logs are not shown inside the connection sheet. Open them from the “我的相机” toolbar `info.circle` button, which presents a dedicated full-screen log drawer.
 
 ## Successful Connection Checklist
 
@@ -143,7 +143,7 @@ u32[] parameters
 
 ### 5. Debug log is the source of truth during protocol work
 
-The connection sheet exposes a selectable monospaced debug log. When a connect fails:
+All connection logs live in the full-screen “连接日志” drawer opened from the “我的相机” toolbar `info.circle` button. Do not put the packet dump back into the connection sheet. When a connect fails:
 
 1. Confirm whether `InitCommandAck` / `InitEventAck` / `OpenSession` / `GetDeviceInfo` response codes arrived.
 2. If those succeeded, inspect the parser offsets rather than Wi-Fi discovery.
@@ -194,7 +194,7 @@ Joining a camera AP does not guarantee simultaneous cellular routing. `joinOnce`
 - `ZLinks/Service/CameraConnectionService.swift`: PTP/IP transport, packet framing, PTP operations, dataset parsing, camera status, and connection debug log.
 - `ZLinks/Service/CameraDiscoveryService.swift`: active-subnet discovery by TCP port probe.
 - `ZLinks/Service/CameraWiFiService.swift`: iOS-managed AP network join request.
-- `ZLinks/HomeView/MyCameraView.swift`: connection UI, AP join form, selectable debug log panel.
+- `ZLinks/HomeView/MyCameraView.swift`: camera status UI, connection sheet, and the full-screen connection log drawer opened from the toolbar info button.
 
 ## Verification Notes
 
