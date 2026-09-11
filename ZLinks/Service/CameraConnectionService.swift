@@ -36,10 +36,45 @@ final class CameraConnectionService: ObservableObject {
         var mediaObjectCount: Int?
     }
 
+    enum LensConnectionState: Equatable {
+        case disconnected
+        case connected
+        case unknown
+        case noneAttached
+
+        var title: String {
+            switch self {
+            case .disconnected:
+                return "未连接"
+            case .connected:
+                return "已连接"
+            case .unknown:
+                return "未知"
+            case .noneAttached:
+                return "未安装"
+            }
+        }
+    }
+
+    struct LensInfo: Equatable {
+        var connectionState: LensConnectionState = .disconnected
+        var lensID: UInt16?
+        var lensType: UInt32?
+        var minFocalLengthMM: Double?
+        var maxFocalLengthMM: Double?
+        var maxApertureAtMinFocal: Double?
+        var maxApertureAtMaxFocal: Double?
+        var currentFocalLengthMM: Double?
+        var currentAperture: Double?
+
+        static let disconnected = LensInfo()
+    }
+
     @Published private(set) var state: State = .disconnected
     @Published private(set) var cameraInfo: CameraInfo?
     @Published private(set) var connectedHost: String?
     @Published private(set) var cameraStatus = CameraStatus()
+    @Published private(set) var lensInfo = LensInfo.disconnected
     @Published private(set) var debugLog = ""
 
     private var commandConnection: NWConnection?
@@ -122,6 +157,7 @@ final class CameraConnectionService: ObservableObject {
             cameraInfo = try parseDeviceInfo(deviceInfo)
             appendLog("DeviceInfo 解析成功 manufacturer=\(cameraInfo?.manufacturer ?? ""), model=\(cameraInfo?.model ?? ""), serial=\(cameraInfo?.serialNumber ?? "")")
             cameraStatus = await readCameraStatus(on: command)
+            lensInfo = await readLensInfo(on: command)
             connectedHost = displayHost
             state = .connected
             appendLog("连接成功")
@@ -137,6 +173,7 @@ final class CameraConnectionService: ObservableObject {
         cameraInfo = nil
         connectedHost = nil
         cameraStatus = CameraStatus()
+        lensInfo = .disconnected
         state = .disconnected
     }
 
@@ -144,6 +181,7 @@ final class CameraConnectionService: ObservableObject {
         guard case .connected = state, let commandConnection else { return }
         appendLog("开始刷新相机状态")
         cameraStatus = await readCameraStatus(on: commandConnection)
+        lensInfo = await readLensInfo(on: commandConnection)
     }
 
     func clearDebugLog() {
@@ -344,6 +382,155 @@ final class CameraConnectionService: ObservableObject {
         }
 
         return status
+    }
+
+    private func readLensInfo(on connection: NWConnection) async -> LensInfo {
+        var info = LensInfo(connectionState: .unknown)
+        appendLog("开始读取镜头信息")
+
+        // Nikon vendor properties observed in libgphoto2 / camera dumps:
+        // LensID 0xD0E0, LensType 0xD0E2, FocalLengthMin/Max 0xD0E3/0xD0E4,
+        // MaxApAtMin/MaxFocal 0xD0E5/0xD0E6. Standard PTP current values:
+        // FNumber 0x5007, FocalLength 0x5008. Scale is value / 100.
+        if let response = try? await operation(.getDevicePropValue, parameters: [0xD0E0], dataPhase: .receive, on: connection),
+           response.code == PTPResponseCode.ok.rawValue,
+           let data = response.data,
+           let value = readIntegerValue(from: data) {
+            info.lensID = UInt16(clamping: value)
+            appendLog("镜头 LensID=0x\(String(format: "%04X", info.lensID ?? 0)) raw=\(value)")
+        }
+
+        if let response = try? await operation(.getDevicePropValue, parameters: [0xD0E2], dataPhase: .receive, on: connection),
+           response.code == PTPResponseCode.ok.rawValue,
+           let data = response.data,
+           let value = readIntegerValue(from: data) {
+            info.lensType = UInt32(clamping: value)
+            appendLog("镜头 LensType=\(value)")
+        }
+
+        if let response = try? await operation(.getDevicePropValue, parameters: [0xD0E3], dataPhase: .receive, on: connection),
+           response.code == PTPResponseCode.ok.rawValue,
+           let data = response.data,
+           let value = readIntegerValue(from: data) {
+            info.minFocalLengthMM = Double(value) / 100.0
+        }
+
+        if let response = try? await operation(.getDevicePropValue, parameters: [0xD0E4], dataPhase: .receive, on: connection),
+           response.code == PTPResponseCode.ok.rawValue,
+           let data = response.data,
+           let value = readIntegerValue(from: data) {
+            info.maxFocalLengthMM = Double(value) / 100.0
+        }
+
+        if let response = try? await operation(.getDevicePropValue, parameters: [0xD0E5], dataPhase: .receive, on: connection),
+           response.code == PTPResponseCode.ok.rawValue,
+           let data = response.data,
+           let value = readIntegerValue(from: data) {
+            info.maxApertureAtMinFocal = Double(value) / 100.0
+        }
+
+        if let response = try? await operation(.getDevicePropValue, parameters: [0xD0E6], dataPhase: .receive, on: connection),
+           response.code == PTPResponseCode.ok.rawValue,
+           let data = response.data,
+           let value = readIntegerValue(from: data) {
+            info.maxApertureAtMaxFocal = Double(value) / 100.0
+        }
+
+        if let response = try? await operation(.getDevicePropValue, parameters: [0x5008], dataPhase: .receive, on: connection),
+           response.code == PTPResponseCode.ok.rawValue,
+           let data = response.data,
+           let value = readIntegerValue(from: data) {
+            info.currentFocalLengthMM = Double(value) / 100.0
+        }
+
+        if let response = try? await operation(.getDevicePropValue, parameters: [0x5007], dataPhase: .receive, on: connection),
+           response.code == PTPResponseCode.ok.rawValue,
+           let data = response.data,
+           let value = readIntegerValue(from: data) {
+            info.currentAperture = Double(value) / 100.0
+        }
+
+        let hasAnyLensMetric =
+            info.lensID != nil
+            || info.minFocalLengthMM != nil
+            || info.maxFocalLengthMM != nil
+            || info.maxApertureAtMinFocal != nil
+            || info.maxApertureAtMaxFocal != nil
+            || info.currentFocalLengthMM != nil
+            || info.currentAperture != nil
+
+        if !hasAnyLensMetric {
+            info.connectionState = .unknown
+            appendLog("镜头信息读取失败或属性不受支持")
+            return info
+        }
+
+        let looksDetached =
+            (info.lensID == 0 || info.lensID == nil)
+            && (info.minFocalLengthMM ?? 0) == 0
+            && (info.maxFocalLengthMM ?? 0) == 0
+            && (info.currentFocalLengthMM ?? 0) == 0
+
+        if looksDetached {
+            info.connectionState = .noneAttached
+        } else {
+            info.connectionState = .connected
+        }
+
+        appendLog(
+            "镜头信息 state=\(info.connectionState.title) id=\(info.lensID.map(String.init) ?? "--") " +
+            "focal=\(info.minFocalLengthMM.map(formatFocalLength) ?? "--")-\(info.maxFocalLengthMM.map(formatFocalLength) ?? "--") " +
+            "aperture=\(info.maxApertureAtMinFocal.map(formatAperture) ?? "--")-\(info.maxApertureAtMaxFocal.map(formatAperture) ?? "--") " +
+            "currentFocal=\(info.currentFocalLengthMM.map(formatFocalLength) ?? "--") " +
+            "currentAperture=\(info.currentAperture.map(formatAperture) ?? "--")"
+        )
+        return info
+    }
+
+    private func readIntegerValue(from data: Data) -> UInt64? {
+        switch data.count {
+        case 0:
+            return nil
+        case 1:
+            return UInt64(data[0])
+        case 2:
+            return UInt64(data.uint16(at: 0))
+        case 3...4:
+            // Some cameras pad UINT16 values; prefer exact width first.
+            if data.count == 4 {
+                return UInt64(data.uint32(at: 0))
+            }
+            return UInt64(data.uint16(at: 0))
+        default:
+            if data.count >= 8 {
+                return data.uint64(at: 0)
+            }
+            if data.count >= 4 {
+                return UInt64(data.uint32(at: 0))
+            }
+            if data.count >= 2 {
+                return UInt64(data.uint16(at: 0))
+            }
+            return UInt64(data[0])
+        }
+    }
+
+    private func formatFocalLength(_ mm: Double) -> String {
+        if mm.rounded() == mm {
+            return String(format: "%.0fmm", mm)
+        }
+        return String(format: "%.1fmm", mm)
+    }
+
+    private func formatAperture(_ value: Double) -> String {
+        if abs(value.rounded() - value) < 0.05 {
+            return String(format: "f/%.0f", value)
+        }
+        let tenths = (value * 10).rounded() / 10
+        if abs(tenths - value) < 0.02 {
+            return String(format: "f/%.1f", tenths)
+        }
+        return String(format: "f/%.2f", value)
     }
 
     private func initCommandPayload(guid: Data) -> Data {

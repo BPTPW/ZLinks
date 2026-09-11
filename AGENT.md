@@ -15,7 +15,7 @@ Verified against Nikon Z5 (`FriendlyName=Z5_2_8064268`, firmware string `V1.20`)
 3. `CameraConnectionService` opens two TCP connections to the camera:
    - command connection: PTP/IP Init Command, then PTP operations;
    - event connection: PTP/IP Init Event, kept separate from command traffic.
-4. The command connection opens PTP session `1`, requests `GetDeviceInfo`, then performs optional status reads for battery, storage, and object count.
+4. The command connection opens PTP session `1`, requests `GetDeviceInfo`, then performs optional status reads for battery, storage, object count, and lens properties.
 5. Connection debug logs are not shown inside the connection sheet. Open them from the “我的相机” toolbar `info.circle` button, which presents a dedicated full-screen log drawer.
 
 ## Successful Connection Checklist
@@ -30,6 +30,12 @@ A healthy session should reach these stages in order:
 6. `GetDeviceInfo` returns `StartData`/`EndData` plus response code `0x2001`.
 7. `DeviceInfo` parses manufacturer/model/version/serial without bounds errors.
 8. Optional status probes for battery (`0x5001`), storage IDs/info, and object count.
+9. Optional lens probes via `GetDevicePropValue`:
+   - Nikon `LensID` `0xD0E0`
+   - Nikon `FocalLengthMin/Max` `0xD0E3` / `0xD0E4` (value / 100 = mm)
+   - Nikon `MaxApAtMin/MaxFocal` `0xD0E5` / `0xD0E6` (value / 100 = f-number)
+   - Standard current `FocalLength` `0x5008` and `FNumber` `0x5007` (value / 100)
+   Lens reads are best-effort and must not tear down a successful camera session.
 
 If step 2 or 4 fails, the failure is still in PTP/IP session setup. If steps 2-6 succeed and the UI still reports "相机返回了无法识别的数据。", the bug is almost always local dataset parsing, not network discovery.
 
@@ -191,10 +197,28 @@ Joining a camera AP does not guarantee simultaneous cellular routing. `joinOnce`
 
 ## Files and Responsibilities
 
-- `ZLinks/Service/CameraConnectionService.swift`: PTP/IP transport, packet framing, PTP operations, dataset parsing, camera status, and connection debug log.
+- `ZLinks/Service/CameraConnectionService.swift`: PTP/IP transport, packet framing, PTP operations, dataset parsing, camera status, lens info, and connection debug log.
 - `ZLinks/Service/CameraDiscoveryService.swift`: active-subnet discovery by TCP port probe.
 - `ZLinks/Service/CameraWiFiService.swift`: iOS-managed AP network join request.
-- `ZLinks/HomeView/MyCameraView.swift`: camera status UI, connection sheet, and the full-screen connection log drawer opened from the toolbar info button.
+- `ZLinks/HomeView/MyCameraView.swift`: camera status UI, lens info card, connection sheet, and the full-screen connection log drawer opened from the toolbar info button.
+
+## Lens Info
+
+Lens data is shown in a separate rounded card on “我的相机”, independent from the camera status card.
+
+Card layout:
+
+- top-left title: `镜头信息`
+- top-right connection state capsule: `未连接` / `已连接` / `未知` / `未安装` / transient camera states
+- primary line: numeric lens ID only (`镜头 ID n`); no friendly lens model name is available from these properties
+- 2x2 metric modules: `焦距范围`, `光圈范围`, `当前焦距`, `当前光圈`
+
+Property scale:
+
+- focal length properties use millimetres * 100
+- aperture properties use f-number * 100
+
+Missing properties must leave the corresponding module as `--` and keep the camera session alive. Toolbar refresh reloads both camera status and lens info.
 
 ## Verification Notes
 

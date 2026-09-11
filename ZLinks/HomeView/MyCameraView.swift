@@ -15,6 +15,7 @@ struct MyCameraView: View {
             ScrollView {
                 VStack(spacing: 20) {
                     cameraStatusCard
+                    lensInfoCard
                     if camera.state != .connected {
                         preparationSection
                     }
@@ -117,6 +118,183 @@ struct MyCameraView: View {
         }
     }
 
+    private var lensInfoCard: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("镜头信息")
+                    .font(.headline)
+                Text(lensIDText)
+                    .font(.subheadline.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 12)
+                Text(lensConnectionStatusTitle)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(lensStatusTint)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(lensStatusTint.opacity(0.14), in: Capsule())
+            }
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)], spacing: 12) {
+                lensMetricModule(title: "焦距范围", value: focalLengthRangeText)
+                lensMetricModule(title: "光圈范围", value: apertureRangeText)
+                lensMetricModule(title: "当前焦距", value: currentFocalLengthText)
+                lensMetricModule(title: "当前光圈", value: currentApertureText)
+            }
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(.clear)
+                .glassEffect(.regular, in: .rect(cornerRadius: 24))
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .strokeBorder(.primary.opacity(0.12), lineWidth: 1)
+        }
+    }
+
+    private func lensMetricModule(title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Text(title)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            Text(value)
+                .font(.subheadline.monospacedDigit().weight(.semibold))
+                .foregroundStyle(value == "--" ? .secondary : .primary)
+                .lineLimit(2)
+                .minimumScaleFactor(0.8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, minHeight: 78, alignment: .topLeading)
+        .background(.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    private var lensConnectionStatusTitle: String {
+        switch camera.state {
+        case .disconnected:
+            return CameraConnectionService.LensConnectionState.disconnected.title
+        case .connecting:
+            return "连接中"
+        case .failed:
+            return "连接失败"
+        case .connected:
+            return camera.lensInfo.connectionState.title
+        }
+    }
+
+    private var lensStatusTint: Color {
+        switch camera.state {
+        case .disconnected:
+            return .secondary
+        case .connecting:
+            return .blue
+        case .failed:
+            return .red
+        case .connected:
+            switch camera.lensInfo.connectionState {
+            case .connected:
+                return .green
+            case .noneAttached:
+                return .orange
+            case .unknown:
+                return .secondary
+            case .disconnected:
+                return .secondary
+            }
+        }
+    }
+
+    private var lensIDText: String {
+        guard case .connected = camera.state else {
+            return ""
+        }
+        guard let lensID = camera.lensInfo.lensID else {
+            switch camera.lensInfo.connectionState {
+            case .noneAttached:
+                return ""
+            case .unknown:
+                return "未知"
+            case .connected, .disconnected:
+                return ""
+            }
+        }
+        return "ID \(lensID)"
+    }
+
+    private var focalLengthRangeText: String {
+        guard case .connected = camera.state else { return "--" }
+        let min = camera.lensInfo.minFocalLengthMM
+        let max = camera.lensInfo.maxFocalLengthMM
+        switch (min, max) {
+        case let (min?, max?) where abs(min - max) < 0.05:
+            return formatLensFocalLength(min)
+        case let (min?, max?):
+            return "\(formatLensFocalLength(min)) – \(formatLensFocalLength(max))"
+        case let (min?, nil):
+            return formatLensFocalLength(min)
+        case let (nil, max?):
+            return formatLensFocalLength(max)
+        default:
+            return "--"
+        }
+    }
+
+    private var apertureRangeText: String {
+        guard case .connected = camera.state else { return "--" }
+        let minF = camera.lensInfo.maxApertureAtMinFocal
+        let maxF = camera.lensInfo.maxApertureAtMaxFocal
+        switch (minF, maxF) {
+        case let (minF?, maxF?) where abs(minF - maxF) < 0.02:
+            return formatLensAperture(minF)
+        case let (minF?, maxF?):
+            return "\(formatLensAperture(minF)) – \(formatLensAperture(maxF))"
+        case let (minF?, nil):
+            return formatLensAperture(minF)
+        case let (nil, maxF?):
+            return formatLensAperture(maxF)
+        default:
+            return "--"
+        }
+    }
+
+    private var currentFocalLengthText: String {
+        guard case .connected = camera.state,
+              let value = camera.lensInfo.currentFocalLengthMM else {
+            return "--"
+        }
+        return formatLensFocalLength(value)
+    }
+
+    private var currentApertureText: String {
+        guard case .connected = camera.state,
+              let value = camera.lensInfo.currentAperture else {
+            return "--"
+        }
+        return formatLensAperture(value)
+    }
+
+    private func formatLensFocalLength(_ mm: Double) -> String {
+        if abs(mm.rounded() - mm) < 0.05 {
+            return String(format: "%.0f mm", mm)
+        }
+        return String(format: "%.1f mm", mm)
+    }
+
+    private func formatLensAperture(_ value: Double) -> String {
+        if abs(value.rounded() - value) < 0.05 {
+            return String(format: "f/%.0f", value)
+        }
+        let tenths = (value * 10).rounded() / 10
+        if abs(tenths - value) < 0.02 {
+            return String(format: "f/%.1f", tenths)
+        }
+        return String(format: "f/%.2f", value)
+    }
+
     private var batteryBadge: some View {
         HStack(spacing: 6) {
             Text(batteryText)
@@ -166,7 +344,7 @@ struct MyCameraView: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("连接准备")
                 .font(.headline)
-            Text("请先让 iPhone 与相机处于同一个 Wi-Fi 网络，或加入相机创建的 Wi-Fi 网络。连接后会读取相机品牌、型号和存储状态。")
+            Text("请先让 iPhone 与相机处于同一个 Wi-Fi 网络，或加入相机创建的 Wi-Fi 网络。连接后会读取相机品牌、型号、镜头信息和存储状态。")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -453,7 +631,7 @@ private struct CameraConnectionSheet: View {
             Text("加入相机 Wi-Fi")
                 .font(.headline)
 
-            TextField("相机 SSID，例如 NIKON_123456", text: $cameraSSID)
+            TextField("SSID", text: $cameraSSID)
                 .textInputAutocapitalization(.characters)
                 .autocorrectionDisabled()
                 .textFieldStyle(.roundedBorder)
@@ -461,30 +639,33 @@ private struct CameraConnectionSheet: View {
             SecureField("密码（开放网络可留空）", text: $cameraPassword)
                 .textFieldStyle(.roundedBorder)
 
-            Button {
-                Task {
-                    await wifi.joinCameraNetwork(
-                        ssid: cameraSSID,
-                        password: cameraPassword.isEmpty ? nil : cameraPassword
-                    )
-                    if case .joined = wifi.state {
-                        try? await Task.sleep(for: .seconds(1))
-                        discovery.start()
+            HStack{
+                Spacer()
+                Button {
+                    Task {
+                        await wifi.joinCameraNetwork(
+                            ssid: cameraSSID,
+                            password: cameraPassword.isEmpty ? nil : cameraPassword
+                        )
+                        if case .joined = wifi.state {
+                            try? await Task.sleep(for: .seconds(1))
+                            discovery.start()
+                        }
                     }
-                }
-            } label: {
-                HStack {
-                    if case .joining = wifi.state {
-                        ProgressView()
+                } label: {
+                    HStack {
+                        if case .joining = wifi.state {
+                            ProgressView()
+                        }
+                        Text("加入网络")
+                        Image(systemName: "wifi")
                     }
-                    Text("加入网络")
-                    Spacer()
-                    Image(systemName: "wifi")
+                    .padding(.vertical, 6)
                 }
-                .frame(maxWidth: .infinity)
+                .buttonStyle(.glassProminent)
+                .disabled(cameraSSID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || wifi.state == .joining)
             }
-            .buttonStyle(.glassProminent)
-            .disabled(cameraSSID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || wifi.state == .joining)
+            
 
             if case .failed(let message) = wifi.state {
                 Label(message, systemImage: "exclamationmark.triangle")
@@ -560,33 +741,35 @@ private struct CameraConnectionSheet: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                TextField("相机 IP，例如 192.168.1.1", text: $manualHost)
+                TextField("输入相机IP", text: $manualHost)
                     .keyboardType(.decimalPad)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .textFieldStyle(.roundedBorder)
 
-                Button {
-                    let host = manualHost.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !host.isEmpty else { return }
-                    isConnecting = true
-                    Task {
-                        await camera.connect(host: host)
-                        isConnecting = false
-                    }
-                } label: {
-                    HStack {
-                        if isConnecting {
-                            ProgressView()
+                HStack{
+                    Spacer()
+                    Button {
+                        let host = manualHost.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !host.isEmpty else { return }
+                        isConnecting = true
+                        Task {
+                            await camera.connect(host: host)
+                            isConnecting = false
                         }
-                        Text("连接此地址")
-                        Spacer()
-                        Image(systemName: "link")
+                    } label: {
+                        HStack {
+                            if isConnecting {
+                                ProgressView()
+                            }
+                            Text("连接")
+                            Image(systemName: "link")
+                        }
+                        .padding(.vertical, 6)
                     }
-                    .frame(maxWidth: .infinity)
+                    .buttonStyle(.glassProminent)
+                    .disabled(isConnecting || manualHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
-                .buttonStyle(.glassProminent)
-                .disabled(isConnecting || manualHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
             .padding(.top, 8)
         } label: {
