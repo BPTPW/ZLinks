@@ -10,6 +10,8 @@ import UIKit
 
 @MainActor
 final class CameraConnectionService: ObservableObject {
+    static let autoConnectOnLaunchKey = "camera.autoConnectOnLaunch"
+
     enum State: Equatable {
         case disconnected
         case connecting
@@ -179,7 +181,16 @@ final class CameraConnectionService: ObservableObject {
     private var connectionGeneration = UUID()
     private var foregroundObserver: NSObjectProtocol?
 
+    private static let lastConnectedHostKey = "camera.lastConnectedHost"
+
     init() {
+        if let rememberedHost = UserDefaults.standard.string(forKey: Self.lastConnectedHostKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !rememberedHost.isEmpty {
+            lastEndpoint = .hostPort(host: .init(rememberedHost), port: 15740)
+            lastDisplayHost = rememberedHost
+        }
+
         foregroundObserver = NotificationCenter.default.addObserver(
             forName: UIApplication.didBecomeActiveNotification,
             object: nil,
@@ -214,7 +225,7 @@ final class CameraConnectionService: ObservableObject {
         if preservingSession {
             disconnectConnections()
         } else {
-            disconnect()
+            disconnect(clearRememberedDevice: false)
         }
         state = .connecting
 
@@ -288,6 +299,7 @@ final class CameraConnectionService: ObservableObject {
             connectedHost = displayHost
             state = .connected
             isReconnecting = false
+            UserDefaults.standard.set(displayHost, forKey: Self.lastConnectedHostKey)
             appendLog("连接成功")
         } catch {
             appendLog("连接失败 error=\(String(reflecting: error)) description=\(error.localizedDescription)")
@@ -302,6 +314,10 @@ final class CameraConnectionService: ObservableObject {
     }
 
     func disconnect() {
+        disconnect(clearRememberedDevice: true)
+    }
+
+    private func disconnect(clearRememberedDevice: Bool) {
         reconnectTask?.cancel()
         reconnectTask = nil
         isReconnecting = false
@@ -317,14 +333,33 @@ final class CameraConnectionService: ObservableObject {
         objectImageCache = [:]
         durationCache = [:]
         state = .disconnected
+
+        if clearRememberedDevice {
+            lastEndpoint = nil
+            lastDisplayHost = nil
+            UserDefaults.standard.removeObject(forKey: Self.lastConnectedHostKey)
+        }
     }
 
     private func handleAppDidBecomeActive() {
-        guard case .connected = state, reconnectTask == nil else { return }
-        let commandReady = commandConnection?.state == .ready
-        let eventReady = eventConnection?.state == .ready
-        guard !commandReady || !eventReady else { return }
-        beginAutomaticReconnect(reason: "应用回到前台后检测到连接已断开")
+        if case .connected = state {
+            guard reconnectTask == nil else { return }
+            let commandReady = commandConnection?.state == .ready
+            let eventReady = eventConnection?.state == .ready
+            guard !commandReady || !eventReady else { return }
+            beginAutomaticReconnect(reason: "应用回到前台后检测到连接已断开")
+            return
+        }
+
+        guard UserDefaults.standard.bool(forKey: Self.autoConnectOnLaunchKey),
+              case .disconnected = state,
+              reconnectTask == nil,
+              lastEndpoint != nil,
+              lastDisplayHost != nil
+        else {
+            return
+        }
+        beginAutomaticReconnect(reason: "应用启动后自动连接上次相机")
     }
 
     private func handleTransportFailure(_ connection: NWConnection, generation: UUID, reason: String) {
@@ -368,7 +403,7 @@ final class CameraConnectionService: ObservableObject {
             }
 
             self.appendLog("自动重连失败，已变为未连接")
-            self.disconnect()
+            self.disconnect(clearRememberedDevice: false)
         }
     }
 

@@ -4,6 +4,7 @@
 //
 
 import SwiftUI
+import UIKit
 
 struct MyCameraView: View {
     @EnvironmentObject private var camera: CameraConnectionService
@@ -16,9 +17,6 @@ struct MyCameraView: View {
                 VStack(spacing: 20) {
                     cameraStatusCard
                     lensInfoCard
-                    if camera.state != .connected {
-                        preparationSection
-                    }
                 }
                 .padding(.horizontal, 20)
                 .padding(.top, 16)
@@ -342,19 +340,6 @@ struct MyCameraView: View {
         .background(.primary.opacity(0.02), in: RoundedRectangle(cornerRadius: 16))
     }
 
-    private var preparationSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("连接准备")
-                .font(.headline)
-            Text("请先让 iPhone 与相机处于同一个 Wi-Fi 网络，或加入相机创建的 Wi-Fi 网络。连接后会读取相机品牌、型号、镜头信息和存储状态。")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .padding(.horizontal, 4)
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
     private var statusLabel: some View {
         Text(connectionStatusTitle)
             .font(.caption.weight(.semibold))
@@ -531,11 +516,9 @@ private struct CameraConnectionSheet: View {
     @ObservedObject var camera: CameraConnectionService
     @Environment(\.dismiss) private var dismiss
     @StateObject private var discovery = CameraDiscoveryService()
-    @StateObject private var wifi = CameraWiFiService()
+    @AppStorage(CameraConnectionService.autoConnectOnLaunchKey) private var autoConnectOnLaunch = false
     @State private var selectedMode: ConnectionMode = .accessPoint
     @State private var isConnecting = false
-    @AppStorage("camera.wifi.ssid") private var cameraSSID = "NIKON_"
-    @AppStorage("camera.wifi.password") private var cameraPassword = ""
     @State private var isAdvancedOptionsExpanded = false
     @State private var manualHost = ""
 
@@ -552,7 +535,7 @@ private struct CameraConnectionSheet: View {
                 .padding(.top, 12)
 
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 24) {
+                    VStack(alignment: .center, spacing: 24) {
                         modeGuide
                         if selectedMode == .accessPoint {
                             cameraWiFiForm
@@ -582,14 +565,6 @@ private struct CameraConnectionSheet: View {
                     }
                 }
             }
-            .onChange(of: selectedMode) { _, mode in
-                wifi.reset()
-                if mode == .station {
-                    discovery.start()
-                } else {
-                    discovery.stop()
-                }
-            }
             .onChange(of: camera.state) { _, state in
                 if case .connected = state {
                     dismiss()
@@ -599,9 +574,7 @@ private struct CameraConnectionSheet: View {
                 discovery.stop()
             }
             .onAppear {
-                if selectedMode == .station {
-                    discovery.start()
-                }
+                discovery.start()
             }
         }
     }
@@ -610,88 +583,51 @@ private struct CameraConnectionSheet: View {
     private var modeGuide: some View {
         if selectedMode == .accessPoint {
             GuidePanel(
-                title: "相机创建 Wi-Fi 网络",
+                title: "连接相机 WI-FI 网络",
                 symbol: "wifi",
                 steps: [
-                    "在相机网络菜单中开启 Wi-Fi 或连接至智能设备。",
-                    "在下方输入相机显示的 SSID 和密码，点击加入网络。",
-                    "确认系统弹窗后，回到 ZLinks 扫描相机。",
-                    "从发现的相机列表中选择设备并读取基础信息。"
+                    "在相机网络菜单中开启 Wi-Fi。",
+                    "在设置中手动连接相机 Wi-Fi。",
+                    "在连接完成后点击扫描对网络中的相机设备进行扫描。"
                 ],
-                note: "iOS 公开 API 不允许普通 App 扫描附近所有 SSID，因此不能可靠地自动列出 NIKON_ 网络。加入相机网络时系统会负责确认和路由；蜂窝数据是否并行可用由 iOS 决定。"
+                note: "若无法搜索到相机，可以在高级选项中输入相机 IP 地址直接连接。扫描使用 PTP/IP 默认端口 15740。"
             )
         } else {
             GuidePanel(
-                title: "相机加入本地网络",
+                title: "相机 STA 模式连接网络",
                 symbol: "network",
                 steps: [
                     "在相机网络菜单中选择连接至已有 Wi-Fi 或手机热点。",
-                    "让 iPhone 加入相同的局域网或开启对应个人热点。",
-                    "ZLinks 会自动扫描当前 Wi-Fi 子网的 PTP/IP 相机。",
-                    "从发现的相机列表中选择设备并读取基础信息。"
+                    "若连接的是已有 WI-FI，则让 iPhone 加入相同的局域网。",
+                    "点击扫描将自动发现局域网中的相机设备"
                 ],
-                note: "手机热点模式下，相机需要先成功加入 iPhone 热点。扫描使用 PTP/IP 默认端口 15740。"
+                note: "扫描使用 PTP/IP 默认端口 15740。"
             )
         }
     }
 
     private var cameraWiFiForm: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("加入相机 Wi-Fi")
+        Button {
+            openWiFiSettings()
+        } label: {
+            Label("打开 WI-FI 设置", systemImage: "wifi")
                 .font(.headline)
-
-            TextField("SSID", text: $cameraSSID)
-                .textInputAutocapitalization(.characters)
-                .autocorrectionDisabled()
-                .textFieldStyle(.roundedBorder)
-
-            SecureField("密码（开放网络可留空）", text: $cameraPassword)
-                .textFieldStyle(.roundedBorder)
-
-            HStack {
-                Spacer()
-                Button {
-                    Task {
-                        await wifi.joinCameraNetwork(
-                            ssid: cameraSSID,
-                            password: cameraPassword.isEmpty ? nil : cameraPassword
-                        )
-                        if case .joined = wifi.state {
-                            try? await Task.sleep(for: .seconds(1))
-                            discovery.start()
-                        }
-                    }
-                } label: {
-                    HStack {
-                        if case .joining = wifi.state {
-                            ProgressView()
-                        }
-                        Text("加入网络")
-                        Image(systemName: "wifi")
-                    }
-                    .padding(.vertical, 6)
-                }
-                .buttonStyle(.glassProminent)
-                .disabled(cameraSSID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || wifi.state == .joining)
-            }
-
-            if case let .failed(message) = wifi.state {
-                Label(message, systemImage: "exclamationmark.triangle")
-                    .font(.footnote)
-                    .foregroundStyle(.red)
-            } else if case .joined = wifi.state {
-                Label("已请求加入网络，正在等待相机地址可用。", systemImage: "checkmark.circle")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            }
+                .frame(maxWidth: .infinity)
         }
+        .buttonStyle(.glassProminent)
+        .accessibilityIdentifier("openWiFiSettingsButton")
+    }
+
+    private func openWiFiSettings() {
+        guard let url = URL(string: "App-Prefs:root=WIFI") else { return }
+        UIApplication.shared.open(url, options: [:], completionHandler: nil)
     }
 
     private var discoveredCameras: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text("发现相机")
-                    .font(.headline)
+                    .font(.headline).fontWeight(.semibold)
                 Spacer()
                 Button {
                     discovery.start()
@@ -714,8 +650,7 @@ private struct CameraConnectionSheet: View {
                         .foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(14)
-                .background(.tertiary.opacity(0.14), in: RoundedRectangle(cornerRadius: 14))
+                .padding(.vertical, 10)
             } else {
                 ForEach(discovery.cameras) { discoveredCamera in
                     Button {
@@ -740,6 +675,13 @@ private struct CameraConnectionSheet: View {
                     .disabled(isConnecting)
                 }
             }
+
+            Toggle(isOn: $autoConnectOnLaunch) {
+                Text("应用启动时恢复连接")
+                    .font(.subheadline.weight(.medium))
+            }
+            .tint(.blue)
+            .padding(.vertical, 8)
         }
     }
 
@@ -755,7 +697,10 @@ private struct CameraConnectionSheet: View {
                     .keyboardType(.decimalPad)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
-                    .textFieldStyle(.roundedBorder)
+                    .textFieldStyle(.plain)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .glassEffect(.regular.interactive(),in: .capsule)
 
                 HStack {
                     Spacer()
