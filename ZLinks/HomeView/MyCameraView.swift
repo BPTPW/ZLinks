@@ -29,6 +29,14 @@ struct MyCameraView: View {
             .toolbar {
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     Button {
+                        isDebugLogPresented = true
+                    } label: {
+                        Image(systemName: "info.circle")
+                            .font(.body.weight(.semibold))
+                    }
+                    .accessibilityLabel("连接日志")
+                    
+                    Button {
                         Task { await camera.refreshCameraStatus() }
                     } label: {
                         Image(systemName: "arrow.clockwise")
@@ -36,14 +44,6 @@ struct MyCameraView: View {
                     }
                     .disabled(camera.state != .connected)
                     .accessibilityLabel("刷新相机状态")
-
-                    Button {
-                        isDebugLogPresented = true
-                    } label: {
-                        Image(systemName: "info.circle")
-                            .font(.body.weight(.semibold))
-                    }
-                    .accessibilityLabel("连接日志")
                 }
             }
             .sheet(isPresented: $isConnectionSheetPresented) {
@@ -693,7 +693,9 @@ private struct CameraConnectionSheet: View {
                 } label: {
                     Image(systemName: "arrow.clockwise")
                 }
-                .buttonStyle(.glass)
+                .buttonStyle(.plain)
+                .frame(width: 42, height: 42)
+                .glassEffect(.regular.interactive(), in: .circle)
                 .accessibilityLabel("重新扫描本地相机")
             }
 

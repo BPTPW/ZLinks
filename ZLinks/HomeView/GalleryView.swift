@@ -203,7 +203,13 @@ struct GalleryView: View {
                         }
                         .contextMenu {
                             Button { enterSelectionMode(selecting: item.handle) } label: { Label("多选", systemImage: "checkmark.circle") }
-                            if !item.isVideo { Button { startTransfer(items: [item], requiresConfirmation: false) } label: { Label("下载", systemImage: "square.and.arrow.down") } }
+                            if !item.isVideo {
+                                Button {
+                                    startTransfer(items: [item], requiresConfirmation: false)
+                                } label: {
+                                    Label("下载", systemImage: "square.and.arrow.down")
+                                }
+                            }
                         }
                         .onAppear {
                             handleCellAppear(item)
@@ -229,8 +235,13 @@ struct GalleryView: View {
                 let items = camera.galleryItems.filter { selectedHandles.contains($0.handle) && !$0.isVideo }
                 guard !items.isEmpty else { return }
                 startTransfer(items: items, requiresConfirmation: true)
-            } label: { Image(systemName: "square.and.arrow.down") }
-            .buttonStyle(.glass)
+            } label: {
+                Image(systemName: "square.and.arrow.down")
+                    .foregroundStyle(.primary)
+            }
+            .buttonStyle(.plain)
+            .frame(width: 42, height: 42)
+            .glassEffect(.regular.interactive(), in: .circle)
             .disabled(selectedHandles.isEmpty)
             Spacer()
         }
@@ -424,8 +435,11 @@ private struct GalleryPreviewView: View {
                                 Image(systemName: "chevron.left")
                                     .font(.title3.weight(.semibold))
                                     .frame(width: 32, height: 32)
+                                    .foregroundStyle(.primary)
                             }
-                            .buttonStyle(.glass)
+                            .buttonStyle(.plain)
+                            .frame(width: 42, height: 42)
+                            .glassEffect(.regular.interactive(), in: .circle)
                             .accessibilityLabel("返回图库")
                             Spacer()
                             Text(item.filename)
@@ -438,7 +452,13 @@ private struct GalleryPreviewView: View {
                         .padding(.top, 8)
                         Spacer()
                         HStack {
-                            Button { onSave() } label: { Image(systemName: "square.and.arrow.down") }.buttonStyle(.glass)
+                            Button { onSave() } label: {
+                                Image(systemName: "square.and.arrow.down")
+                                    .foregroundStyle(.primary)
+                            }
+                            .buttonStyle(.plain)
+                            .frame(width: 42, height: 42)
+                            .glassEffect(.regular.interactive(), in: .circle)
                             Spacer()
                         }.padding(.horizontal, 16).padding(.bottom, 12)
                     }
@@ -474,6 +494,7 @@ private struct GalleryPreviewView: View {
             Image(uiImage: image)
                 .resizable()
                 .scaledToFit()
+                .allowedDynamicRange(.high)
                 .overlay(alignment: .center) {
                     if isLoading { Color.clear }
                 }
