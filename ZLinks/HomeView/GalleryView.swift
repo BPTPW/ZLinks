@@ -3,9 +3,9 @@
 //  ZLinks
 //
 
+import Photos
 import SwiftUI
 import UIKit
-import Photos
 import UniformTypeIdentifiers
 
 struct GalleryView: View {
@@ -253,6 +253,7 @@ struct GalleryView: View {
         isSelectionMode = true
         if let handle { selectedHandles.insert(handle) }
     }
+
     private func exitSelectionMode() { isSelectionMode = false; selectedHandles.removeAll() }
     private func startTransfer(items: [CameraConnectionService.GalleryItem], requiresConfirmation: Bool) {
         transferItems = items
@@ -384,7 +385,7 @@ struct GalleryView: View {
             let needsDuration = item.isVideo && item.durationSeconds == nil
             let needsThumb =
                 thumbnailImages[item.handle] == nil
-                && !failedThumbnails.contains(item.handle)
+                    && !failedThumbnails.contains(item.handle)
             if needsDuration || needsThumb {
                 return item
             }
@@ -392,7 +393,6 @@ struct GalleryView: View {
         return nil
     }
 }
-
 
 private struct GalleryPreviewView: View {
     let item: CameraConnectionService.GalleryItem
@@ -661,12 +661,21 @@ private struct TransferSheet: View {
             VStack(spacing: 14) {
                 if phase == .confirm { Text("保存 \(items.count) 张图片到相册").font(.headline); Spacer(); Button("确认") { begin() }.buttonStyle(.borderedProminent); Button("取消") { dismiss() } }
                 else if phase == .transferring { transferringView }
-                else { Text("成功接收\(received)个文件 失败\(failed)个\(cancelled > 0 ? " 取消传输\(cancelled)个" : "")").multilineTextAlignment(.center); Spacer(); Button("完成") { dismiss() }.buttonStyle(.borderedProminent) }
-            }.padding(20).navigationTitle(phase == .transferring ? "传输中" : phase == .completed ? "传输完成" : "确认下载").navigationBarTitleDisplayMode(.inline)
+                else {
+                    Text("成功接收\(received)个文件 失败\(failed)个\(cancelled > 0 ? " 取消传输\(cancelled)个" : "")")
+                        .multilineTextAlignment(.center); Spacer(); Button("完成") {
+                            dismiss()
+                        }
+                        .buttonStyle(.borderedProminent)
+                }
+            }
+            .padding(20)
+            .navigationTitle(phase == .transferring ? "传输中" : phase == .completed ? "传输完成" : "确认下载").navigationBarTitleDisplayMode(.inline)
         }.presentationDetents([.height(250)]).interactiveDismissDisabled(phase == .transferring)
-        .onAppear { if phase == .transferring && transferTask == nil { begin() } }
-        .onDisappear { transferTask?.cancel() }
+            .onAppear { if phase == .transferring && transferTask == nil { begin() } }
+            .onDisappear { transferTask?.cancel() }
     }
+
     private var progress: Double { totalBytes > 0 ? min(Double(bytesReceived) / Double(totalBytes), 1) : (items.isEmpty ? 0 : Double(current) / Double(items.count)) }
     private var transferringView: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -681,6 +690,7 @@ private struct TransferSheet: View {
                 }
         }
     }
+
     private func begin() {
         phase = .transferring; current = 0; totalBytes = items.reduce(0) { $0 + $1.fileSize }
         transferTask = Task { @MainActor in
@@ -697,6 +707,7 @@ private struct TransferSheet: View {
             phase = .completed
         }
     }
+
     private func save(url: URL) async throws {
         try await PHPhotoLibrary.shared().performChanges {
             let request = PHAssetCreationRequest.forAsset()

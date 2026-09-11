@@ -3,9 +3,9 @@
 //  ZLinks
 //
 
+import Combine
 import Foundation
 import Network
-import Combine
 import UIKit
 
 @MainActor
@@ -174,7 +174,7 @@ final class CameraConnectionService: ObservableObject {
 
             let guid = Data([
                 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-                0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF
+                0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff
             ])
             try await send(ptpIPPacket(type: .initCommandRequest, payload: initCommandPayload(guid: guid)), on: command)
             let acknowledgement = try await receivePacket(on: command)
@@ -406,7 +406,7 @@ final class CameraConnectionService: ObservableObject {
             let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
             appendLog(
                 "[图库] 目录媒体完成 dir=\(directory.pickerTitle) photos=\(photos) videos=\(videos) " +
-                "total=\(items.count) elapsedMs=\(elapsedMs)"
+                    "total=\(items.count) elapsedMs=\(elapsedMs)"
             )
         } catch {
             galleryItems = []
@@ -435,7 +435,7 @@ final class CameraConnectionService: ObservableObject {
             guard response.code == PTPResponseCode.ok.rawValue, let data = response.data, !data.isEmpty else {
                 appendLog(
                     "[图库] 缩略图失败 \(galleryItemLabel(handle: handle, filename: filename)) " +
-                    "code=0x\(String(format: "%04X", response.code)) bytes=\(response.data?.count ?? 0)"
+                        "code=0x\(String(format: "%04X", response.code)) bytes=\(response.data?.count ?? 0)"
                 )
                 return nil
             }
@@ -482,10 +482,11 @@ final class CameraConnectionService: ObservableObject {
             guard response.code == PTPResponseCode.ok.rawValue,
                   let data = response.data,
                   !data.isEmpty,
-                  let image = UIImage(data: data) else {
+                  let image = UIImage(data: data)
+            else {
                 appendLog(
                     "[图库] 原图失败 \(galleryItemLabel(handle: handle, filename: filename)) " +
-                    "code=0x\(String(format: "%04X", response.code)) bytes=\(response.data?.count ?? 0)"
+                        "code=0x\(String(format: "%04X", response.code)) bytes=\(response.data?.count ?? 0)"
                 )
                 return nil
             }
@@ -540,7 +541,7 @@ final class CameraConnectionService: ObservableObject {
         if logStyle != .silent {
             appendLog(
                 "[command] OperationRequest name=\(code.debugName) code=0x\(String(format: "%04X", code.rawValue)) " +
-                "transaction=\(currentTransactionID) parameters=\(parameters.map { String(format: "0x%08X", $0) }.joined(separator: ","))"
+                    "transaction=\(currentTransactionID) parameters=\(parameters.map { String(format: "0x%08X", $0) }.joined(separator: ","))"
             )
         }
 
@@ -599,12 +600,12 @@ final class CameraConnectionService: ObservableObject {
                 if logStyle != .silent {
                     appendLog(
                         "[command] OperationResponse name=\(code.debugName) code=0x\(String(format: "%04X", responseCode)) " +
-                        "transaction=\(responseTransactionID) dataBytes=\(receivedData.count)"
+                            "transaction=\(responseTransactionID) dataBytes=\(receivedData.count)"
                     )
                 } else if responseCode != PTPResponseCode.ok.rawValue {
                     appendLog(
                         "[command] OperationResponse name=\(code.debugName) code=0x\(String(format: "%04X", responseCode)) " +
-                        "transaction=\(responseTransactionID) dataBytes=\(receivedData.count)"
+                            "transaction=\(responseTransactionID) dataBytes=\(receivedData.count)"
                     )
                 }
                 return PTPResponse(code: responseCode, data: dataPhase == .receive ? receivedData : nil)
@@ -782,7 +783,7 @@ final class CameraConnectionService: ObservableObject {
         }
         appendLog(
             "[图库] 存储数量 count=\(storageIDs.count) ids=" +
-            storageIDs.map { String(format: "0x%08X", $0) }.joined(separator: ",")
+                storageIDs.map { String(format: "0x%08X", $0) }.joined(separator: ",")
         )
 
         var directories: [GalleryDirectory] = []
@@ -795,7 +796,7 @@ final class CameraConnectionService: ObservableObject {
             if let root = try? await fetchObjectHandles(
                 storageID: storageID,
                 objectFormat: 0,
-                parent: 0xFFFF_FFFF,
+                parent: 0xffffffff,
                 on: connection
             ) {
                 appendLog(
@@ -827,7 +828,7 @@ final class CameraConnectionService: ObservableObject {
                     } catch {
                         appendLog(
                             "[图库] 目录子项失败 parent=0x\(String(format: "%08X", folderHandle)) " +
-                            "error=\(error.localizedDescription)"
+                                "error=\(error.localizedDescription)"
                         )
                         continue
                     }
@@ -865,7 +866,7 @@ final class CameraConnectionService: ObservableObject {
                         directories.append(directory)
                         appendLog(
                             "[图库] 可选目录 \(directory.pickerTitle) path=\(directory.path) " +
-                            "media=\(directMediaCount) handle=0x\(String(format: "%08X", folderHandle))"
+                                "media=\(directMediaCount) handle=0x\(String(format: "%08X", folderHandle))"
                         )
                     }
                 } else if directMediaCount > 0 {
@@ -919,7 +920,7 @@ final class CameraConnectionService: ObservableObject {
         let rootHandles = try await fetchObjectHandles(
             storageID: directory.storageID,
             objectFormat: 0,
-            parent: directory.isSyntheticRoot ? 0xFFFF_FFFF : directory.handle,
+            parent: directory.isSyntheticRoot ? 0xffffffff : directory.handle,
             on: connection
         )
 
@@ -951,7 +952,7 @@ final class CameraConnectionService: ObservableObject {
                     queue.append(contentsOf: descendants)
                     appendLog(
                         "[图库] 递归目录 parent=0x\(String(format: "%08X", handle)) " +
-                        "children=\(descendants.count)"
+                            "children=\(descendants.count)"
                     )
                     continue
                 }
@@ -976,21 +977,21 @@ final class CameraConnectionService: ObservableObject {
                 skippedErrors += 1
                 appendLog(
                     "[图库] ObjectInfo 跳过 handle=0x\(String(format: "%08X", handle)) " +
-                    "error=\(error.localizedDescription)"
+                        "error=\(error.localizedDescription)"
                 )
             }
 
             if processed % 25 == 0 || queue.isEmpty {
                 appendLog(
                     "[图库] 目录解析进度 dir=\(directory.pickerTitle) processed=\(processed) pending=\(queue.count) " +
-                    "media=\(items.count)"
+                        "media=\(items.count)"
                 )
             }
         }
 
         items.sort { lhs, rhs in
             switch (lhs.captureDate, rhs.captureDate) {
-            case let (l?, r?):
+            case (let l?, let r?):
                 if l != r { return l > r }
             case (_?, nil):
                 return true
@@ -1004,7 +1005,7 @@ final class CameraConnectionService: ObservableObject {
 
         appendLog(
             "[图库] 目录解析结束 dir=\(directory.pickerTitle) media=\(items.count) " +
-            "skippedNonMedia=\(skippedNonMedia) errors=\(skippedErrors)"
+                "skippedNonMedia=\(skippedNonMedia) errors=\(skippedErrors)"
         )
         return items
     }
@@ -1028,7 +1029,7 @@ final class CameraConnectionService: ObservableObject {
             throw CameraConnectionError.malformedPacket
         }
         let ids = (0..<count).map { data.uint32(at: 4 + $0 * 4) }
-        let present = ids.filter { ($0 & 0x0000_FFFF) != 0 }
+        let present = ids.filter { ($0 & 0x0000ffff) != 0 }
         return present.isEmpty ? ids : present
     }
 
@@ -1048,7 +1049,7 @@ final class CameraConnectionService: ObservableObject {
         guard response.code == PTPResponseCode.ok.rawValue, let data = response.data, data.count >= 4 else {
             appendLog(
                 "[图库] GetObjectHandles 失败 storageID=0x\(String(format: "%08X", storageID)) " +
-                "parent=0x\(String(format: "%08X", parent)) code=0x\(String(format: "%04X", response.code))"
+                    "parent=0x\(String(format: "%08X", parent)) code=0x\(String(format: "%04X", response.code))"
             )
             throw CameraConnectionError.ptpResponse(response.code)
         }
@@ -1058,7 +1059,7 @@ final class CameraConnectionService: ObservableObject {
         guard data.count >= needed else {
             appendLog(
                 "[图库] GetObjectHandles 数据异常 storageID=0x\(String(format: "%08X", storageID)) " +
-                "parent=0x\(String(format: "%08X", parent)) bytes=\(data.count) count=\(count)"
+                    "parent=0x\(String(format: "%08X", parent)) bytes=\(data.count) count=\(count)"
             )
             throw CameraConnectionError.malformedPacket
         }
@@ -1101,7 +1102,7 @@ final class CameraConnectionService: ObservableObject {
         guard response.code == PTPResponseCode.ok.rawValue, let data = response.data else {
             appendLog(
                 "[图库] GetObjectInfo 失败 handle=0x\(String(format: "%08X", handle)) " +
-                "code=0x\(String(format: "%04X", response.code)) bytes=\(response.data?.count ?? 0)"
+                    "code=0x\(String(format: "%04X", response.code)) bytes=\(response.data?.count ?? 0)"
             )
             return nil
         }
@@ -1142,7 +1143,7 @@ final class CameraConnectionService: ObservableObject {
         do {
             let response = try await operation(
                 .getObjectPropValue,
-                parameters: [handle, 0x0000_DC89],
+                parameters: [handle, 0x0000dc89],
                 dataPhase: .receive,
                 on: connection,
                 logStyle: .silent
@@ -1150,14 +1151,16 @@ final class CameraConnectionService: ObservableObject {
             guard response.code == PTPResponseCode.ok.rawValue,
                   let data = response.data,
                   let raw = readIntegerValue(from: data),
-                  raw > 0 else {
+                  raw > 0
+            else {
                 // Many cameras omit Duration; keep the log quiet unless it's an unexpected hard failure.
                 if response.code != PTPResponseCode.ok.rawValue,
-                   response.code != 0x200A, // DevicePropNotSupported-ish / common reject
-                   response.code != 0xA801 {
+                   response.code != 0x200a, // DevicePropNotSupported-ish / common reject
+                   response.code != 0xa801
+                {
                     appendLog(
                         "[图库] 视频时长读取被拒 \(galleryItemLabel(handle: handle, filename: filename)) " +
-                        "code=0x\(String(format: "%04X", response.code))"
+                            "code=0x\(String(format: "%04X", response.code))"
                     )
                 }
                 return nil
@@ -1179,7 +1182,7 @@ final class CameraConnectionService: ObservableObject {
         } catch {
             appendLog(
                 "[图库] 视频时长读取异常 \(galleryItemLabel(handle: handle, filename: filename)) " +
-                "error=\(error.localizedDescription)"
+                    "error=\(error.localizedDescription)"
             )
             return nil
         }
@@ -1201,7 +1204,7 @@ final class CameraConnectionService: ObservableObject {
 
     private func isImageMedia(objectFormat: UInt16, filename: String) -> Bool {
         switch objectFormat {
-        case 0x3801, 0x3802, 0x3804, 0x3808, 0x380D, 0x3811, 0xB802, 0xB80A:
+        case 0x3801, 0x3802, 0x3804, 0x3808, 0x380d, 0x3811, 0xb802, 0xb80a:
             return true
         default:
             break
@@ -1212,7 +1215,7 @@ final class CameraConnectionService: ObservableObject {
 
     private func isVideoMedia(objectFormat: UInt16, filename: String) -> Bool {
         switch objectFormat {
-        case 0x3008, 0x3009, 0x300A, 0x300B, 0x300C, 0x300D, 0xB982, 0xB984:
+        case 0x3008, 0x3009, 0x300a, 0x300b, 0x300c, 0x300d, 0xb982, 0xb984:
             return true
         default:
             break
@@ -1238,7 +1241,7 @@ final class CameraConnectionService: ObservableObject {
         return formatter.date(from: core)
     }
 
-        private func readCameraStatus(on connection: NWConnection) async -> CameraStatus {
+    private func readCameraStatus(on connection: NWConnection) async -> CameraStatus {
         var status = CameraStatus()
 
         // These are standard PTP properties. Nikon may omit one or expose a
@@ -1246,21 +1249,24 @@ final class CameraConnectionService: ObservableObject {
         if let battery = try? await operation(.getDevicePropValue, parameters: [0x5001], dataPhase: .receive, on: connection),
            battery.code == PTPResponseCode.ok.rawValue,
            let data = battery.data,
-           let value = data.first {
+           let value = data.first
+        {
             status.batteryLevel = min(Int(value), 100)
         }
 
         if let storageIDs = try? await operation(.getStorageIDs, parameters: [], dataPhase: .receive, on: connection),
            storageIDs.code == PTPResponseCode.ok.rawValue,
            let data = storageIDs.data,
-           data.count >= 4 {
+           data.count >= 4
+        {
             let count = Int(data.uint32(at: 0))
             if count > 0, data.count >= 8 {
                 let storageID = data.uint32(at: 4)
                 if let storageInfo = try? await operation(.getStorageInfo, parameters: [storageID], dataPhase: .receive, on: connection),
                    storageInfo.code == PTPResponseCode.ok.rawValue,
                    let storageData = storageInfo.data,
-                   storageData.count >= 27 {
+                   storageData.count >= 27
+                {
                     status.storageTotalBytes = storageData.uint64(at: 6)
                     status.storageFreeBytes = storageData.uint64(at: 14)
                     status.storageName = try? readPTPString(from: storageData, offset: 26).value
@@ -1271,8 +1277,8 @@ final class CameraConnectionService: ObservableObject {
                     dataPhase: .receive,
                     on: connection
                 ), numberOfObjects.code == PTPResponseCode.ok.rawValue,
-                   let objectData = numberOfObjects.data,
-                   objectData.count >= 4 {
+                let objectData = numberOfObjects.data,
+                objectData.count >= 4 {
                     status.mediaObjectCount = Int(objectData.uint32(at: 0))
                 }
             }
@@ -1289,72 +1295,80 @@ final class CameraConnectionService: ObservableObject {
         // LensID 0xD0E0, LensType 0xD0E2, FocalLengthMin/Max 0xD0E3/0xD0E4,
         // MaxApAtMin/MaxFocal 0xD0E5/0xD0E6. Standard PTP current values:
         // FNumber 0x5007, FocalLength 0x5008. Scale is value / 100.
-        if let response = try? await operation(.getDevicePropValue, parameters: [0xD0E0], dataPhase: .receive, on: connection),
+        if let response = try? await operation(.getDevicePropValue, parameters: [0xd0e0], dataPhase: .receive, on: connection),
            response.code == PTPResponseCode.ok.rawValue,
            let data = response.data,
-           let value = readIntegerValue(from: data) {
+           let value = readIntegerValue(from: data)
+        {
             info.lensID = UInt16(clamping: value)
             appendLog("镜头 LensID=0x\(String(format: "%04X", info.lensID ?? 0)) raw=\(value)")
         }
 
-        if let response = try? await operation(.getDevicePropValue, parameters: [0xD0E2], dataPhase: .receive, on: connection),
+        if let response = try? await operation(.getDevicePropValue, parameters: [0xd0e2], dataPhase: .receive, on: connection),
            response.code == PTPResponseCode.ok.rawValue,
            let data = response.data,
-           let value = readIntegerValue(from: data) {
+           let value = readIntegerValue(from: data)
+        {
             info.lensType = UInt32(clamping: value)
             appendLog("镜头 LensType=\(value)")
         }
 
-        if let response = try? await operation(.getDevicePropValue, parameters: [0xD0E3], dataPhase: .receive, on: connection),
+        if let response = try? await operation(.getDevicePropValue, parameters: [0xd0e3], dataPhase: .receive, on: connection),
            response.code == PTPResponseCode.ok.rawValue,
            let data = response.data,
-           let value = readIntegerValue(from: data) {
+           let value = readIntegerValue(from: data)
+        {
             info.minFocalLengthMM = Double(value) / 100.0
         }
 
-        if let response = try? await operation(.getDevicePropValue, parameters: [0xD0E4], dataPhase: .receive, on: connection),
+        if let response = try? await operation(.getDevicePropValue, parameters: [0xd0e4], dataPhase: .receive, on: connection),
            response.code == PTPResponseCode.ok.rawValue,
            let data = response.data,
-           let value = readIntegerValue(from: data) {
+           let value = readIntegerValue(from: data)
+        {
             info.maxFocalLengthMM = Double(value) / 100.0
         }
 
-        if let response = try? await operation(.getDevicePropValue, parameters: [0xD0E5], dataPhase: .receive, on: connection),
+        if let response = try? await operation(.getDevicePropValue, parameters: [0xd0e5], dataPhase: .receive, on: connection),
            response.code == PTPResponseCode.ok.rawValue,
            let data = response.data,
-           let value = readIntegerValue(from: data) {
+           let value = readIntegerValue(from: data)
+        {
             info.maxApertureAtMinFocal = Double(value) / 100.0
         }
 
-        if let response = try? await operation(.getDevicePropValue, parameters: [0xD0E6], dataPhase: .receive, on: connection),
+        if let response = try? await operation(.getDevicePropValue, parameters: [0xd0e6], dataPhase: .receive, on: connection),
            response.code == PTPResponseCode.ok.rawValue,
            let data = response.data,
-           let value = readIntegerValue(from: data) {
+           let value = readIntegerValue(from: data)
+        {
             info.maxApertureAtMaxFocal = Double(value) / 100.0
         }
 
         if let response = try? await operation(.getDevicePropValue, parameters: [0x5008], dataPhase: .receive, on: connection),
            response.code == PTPResponseCode.ok.rawValue,
            let data = response.data,
-           let value = readIntegerValue(from: data) {
+           let value = readIntegerValue(from: data)
+        {
             info.currentFocalLengthMM = Double(value) / 100.0
         }
 
         if let response = try? await operation(.getDevicePropValue, parameters: [0x5007], dataPhase: .receive, on: connection),
            response.code == PTPResponseCode.ok.rawValue,
            let data = response.data,
-           let value = readIntegerValue(from: data) {
+           let value = readIntegerValue(from: data)
+        {
             info.currentAperture = Double(value) / 100.0
         }
 
         let hasAnyLensMetric =
             info.lensID != nil
-            || info.minFocalLengthMM != nil
-            || info.maxFocalLengthMM != nil
-            || info.maxApertureAtMinFocal != nil
-            || info.maxApertureAtMaxFocal != nil
-            || info.currentFocalLengthMM != nil
-            || info.currentAperture != nil
+                || info.minFocalLengthMM != nil
+                || info.maxFocalLengthMM != nil
+                || info.maxApertureAtMinFocal != nil
+                || info.maxApertureAtMaxFocal != nil
+                || info.currentFocalLengthMM != nil
+                || info.currentAperture != nil
 
         if !hasAnyLensMetric {
             info.connectionState = .unknown
@@ -1364,9 +1378,9 @@ final class CameraConnectionService: ObservableObject {
 
         let looksDetached =
             (info.lensID == 0 || info.lensID == nil)
-            && (info.minFocalLengthMM ?? 0) == 0
-            && (info.maxFocalLengthMM ?? 0) == 0
-            && (info.currentFocalLengthMM ?? 0) == 0
+                && (info.minFocalLengthMM ?? 0) == 0
+                && (info.maxFocalLengthMM ?? 0) == 0
+                && (info.currentFocalLengthMM ?? 0) == 0
 
         if looksDetached {
             info.connectionState = .noneAttached
@@ -1376,10 +1390,10 @@ final class CameraConnectionService: ObservableObject {
 
         appendLog(
             "镜头信息 state=\(info.connectionState.title) id=\(info.lensID.map(String.init) ?? "--") " +
-            "focal=\(info.minFocalLengthMM.map(formatFocalLength) ?? "--")-\(info.maxFocalLengthMM.map(formatFocalLength) ?? "--") " +
-            "aperture=\(info.maxApertureAtMinFocal.map(formatAperture) ?? "--")-\(info.maxApertureAtMaxFocal.map(formatAperture) ?? "--") " +
-            "currentFocal=\(info.currentFocalLengthMM.map(formatFocalLength) ?? "--") " +
-            "currentAperture=\(info.currentAperture.map(formatAperture) ?? "--")"
+                "focal=\(info.minFocalLengthMM.map(formatFocalLength) ?? "--")-\(info.maxFocalLengthMM.map(formatFocalLength) ?? "--") " +
+                "aperture=\(info.maxApertureAtMinFocal.map(formatAperture) ?? "--")-\(info.maxApertureAtMaxFocal.map(formatAperture) ?? "--") " +
+                "currentFocal=\(info.currentFocalLengthMM.map(formatFocalLength) ?? "--") " +
+                "currentAperture=\(info.currentAperture.map(formatAperture) ?? "--")"
         )
         return info
     }
@@ -1458,7 +1472,8 @@ final class CameraConnectionService: ObservableObject {
             nameEnd += 2
         }
         guard nameEnd + 1 < protocolVersionOffset,
-              data.uint16(at: nameEnd) == 0 else {
+              data.uint16(at: nameEnd) == 0
+        else {
             appendLog("InitCommandAck FriendlyName 未找到 UTF-16 终止符 start=20 end=\(protocolVersionOffset)")
             throw CameraConnectionError.malformedPacket
         }
@@ -1514,7 +1529,6 @@ final class CameraConnectionService: ObservableObject {
             serialNumber: Self.normalizedSerialNumber(serial.value)
         )
     }
-
 
     private static func normalizedSerialNumber(_ value: String) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1611,8 +1625,8 @@ private enum PTPIPPacketType: UInt32 {
     case operationResponse = 0x00000007
     case event = 0x00000008
     case startData = 0x00000009
-    case data = 0x0000000A
-    case endData = 0x0000000C
+    case data = 0x0000000a
+    case endData = 0x0000000c
 
     var debugName: String {
         switch self {
@@ -1640,7 +1654,7 @@ private enum PTPOperationCode: UInt16 {
     case getObjectHandles = 0x1007
     case getObjectInfo = 0x1008
     case getObject = 0x1009
-    case getThumb = 0x100A
+    case getThumb = 0x100a
     case getDevicePropValue = 0x1015
     case getObjectPropValue = 0x9803
 

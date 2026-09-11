@@ -35,7 +35,7 @@ struct MyCameraView: View {
                             .font(.body.weight(.semibold))
                     }
                     .accessibilityLabel("连接日志")
-                    
+
                     Button {
                         Task { await camera.refreshCameraStatus() }
                     } label: {
@@ -263,7 +263,8 @@ struct MyCameraView: View {
 
     private var currentFocalLengthText: String {
         guard case .connected = camera.state,
-              let value = camera.lensInfo.currentFocalLengthMM else {
+              let value = camera.lensInfo.currentFocalLengthMM
+        else {
             return "--"
         }
         return formatLensFocalLength(value)
@@ -271,7 +272,8 @@ struct MyCameraView: View {
 
     private var currentApertureText: String {
         guard case .connected = camera.state,
-              let value = camera.lensInfo.currentAperture else {
+              let value = camera.lensInfo.currentAperture
+        else {
             return "--"
         }
         return formatLensAperture(value)
@@ -437,7 +439,8 @@ struct MyCameraView: View {
 
     private var batteryText: String {
         guard case .connected = camera.state,
-              let level = camera.cameraStatus.batteryLevel else {
+              let level = camera.cameraStatus.batteryLevel
+        else {
             return "--%"
         }
         return "\(level)%"
@@ -445,7 +448,8 @@ struct MyCameraView: View {
 
     private var batteryTint: Color {
         guard case .connected = camera.state,
-              let level = camera.cameraStatus.batteryLevel else {
+              let level = camera.cameraStatus.batteryLevel
+        else {
             return .secondary
         }
         switch level {
@@ -460,7 +464,8 @@ struct MyCameraView: View {
 
     private var batterySymbol: String {
         guard case .connected = camera.state,
-              let level = camera.cameraStatus.batteryLevel else {
+              let level = camera.cameraStatus.batteryLevel
+        else {
             return "battery.0percent"
         }
         switch level {
@@ -480,7 +485,8 @@ struct MyCameraView: View {
     private var storageUsedRatio: Double {
         guard let free = camera.cameraStatus.storageFreeBytes,
               let total = camera.cameraStatus.storageTotalBytes,
-              total > 0 else {
+              total > 0
+        else {
             return 0
         }
         let used = total > free ? total - free : 0
@@ -489,13 +495,13 @@ struct MyCameraView: View {
 
     private var storageUsageText: String {
         guard let free = camera.cameraStatus.storageFreeBytes,
-              let total = camera.cameraStatus.storageTotalBytes else {
+              let total = camera.cameraStatus.storageTotalBytes
+        else {
             return "-- / --"
         }
         let used = total > free ? total - free : 0
         return "\(formatBytes(used)) / \(formatBytes(total))"
     }
-
 
     private func detailRow(_ title: String, value: String) -> some View {
         HStack(alignment: .firstTextBaseline) {
@@ -554,7 +560,7 @@ private struct CameraConnectionSheet: View {
                         discoveredCameras
                         advancedOptions
 
-                        if case .failed(let message) = camera.state {
+                        if case let .failed(message) = camera.state {
                             Label(message, systemImage: "exclamationmark.triangle.fill")
                                 .font(.footnote)
                                 .foregroundStyle(.red)
@@ -642,7 +648,7 @@ private struct CameraConnectionSheet: View {
             SecureField("密码（开放网络可留空）", text: $cameraPassword)
                 .textFieldStyle(.roundedBorder)
 
-            HStack{
+            HStack {
                 Spacer()
                 Button {
                     Task {
@@ -668,9 +674,8 @@ private struct CameraConnectionSheet: View {
                 .buttonStyle(.glassProminent)
                 .disabled(cameraSSID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || wifi.state == .joining)
             }
-            
 
-            if case .failed(let message) = wifi.state {
+            if case let .failed(message) = wifi.state {
                 Label(message, systemImage: "exclamationmark.triangle")
                     .font(.footnote)
                     .foregroundStyle(.red)
@@ -685,7 +690,7 @@ private struct CameraConnectionSheet: View {
     private var discoveredCameras: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                    Text("发现相机")
+                Text("发现相机")
                     .font(.headline)
                 Spacer()
                 Button {
@@ -752,7 +757,7 @@ private struct CameraConnectionSheet: View {
                     .autocorrectionDisabled()
                     .textFieldStyle(.roundedBorder)
 
-                HStack{
+                HStack {
                     Spacer()
                     Button {
                         let host = manualHost.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -783,7 +788,6 @@ private struct CameraConnectionSheet: View {
         }
         .tint(.primary)
     }
-
 }
 
 private struct CameraDebugLogView: View {
@@ -832,8 +836,6 @@ private struct CameraDebugLogView: View {
         }
     }
 }
-
-
 
 private struct GuidePanel: View {
     let title: String

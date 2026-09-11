@@ -3,9 +3,9 @@
 //  ZLinks
 //
 
+import Combine
 import Foundation
 import NetworkExtension
-import Combine
 
 @MainActor
 final class CameraWiFiService: ObservableObject {

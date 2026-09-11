@@ -34,7 +34,7 @@ final class CameraDiscoveryService: ObservableObject {
         isSearching = true
         statusMessage = "正在扫描 \(subnet).0/24 网络"
         scanTask = Task { [weak self] in
-            let hosts = (1...254).map { "\(subnet).\($0)" }
+            let hosts = (1 ... 254).map { "\(subnet).\($0)" }
             let foundHosts = await Self.findPTPIPHosts(in: hosts)
             guard !Task.isCancelled else { return }
             self?.cameras = foundHosts.map(Camera.init(host:))
@@ -65,7 +65,8 @@ final class CameraDiscoveryService: ObservableObject {
             let name = String(cString: interface.pointee.ifa_name)
             guard ["en0", "bridge100", "ap1"].contains(name),
                   let address = interface.pointee.ifa_addr,
-                  address.pointee.sa_family == sa_family_t(AF_INET) else {
+                  address.pointee.sa_family == sa_family_t(AF_INET)
+            else {
                 continue
             }
 
@@ -89,7 +90,7 @@ final class CameraDiscoveryService: ObservableObject {
         for startIndex in stride(from: 0, to: hosts.count, by: batchSize) {
             if Task.isCancelled { break }
             let endIndex = min(startIndex + batchSize, hosts.count)
-            let batch = hosts[startIndex..<endIndex]
+            let batch = hosts[startIndex ..< endIndex]
             let batchMatches = await withTaskGroup(of: String?.self, returning: [String].self) { group in
                 for host in batch {
                     group.addTask {
@@ -132,7 +133,7 @@ private nonisolated func isPTPIPPortOpen(host: String) async -> Bool {
     }
 }
 
-private nonisolated final class PortProbeCompletion: @unchecked Sendable {
+private final nonisolated class PortProbeCompletion: @unchecked Sendable {
     private let lock = NSLock()
     private var didFinish = false
     private let connection: NWConnection
