@@ -206,18 +206,23 @@ final class CameraConnectionService: ObservableObject {
     func refreshGallery() async {
         guard case .connected = state, let commandConnection else {
             galleryItems = []
+            appendLog("[图库] 未连接相机，跳过刷新")
             return
         }
 
-        appendLog("开始刷新图库")
+        let startedAt = Date()
+        appendLog("[图库] 开始刷新媒体列表")
         thumbnailCache = [:]
         durationCache = [:]
         do {
             let items = try await loadGalleryItems(on: commandConnection)
             galleryItems = items
-            appendLog("图库刷新完成 count=\(items.count) videos=\(items.filter(\.isVideo).count)")
+            let photos = items.filter { !$0.isVideo }.count
+            let videos = items.filter(\.isVideo).count
+            let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
+            appendLog("[图库] 媒体列表完成 photos=\(photos) videos=\(videos) total=\(items.count) elapsedMs=\(elapsedMs)")
         } catch {
-            appendLog("图库刷新失败 error=\(String(reflecting: error)) description=\(error.localizedDescription)")
+            appendLog("[图库] 媒体列表失败 error=\(error.localizedDescription)")
         }
     }
 
@@ -225,23 +230,31 @@ final class CameraConnectionService: ObservableObject {
         if let cached = thumbnailCache[handle], let image = UIImage(data: cached) {
             return image
         }
-        guard case .connected = state, let commandConnection else { return nil }
+        guard case .connected = state, let commandConnection else {
+            appendLog("[图库] 缩略图跳过 handle=0x\(String(format: "%08X", handle)) reason=未连接")
+            return nil
+        }
 
+        let filename = galleryItems.first(where: { $0.handle == handle })?.filename
         do {
             let response = try await operation(
                 .getThumb,
                 parameters: [handle],
                 dataPhase: .receive,
                 on: commandConnection,
-                logPayloadHex: false
+                logStyle: .silent
             )
             guard response.code == PTPResponseCode.ok.rawValue, let data = response.data, !data.isEmpty else {
+                appendLog(
+                    "[图库] 缩略图失败 \(galleryItemLabel(handle: handle, filename: filename)) " +
+                    "code=0x\(String(format: "%04X", response.code)) bytes=\(response.data?.count ?? 0)"
+                )
                 return nil
             }
             thumbnailCache[handle] = data
             return UIImage(data: data)
         } catch {
-            appendLog("缩略图获取失败 handle=0x\(String(format: "%08X", handle)) error=\(error.localizedDescription)")
+            appendLog("[图库] 缩略图异常 \(galleryItemLabel(handle: handle, filename: filename)) error=\(error.localizedDescription)")
             return nil
         }
     }
@@ -263,7 +276,7 @@ final class CameraConnectionService: ObservableObject {
         parameters: [UInt32],
         dataPhase: DataPhase?,
         on connection: NWConnection,
-        logPayloadHex: Bool = true
+        logStyle: OperationLogStyle = .verbose
     ) async throws -> PTPResponse {
         await acquireOperationSlot()
         defer { releaseOperationSlot() }
@@ -285,40 +298,58 @@ final class CameraConnectionService: ObservableObject {
         for parameter in parameters {
             operationPayload.append(uint32Data(parameter))
         }
-        appendLog("[command] OperationRequest name=\(code.debugName) code=0x\(String(format: "%04X", code.rawValue)) transaction=\(currentTransactionID) parameters=\(parameters.map { String(format: "0x%08X", $0) }.joined(separator: ","))")
-        try await send(ptpIPPacket(type: .operationRequest, payload: operationPayload), on: connection, logPayloadHex: logPayloadHex)
+
+        if logStyle != .silent {
+            appendLog(
+                "[command] OperationRequest name=\(code.debugName) code=0x\(String(format: "%04X", code.rawValue)) " +
+                "transaction=\(currentTransactionID) parameters=\(parameters.map { String(format: "0x%08X", $0) }.joined(separator: ","))"
+            )
+        }
+
+        try await send(
+            ptpIPPacket(type: .operationRequest, payload: operationPayload),
+            on: connection,
+            logStyle: logStyle
+        )
 
         var receivedData = Data()
         while true {
-            let packet = try await receivePacket(on: connection, logPayloadHex: logPayloadHex)
+            let packet = try await receivePacket(on: connection, logStyle: logStyle)
             switch packet.type {
             case PTPIPPacketType.startData.rawValue:
                 guard packet.payload.count >= 12 else {
+                    appendLog("[command] StartData 报文异常 name=\(code.debugName) transaction=\(currentTransactionID)")
                     throw CameraConnectionError.malformedPacket
                 }
                 let dataTransactionID = packet.payload.uint32(at: 0)
                 guard dataTransactionID == currentTransactionID else {
+                    appendLog("[command] StartData 事务号不匹配 name=\(code.debugName) expected=\(currentTransactionID) actual=\(dataTransactionID)")
                     throw CameraConnectionError.transactionMismatch
                 }
                 continue
             case PTPIPPacketType.data.rawValue:
                 guard packet.payload.count >= 4 else {
+                    appendLog("[command] Data 报文异常 name=\(code.debugName) transaction=\(currentTransactionID)")
                     throw CameraConnectionError.malformedPacket
                 }
                 guard packet.payload.uint32(at: 0) == currentTransactionID else {
+                    appendLog("[command] Data 事务号不匹配 name=\(code.debugName) transaction=\(currentTransactionID)")
                     throw CameraConnectionError.transactionMismatch
                 }
                 receivedData.append(packet.payload.dropFirst(4))
             case PTPIPPacketType.endData.rawValue:
                 guard packet.payload.count >= 4 else {
+                    appendLog("[command] EndData 报文异常 name=\(code.debugName) transaction=\(currentTransactionID)")
                     throw CameraConnectionError.malformedPacket
                 }
                 guard packet.payload.uint32(at: 0) == currentTransactionID else {
+                    appendLog("[command] EndData 事务号不匹配 name=\(code.debugName) transaction=\(currentTransactionID)")
                     throw CameraConnectionError.transactionMismatch
                 }
                 receivedData.append(packet.payload.dropFirst(4))
             case PTPIPPacketType.operationResponse.rawValue:
                 guard packet.payload.count >= 6 else {
+                    appendLog("[command] OperationResponse 报文异常 name=\(code.debugName) transaction=\(currentTransactionID)")
                     throw CameraConnectionError.malformedPacket
                 }
                 let responseCode = packet.payload.uint16(at: 0)
@@ -327,10 +358,22 @@ final class CameraConnectionService: ObservableObject {
                     appendLog("[command] 事务号不匹配 expected=\(currentTransactionID) actual=\(responseTransactionID)")
                     throw CameraConnectionError.transactionMismatch
                 }
-                appendLog("[command] OperationResponse name=\(code.debugName) code=0x\(String(format: "%04X", responseCode)) transaction=\(responseTransactionID) dataBytes=\(receivedData.count)")
+                if logStyle != .silent {
+                    appendLog(
+                        "[command] OperationResponse name=\(code.debugName) code=0x\(String(format: "%04X", responseCode)) " +
+                        "transaction=\(responseTransactionID) dataBytes=\(receivedData.count)"
+                    )
+                } else if responseCode != PTPResponseCode.ok.rawValue {
+                    appendLog(
+                        "[command] OperationResponse name=\(code.debugName) code=0x\(String(format: "%04X", responseCode)) " +
+                        "transaction=\(responseTransactionID) dataBytes=\(receivedData.count)"
+                    )
+                }
                 return PTPResponse(code: responseCode, data: dataPhase == .receive ? receivedData : nil)
             default:
-                appendLog("[command] 忽略未预期包 type=\(packet.typeName)")
+                if logStyle != .silent {
+                    appendLog("[command] 忽略未预期包 type=\(packet.typeName)")
+                }
                 continue
             }
         }
@@ -360,11 +403,14 @@ final class CameraConnectionService: ObservableObject {
         }
     }
 
-    private func send(_ packet: Data, on connection: NWConnection, logPayloadHex: Bool = true) async throws {
-        if logPayloadHex {
+    private func send(_ packet: Data, on connection: NWConnection, logStyle: OperationLogStyle = .verbose) async throws {
+        switch logStyle {
+        case .verbose:
             appendLog("发送 PTP/IP type=\(packet.packetTypeName) totalBytes=\(packet.count) hex=\(packet.hexDump)")
-        } else {
+        case .compact:
             appendLog("发送 PTP/IP type=\(packet.packetTypeName) totalBytes=\(packet.count)")
+        case .silent:
+            break
         }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             connection.send(content: packet, completion: .contentProcessed { error in
@@ -377,7 +423,7 @@ final class CameraConnectionService: ObservableObject {
         }
     }
 
-    private func receivePacket(on connection: NWConnection, logPayloadHex: Bool = true) async throws -> PTPIPPacket {
+    private func receivePacket(on connection: NWConnection, logStyle: OperationLogStyle = .verbose) async throws -> PTPIPPacket {
         let header = try await receiveExactly(8, on: connection)
         let totalLength = Int(header.uint32(at: 0))
         guard totalLength >= 8 else {
@@ -387,10 +433,13 @@ final class CameraConnectionService: ObservableObject {
         let type = header.uint32(at: 4)
         let payload = totalLength > 8 ? try await receiveExactly(totalLength - 8, on: connection) : Data()
         let packet = PTPIPPacket(type: type, payload: payload)
-        if logPayloadHex {
+        switch logStyle {
+        case .verbose:
             appendLog("接收 PTP/IP type=\(packet.typeName) totalBytes=\(totalLength) payloadBytes=\(payload.count) hex=\(packet.hexDump)")
-        } else {
+        case .compact:
             appendLog("接收 PTP/IP type=\(packet.typeName) totalBytes=\(totalLength) payloadBytes=\(payload.count)")
+        case .silent:
+            break
         }
         return packet
     }
@@ -443,23 +492,36 @@ final class CameraConnectionService: ObservableObject {
     }
 
     private func loadGalleryItems(on connection: NWConnection) async throws -> [GalleryItem] {
+        appendLog("[图库] 正在获取对象句柄…")
         let handles = try await fetchObjectHandles(on: connection)
-        appendLog("图库 objectHandles count=\(handles.count)")
+        appendLog("[图库] 对象句柄就绪 count=\(handles.count)")
+
+        if handles.isEmpty {
+            appendLog("[图库] 存储中没有对象")
+            return []
+        }
 
         var items: [GalleryItem] = []
         items.reserveCapacity(handles.count)
+        var skippedNonMedia = 0
+        var skippedErrors = 0
+        var processed = 0
+        let progressStep = max(handles.count / 10, 25)
 
+        appendLog("[图库] 开始解析 ObjectInfo total=\(handles.count)")
         for handle in handles {
+            processed += 1
             do {
                 guard let info = try await fetchObjectInfo(handle: handle, on: connection) else {
+                    skippedErrors += 1
                     continue
                 }
                 guard isGalleryMedia(objectFormat: info.objectFormat, filename: info.filename) else {
+                    skippedNonMedia += 1
                     continue
                 }
 
                 let isVideo = isVideoMedia(objectFormat: info.objectFormat, filename: info.filename)
-
                 items.append(
                     GalleryItem(
                         id: handle,
@@ -471,8 +533,19 @@ final class CameraConnectionService: ObservableObject {
                     )
                 )
             } catch {
-                appendLog("ObjectInfo 跳过 handle=0x\(String(format: "%08X", handle)) error=\(error.localizedDescription)")
+                skippedErrors += 1
+                appendLog(
+                    "[图库] ObjectInfo 跳过 handle=0x\(String(format: "%08X", handle)) " +
+                    "error=\(error.localizedDescription)"
+                )
                 continue
+            }
+
+            if processed == handles.count || processed % progressStep == 0 {
+                appendLog(
+                    "[图库] ObjectInfo 进度 \(processed)/\(handles.count) " +
+                    "media=\(items.count) skippedNonMedia=\(skippedNonMedia) errors=\(skippedErrors)"
+                )
             }
         }
 
@@ -489,23 +562,42 @@ final class CameraConnectionService: ObservableObject {
             }
             return lhs.handle > rhs.handle
         }
+
+        appendLog(
+            "[图库] ObjectInfo 解析结束 media=\(items.count) " +
+            "skippedNonMedia=\(skippedNonMedia) errors=\(skippedErrors)"
+        )
         return items
     }
 
     private func fetchObjectHandles(on connection: NWConnection) async throws -> [UInt32] {
         // Prefer "all storages" query first; fall back to each StorageID if needed.
-        if let handles = try? await fetchObjectHandles(
-            storageID: 0xFFFF_FFFF,
-            on: connection
-        ), !handles.isEmpty {
-            return handles
+        do {
+            let handles = try await fetchObjectHandles(storageID: 0xFFFF_FFFF, on: connection)
+            if !handles.isEmpty {
+                appendLog("[图库] 使用全存储句柄查询 storageID=0xFFFFFFFF count=\(handles.count)")
+                return handles
+            }
+            appendLog("[图库] 全存储句柄查询返回空，改为分存储查询")
+        } catch {
+            appendLog("[图库] 全存储句柄查询失败，改为分存储查询 error=\(error.localizedDescription)")
         }
 
         let storageIDs = try await fetchStorageIDs(on: connection)
+        appendLog("[图库] 存储数量 count=\(storageIDs.count) ids=\(storageIDs.map { String(format: "0x%08X", $0) }.joined(separator: ","))")
+
         var handles: [UInt32] = []
         for storageID in storageIDs {
-            let part = try await fetchObjectHandles(storageID: storageID, on: connection)
-            handles.append(contentsOf: part)
+            do {
+                let part = try await fetchObjectHandles(storageID: storageID, on: connection)
+                appendLog("[图库] 存储句柄 storageID=0x\(String(format: "%08X", storageID)) count=\(part.count)")
+                handles.append(contentsOf: part)
+            } catch {
+                appendLog(
+                    "[图库] 存储句柄失败 storageID=0x\(String(format: "%08X", storageID)) " +
+                    "error=\(error.localizedDescription)"
+                )
+            }
         }
         return handles
     }
@@ -516,14 +608,16 @@ final class CameraConnectionService: ObservableObject {
             parameters: [],
             dataPhase: .receive,
             on: connection,
-            logPayloadHex: false
+            logStyle: .silent
         )
         guard response.code == PTPResponseCode.ok.rawValue, let data = response.data, data.count >= 4 else {
+            appendLog("[图库] GetStorageIDs 失败 code=0x\(String(format: "%04X", response.code))")
             throw CameraConnectionError.ptpResponse(response.code)
         }
         let count = Int(data.uint32(at: 0))
         let needed = 4 + count * 4
         guard count >= 0, data.count >= needed else {
+            appendLog("[图库] GetStorageIDs 数据异常 bytes=\(data.count) count=\(count)")
             throw CameraConnectionError.malformedPacket
         }
         return (0..<count).map { data.uint32(at: 4 + $0 * 4) }
@@ -536,15 +630,23 @@ final class CameraConnectionService: ObservableObject {
             parameters: [storageID, 0x0000_0000, 0xFFFF_FFFF],
             dataPhase: .receive,
             on: connection,
-            logPayloadHex: false
+            logStyle: .silent
         )
         guard response.code == PTPResponseCode.ok.rawValue, let data = response.data, data.count >= 4 else {
+            appendLog(
+                "[图库] GetObjectHandles 失败 storageID=0x\(String(format: "%08X", storageID)) " +
+                "code=0x\(String(format: "%04X", response.code))"
+            )
             throw CameraConnectionError.ptpResponse(response.code)
         }
 
         let count = Int(data.uint32(at: 0))
         let needed = 4 + count * 4
         guard data.count >= needed else {
+            appendLog(
+                "[图库] GetObjectHandles 数据异常 storageID=0x\(String(format: "%08X", storageID)) " +
+                "bytes=\(data.count) count=\(count)"
+            )
             throw CameraConnectionError.malformedPacket
         }
 
@@ -554,6 +656,13 @@ final class CameraConnectionService: ObservableObject {
             handles.append(data.uint32(at: 4 + index * 4))
         }
         return handles
+    }
+
+    private func galleryItemLabel(handle: UInt32, filename: String?) -> String {
+        if let filename, !filename.isEmpty {
+            return "\(filename) handle=0x\(String(format: "%08X", handle))"
+        }
+        return "handle=0x\(String(format: "%08X", handle))"
     }
 
     private struct ParsedObjectInfo {
@@ -569,9 +678,13 @@ final class CameraConnectionService: ObservableObject {
             parameters: [handle],
             dataPhase: .receive,
             on: connection,
-            logPayloadHex: false
+            logStyle: .silent
         )
         guard response.code == PTPResponseCode.ok.rawValue, let data = response.data else {
+            appendLog(
+                "[图库] GetObjectInfo 失败 handle=0x\(String(format: "%08X", handle)) " +
+                "code=0x\(String(format: "%04X", response.code)) bytes=\(response.data?.count ?? 0)"
+            )
             return nil
         }
         return try parseObjectInfo(data)
@@ -604,33 +717,53 @@ final class CameraConnectionService: ObservableObject {
             return cached
         }
 
+        let filename = galleryItems.first(where: { $0.handle == handle })?.filename
+
         // MTP ObjectPropCode Duration = 0xDC89, typically milliseconds.
-        guard let response = try? await operation(
-            .getObjectPropValue,
-            parameters: [handle, 0x0000_DC89],
-            dataPhase: .receive,
-            on: connection,
-            logPayloadHex: false
-        ), response.code == PTPResponseCode.ok.rawValue,
-           let data = response.data,
-           let raw = readIntegerValue(from: data),
-           raw > 0 else {
+        do {
+            let response = try await operation(
+                .getObjectPropValue,
+                parameters: [handle, 0x0000_DC89],
+                dataPhase: .receive,
+                on: connection,
+                logStyle: .silent
+            )
+            guard response.code == PTPResponseCode.ok.rawValue,
+                  let data = response.data,
+                  let raw = readIntegerValue(from: data),
+                  raw > 0 else {
+                // Many cameras omit Duration; keep the log quiet unless it's an unexpected hard failure.
+                if response.code != PTPResponseCode.ok.rawValue,
+                   response.code != 0x200A, // DevicePropNotSupported-ish / common reject
+                   response.code != 0xA801 {
+                    appendLog(
+                        "[图库] 视频时长读取被拒 \(galleryItemLabel(handle: handle, filename: filename)) " +
+                        "code=0x\(String(format: "%04X", response.code))"
+                    )
+                }
+                return nil
+            }
+
+            let seconds: Int
+            if raw >= 1000 {
+                seconds = Int(raw / 1000)
+            } else {
+                seconds = Int(raw)
+            }
+            durationCache[handle] = seconds
+            if let index = galleryItems.firstIndex(where: { $0.handle == handle }) {
+                var items = galleryItems
+                items[index].durationSeconds = seconds
+                galleryItems = items
+            }
+            return seconds
+        } catch {
+            appendLog(
+                "[图库] 视频时长读取异常 \(galleryItemLabel(handle: handle, filename: filename)) " +
+                "error=\(error.localizedDescription)"
+            )
             return nil
         }
-
-        let seconds: Int
-        if raw >= 1000 {
-            seconds = Int(raw / 1000)
-        } else {
-            seconds = Int(raw)
-        }
-        durationCache[handle] = seconds
-        if let index = galleryItems.firstIndex(where: { $0.handle == handle }) {
-            var items = galleryItems
-            items[index].durationSeconds = seconds
-            galleryItems = items
-        }
-        return seconds
     }
 
     private func isGalleryMedia(objectFormat: UInt16, filename: String) -> Bool {
@@ -1025,6 +1158,15 @@ final class CameraConnectionService: ObservableObject {
 
 private enum DataPhase {
     case receive
+}
+
+private enum OperationLogStyle {
+    /// Connection setup: include packet hex dumps.
+    case verbose
+    /// One-line packet size logs without hex payloads.
+    case compact
+    /// Suppress routine transport logs; caller records progress/errors.
+    case silent
 }
 
 private struct PTPResponse {
