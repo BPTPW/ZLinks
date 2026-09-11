@@ -525,8 +525,8 @@ private struct CameraConnectionSheet: View {
     @StateObject private var wifi = CameraWiFiService()
     @State private var selectedMode: ConnectionMode = .accessPoint
     @State private var isConnecting = false
-    @State private var cameraSSID = "NIKON_"
-    @State private var cameraPassword = ""
+    @AppStorage("camera.wifi.ssid") private var cameraSSID = "NIKON_"
+    @AppStorage("camera.wifi.password") private var cameraPassword = ""
     @State private var isAdvancedOptionsExpanded = false
     @State private var manualHost = ""
 
