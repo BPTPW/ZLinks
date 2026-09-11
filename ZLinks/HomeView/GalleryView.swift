@@ -22,7 +22,7 @@ struct GalleryView: View {
     @State private var isSelectionMode = false
     @State private var selectedHandles: Set<UInt32> = []
     @State private var isTransferPresented = false
-    @State private var transferItems: [CameraConnectionService.GalleryItem] = []
+    @State private var transferItems: [GalleryDownload] = []
     @State private var transferRequiresConfirmation = false
     @State private var selectedItem: CameraConnectionService.GalleryItem?
     @Namespace private var galleryTransition
@@ -65,12 +65,12 @@ struct GalleryView: View {
                         Button { exitSelectionMode() } label: { Image(systemName: "xmark") }
                             .accessibilityLabel("取消多选")
                     } else {
-                        HStack(spacing: 20) {
+                        HStack(spacing: 26) {
                             Button { enterSelectionMode() } label: { Image(systemName: "checkmark.circle") }
                             Button { Task { await reloadGallery(force: true) } } label: { Image(systemName: "arrow.clockwise") }
                                 .disabled(!isConnected || isRefreshing || isDirectorySwitching)
                         }
-                        .padding(.horizontal, 6)
+                        .padding(.horizontal, 5)
                     }
                 }
             }
@@ -87,13 +87,21 @@ struct GalleryView: View {
                 if isSelectionMode { selectionToolbar }
             }
             .sheet(isPresented: $isTransferPresented) {
-                TransferSheet(items: transferItems, camera: camera, requiresConfirmation: transferRequiresConfirmation).id(transferItems.map(\.handle).map(String.init).joined(separator: ","))
+                TransferSheet(
+                    items: transferItems,
+                    camera: camera,
+                    requiresConfirmation: transferRequiresConfirmation
+                )
+                .id(transferItems.map { "\($0.handle)-\($0.format.rawValue)" }.joined(separator: ","))
             }
             .navigationDestination(item: $selectedItem) { item in
                 GalleryPreviewView(
                     item: item,
                     thumbnail: thumbnailImages[item.handle],
-                    camera: camera, onSave: { startTransfer(items: [item], requiresConfirmation: false) }
+                    camera: camera,
+                    onDownload: { format in
+                        startTransfer(item: item, format: format)
+                    }
                 )
                 .toolbar(.hidden, for: .navigationBar)
                 .toolbar(.hidden, for: .tabBar)
@@ -202,12 +210,25 @@ struct GalleryView: View {
                             } else { selectedItem = item }
                         }
                         .contextMenu {
-                            Button { enterSelectionMode(selecting: item.handle) } label: { Label("多选", systemImage: "checkmark.circle") }
                             if !item.isVideo {
-                                Button {
-                                    startTransfer(items: [item], requiresConfirmation: false)
-                                } label: {
-                                    Label("下载", systemImage: "square.and.arrow.down")
+                                Button { enterSelectionMode(selecting: item.handle) } label: {
+                                    Label("多选", systemImage: "checkmark.circle")
+                                }
+                            }
+                            if let format = item.photoFormat {
+                                if format.supportsRAW {
+                                    Button {
+                                        startTransfer(item: item, format: .raw)
+                                    } label: {
+                                        Label("下载 RAW", systemImage: "r.square")
+                                    }
+                                }
+                                if format.supportsJPEG {
+                                    Button {
+                                        startTransfer(item: item, format: .jpeg)
+                                    } label: {
+                                        Label("下载 JPEG", systemImage: "j.square")
+                                    }
                                 }
                             }
                         }
@@ -231,10 +252,14 @@ struct GalleryView: View {
 
     private var selectionToolbar: some View {
         HStack {
-            Button {
-                let items = camera.galleryItems.filter { selectedHandles.contains($0.handle) && !$0.isVideo }
-                guard !items.isEmpty else { return }
-                startTransfer(items: items, requiresConfirmation: true)
+            Menu {
+                ForEach(multiDownloadOptions) { option in
+                    Button {
+                        startMultiTransfer(option)
+                    } label: {
+                        Label(option.title, systemImage: option.symbol)
+                    }
+                }
             } label: {
                 Image(systemName: "square.and.arrow.down")
                     .foregroundStyle(.primary)
@@ -242,7 +267,7 @@ struct GalleryView: View {
             .buttonStyle(.plain)
             .frame(width: 42, height: 42)
             .glassEffect(.regular.interactive(), in: .circle)
-            .disabled(selectedHandles.isEmpty)
+            .disabled(multiDownloadOptions.isEmpty)
             Spacer()
         }
         .padding(.horizontal, 20).frame(maxWidth: .infinity).frame(height: 49)
@@ -255,8 +280,88 @@ struct GalleryView: View {
     }
 
     private func exitSelectionMode() { isSelectionMode = false; selectedHandles.removeAll() }
-    private func startTransfer(items: [CameraConnectionService.GalleryItem], requiresConfirmation: Bool) {
-        transferItems = items
+    private var selectedPhotoItems: [CameraConnectionService.GalleryItem] {
+        camera.galleryItems.filter { selectedHandles.contains($0.handle) && !$0.isVideo }
+    }
+
+    private var multiDownloadOptions: [MultiDownloadOption] {
+        let items = selectedPhotoItems
+        guard !items.isEmpty else { return [] }
+
+        let jpegCount = items.filter { $0.photoFormat?.supportsJPEG == true }.count
+        let rawCount = items.filter { $0.photoFormat?.supportsRAW == true }.count
+        var options: [MultiDownloadOption] = []
+
+        if jpegCount == items.count {
+            options.append(.jpeg)
+        } else if jpegCount > 0 {
+            options.append(.preferredJPEG)
+        }
+
+        if rawCount == items.count {
+            options.append(.raw)
+        } else if rawCount > 0 {
+            options.append(.preferredRAW)
+        }
+
+        return options
+    }
+
+    private func startMultiTransfer(_ option: MultiDownloadOption) {
+        let downloads = selectedPhotoItems.compactMap {
+            makeDownload(for: $0, format: option.format, fallbackToOtherFormat: option.isPreferred)
+        }
+        startTransfer(downloads: downloads, requiresConfirmation: true)
+    }
+
+    private func startTransfer(item: CameraConnectionService.GalleryItem, format: GalleryDownloadFormat) {
+        guard let download = makeDownload(for: item, format: format, fallbackToOtherFormat: false) else {
+            return
+        }
+        startTransfer(downloads: [download], requiresConfirmation: false)
+    }
+
+    private func makeDownload(
+        for item: CameraConnectionService.GalleryItem,
+        format: GalleryDownloadFormat,
+        fallbackToOtherFormat: Bool
+    ) -> GalleryDownload? {
+        var requestedFormat = format
+        if requestedFormat == .raw && item.rawHandle == nil {
+            guard fallbackToOtherFormat, item.jpegHandle != nil else { return nil }
+            requestedFormat = .jpeg
+        } else if requestedFormat == .jpeg && item.jpegHandle == nil {
+            guard fallbackToOtherFormat, item.rawHandle != nil else { return nil }
+            requestedFormat = .raw
+        }
+
+        let handle: UInt32
+        let filename: String
+        let fileSize: UInt64
+        switch requestedFormat {
+        case .raw:
+            guard let rawHandle = item.rawHandle, let rawFilename = item.rawFilename else { return nil }
+            handle = rawHandle
+            filename = rawFilename
+            fileSize = item.rawFileSize ?? 0
+        case .jpeg:
+            guard let jpegHandle = item.jpegHandle, let jpegFilename = item.jpegFilename else { return nil }
+            handle = jpegHandle
+            filename = jpegFilename
+            fileSize = item.jpegFileSize ?? 0
+        }
+
+        return GalleryDownload(
+            handle: handle,
+            filename: filename,
+            fileSize: fileSize,
+            format: requestedFormat
+        )
+    }
+
+    private func startTransfer(downloads: [GalleryDownload], requiresConfirmation: Bool) {
+        guard !downloads.isEmpty else { return }
+        transferItems = downloads
         transferRequiresConfirmation = requiresConfirmation
         isTransferPresented = false
         DispatchQueue.main.async { isTransferPresented = true }
@@ -371,7 +476,7 @@ struct GalleryView: View {
 
             guard visibleHandles.contains(item.handle) else { continue }
 
-            if let image = await camera.thumbnailImage(for: item.handle) {
+            if let image = await camera.thumbnailImage(for: item.thumbnailHandle) {
                 thumbnailImages[item.handle] = image
             } else if visibleHandles.contains(item.handle) {
                 failedThumbnails.insert(item.handle)
@@ -394,11 +499,63 @@ struct GalleryView: View {
     }
 }
 
+private enum GalleryDownloadFormat: String, Hashable {
+    case raw
+    case jpeg
+}
+
+private struct GalleryDownload: Identifiable, Hashable {
+    let handle: UInt32
+    let filename: String
+    let fileSize: UInt64
+    let format: GalleryDownloadFormat
+
+    var id: String {
+        "\(handle)-\(format.rawValue)"
+    }
+}
+
+private enum MultiDownloadOption: String, Identifiable {
+    case jpeg
+    case preferredJPEG
+    case raw
+    case preferredRAW
+
+    var id: String { rawValue }
+
+    var format: GalleryDownloadFormat {
+        switch self {
+        case .jpeg, .preferredJPEG: return .jpeg
+        case .raw, .preferredRAW: return .raw
+        }
+    }
+
+    var isPreferred: Bool {
+        self == .preferredJPEG || self == .preferredRAW
+    }
+
+    var title: String {
+        switch self {
+        case .jpeg: return "下载 JPEG"
+        case .preferredJPEG: return "优先下载 JPEG"
+        case .raw: return "下载 RAW"
+        case .preferredRAW: return "优先下载 RAW"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .jpeg, .preferredJPEG: return "j.square"
+        case .raw, .preferredRAW: return "r.square"
+        }
+    }
+}
+
 private struct GalleryPreviewView: View {
     let item: CameraConnectionService.GalleryItem
     let thumbnail: UIImage?
     let camera: CameraConnectionService
-    let onSave: () -> Void
+    let onDownload: (GalleryDownloadFormat) -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var image: UIImage?
@@ -430,17 +587,28 @@ private struct GalleryPreviewView: View {
 
                 if controlsVisible {
                     VStack {
-                        HStack {
-                            Button { dismiss() } label: {
-                                Image(systemName: "chevron.left")
-                                    .font(.title3.weight(.semibold))
-                                    .frame(width: 32, height: 32)
-                                    .foregroundStyle(.primary)
+                        HStack(alignment: .top) {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Button { dismiss() } label: {
+                                    Image(systemName: "chevron.left")
+                                        .font(.title3.weight(.semibold))
+                                        .frame(width: 32, height: 32)
+                                        .foregroundStyle(.primary)
+                                }
+                                .buttonStyle(.plain)
+                                .frame(width: 42, height: 42)
+                                .glassEffect(.regular.interactive(), in: .circle)
+                                .accessibilityLabel("返回图库")
+
+                                if let format = item.photoFormat {
+                                    Text(format.title)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(.primary)
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 5)
+                                        .glassEffect(.regular, in: .capsule)
+                                }
                             }
-                            .buttonStyle(.plain)
-                            .frame(width: 42, height: 42)
-                            .glassEffect(.regular.interactive(), in: .circle)
-                            .accessibilityLabel("返回图库")
                             Spacer()
                             Text(item.filename)
                                 .font(.subheadline.weight(.medium))
@@ -452,13 +620,26 @@ private struct GalleryPreviewView: View {
                         .padding(.top, 8)
                         Spacer()
                         HStack {
-                            Button { onSave() } label: {
-                                Image(systemName: "square.and.arrow.down")
-                                    .foregroundStyle(.primary)
+                            if let format = item.photoFormat {
+                                Menu {
+                                    if format.supportsRAW {
+                                        Button { onDownload(.raw) } label: {
+                                            Label("下载 RAW", systemImage: "r.square")
+                                        }
+                                    }
+                                    if format.supportsJPEG {
+                                        Button { onDownload(.jpeg) } label: {
+                                            Label("下载 JPEG", systemImage: "j.square")
+                                        }
+                                    }
+                                } label: {
+                                    Image(systemName: "square.and.arrow.down")
+                                        .foregroundStyle(.primary)
+                                }
+                                .buttonStyle(.plain)
+                                .frame(width: 42, height: 42)
+                                .glassEffect(.regular.interactive(), in: .circle)
                             }
-                            .buttonStyle(.plain)
-                            .frame(width: 42, height: 42)
-                            .glassEffect(.regular.interactive(), in: .circle)
                             Spacer()
                         }.padding(.horizontal, 16).padding(.bottom, 12)
                     }
@@ -487,6 +668,7 @@ private struct GalleryPreviewView: View {
     }
 
     private var isImmersive: Bool { scale > 1.01 || !controlsVisible }
+
 
     @ViewBuilder
     private var previewImage: some View {
@@ -541,7 +723,7 @@ private struct GalleryPreviewView: View {
         guard !item.isVideo, image == nil, !isLoading else { return }
         isLoading = true
         Task {
-            let loaded = await camera.objectImage(for: item.handle)
+            let loaded = await camera.objectImage(for: item.previewHandle)
             await MainActor.run {
                 image = loaded
                 hasLoadFailed = loaded == nil
@@ -599,6 +781,14 @@ private struct GalleryThumbnailCell: View {
                 }
             }
             .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .overlay(alignment: .topLeading) {
+                if let format = item.photoFormat, let symbol = format.thumbnailSymbol {
+                    Image(systemName: symbol)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(format == .raw ? .orange : .white)
+                        .padding(5)
+                }
+            }
             .overlay { if selectionMode && isSelected { Color.white.opacity(0.42); Image(systemName: "checkmark.circle.fill").font(.title2).foregroundStyle(.blue).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing).padding(6) } }
             .overlay(alignment: .bottomTrailing) {
                 if item.isVideo {
@@ -618,7 +808,8 @@ private struct GalleryThumbnailCell: View {
         if item.isVideo {
             return "视频 \(item.filename) \(Self.durationText(for: item.durationSeconds))"
         }
-        return "照片 \(item.filename)"
+        let format = item.photoFormat?.title ?? "照片"
+        return "\(format) \(item.filename)"
     }
 
     private static func durationText(for seconds: Int?) -> String {
@@ -639,7 +830,7 @@ private struct GalleryThumbnailCell: View {
 }
 
 private struct TransferSheet: View {
-    let items: [CameraConnectionService.GalleryItem]
+    let items: [GalleryDownload]
     let camera: CameraConnectionService
     let requiresConfirmation: Bool
     @Environment(\.dismiss) private var dismiss
@@ -654,7 +845,12 @@ private struct TransferSheet: View {
     @State private var transferTask: Task<Void, Never>?
     @State private var showCancelConfirmation = false
     enum Phase { case confirm, transferring, completed }
-    init(items: [CameraConnectionService.GalleryItem], camera: CameraConnectionService, requiresConfirmation: Bool) { self.items = items; self.camera = camera; self.requiresConfirmation = requiresConfirmation; _phase = State(initialValue: requiresConfirmation ? .confirm : .transferring) }
+    init(items: [GalleryDownload], camera: CameraConnectionService, requiresConfirmation: Bool) {
+        self.items = items
+        self.camera = camera
+        self.requiresConfirmation = requiresConfirmation
+        _phase = State(initialValue: requiresConfirmation ? .confirm : .transferring)
+    }
 
     var body: some View {
         NavigationStack {

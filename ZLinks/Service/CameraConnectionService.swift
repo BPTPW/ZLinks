@@ -71,6 +71,36 @@ final class CameraConnectionService: ObservableObject {
         static let disconnected = LensInfo()
     }
 
+    enum GalleryPhotoFormat: String, Equatable, Hashable {
+        case raw
+        case rawAndJPEG
+        case jpeg
+
+        var title: String {
+            switch self {
+            case .raw: return "RAW"
+            case .rawAndJPEG: return "RAW + JPEG"
+            case .jpeg: return "JPEG"
+            }
+        }
+
+        var thumbnailSymbol: String? {
+            switch self {
+            case .raw: return "r.square.fill"
+            case .rawAndJPEG: return "r.square.on.square.fill"
+            case .jpeg: return nil
+            }
+        }
+
+        var supportsRAW: Bool {
+            self == .raw || self == .rawAndJPEG
+        }
+
+        var supportsJPEG: Bool {
+            self == .jpeg || self == .rawAndJPEG
+        }
+    }
+
     struct GalleryItem: Identifiable, Equatable, Hashable {
         let id: UInt32
         var handle: UInt32 { id }
@@ -80,6 +110,29 @@ final class CameraConnectionService: ObservableObject {
         var isVideo: Bool
         var captureDate: Date?
         var durationSeconds: Int?
+        var rawHandle: UInt32?
+        var rawFilename: String?
+        var rawFileSize: UInt64?
+        var jpegHandle: UInt32?
+        var jpegFilename: String?
+        var jpegFileSize: UInt64?
+
+        var photoFormat: GalleryPhotoFormat? {
+            guard !isVideo else { return nil }
+            switch (rawHandle != nil, jpegHandle != nil) {
+            case (true, true): return .rawAndJPEG
+            case (true, false): return .raw
+            default: return .jpeg
+            }
+        }
+
+        var thumbnailHandle: UInt32 {
+            jpegHandle ?? rawHandle ?? handle
+        }
+
+        var previewHandle: UInt32 {
+            thumbnailHandle
+        }
     }
 
     struct GalleryDirectory: Identifiable, Equatable, Hashable {
@@ -962,6 +1015,7 @@ final class CameraConnectionService: ObservableObject {
                 }
 
                 let isVideo = isVideoMedia(objectFormat: info.objectFormat, filename: info.filename)
+                let isRAW = !isVideo && isRAWMedia(objectFormat: info.objectFormat, filename: info.filename)
                 items.append(
                     GalleryItem(
                         id: handle,
@@ -970,7 +1024,13 @@ final class CameraConnectionService: ObservableObject {
                         fileSize: info.fileSize,
                         isVideo: isVideo,
                         captureDate: info.captureDate ?? info.modificationDate,
-                        durationSeconds: isVideo ? durationCache[handle] : nil
+                        durationSeconds: isVideo ? durationCache[handle] : nil,
+                        rawHandle: isRAW ? handle : nil,
+                        rawFilename: isRAW ? info.filename : nil,
+                        rawFileSize: isRAW ? info.fileSize : nil,
+                        jpegHandle: !isVideo && !isRAW ? handle : nil,
+                        jpegFilename: !isVideo && !isRAW ? info.filename : nil,
+                        jpegFileSize: !isVideo && !isRAW ? info.fileSize : nil
                     )
                 )
             } catch {
@@ -988,6 +1048,8 @@ final class CameraConnectionService: ObservableObject {
                 )
             }
         }
+
+        items = mergePairedPhotos(items)
 
         items.sort { lhs, rhs in
             switch (lhs.captureDate, rhs.captureDate) {
@@ -1008,6 +1070,60 @@ final class CameraConnectionService: ObservableObject {
                 "skippedNonMedia=\(skippedNonMedia) errors=\(skippedErrors)"
         )
         return items
+    }
+
+    private func mergePairedPhotos(_ sourceItems: [GalleryItem]) -> [GalleryItem] {
+        var merged: [GalleryItem] = []
+        var photoIndexes: [String: Int] = [:]
+
+        for item in sourceItems {
+            guard !item.isVideo, let format = item.photoFormat else {
+                merged.append(item)
+                continue
+            }
+
+            let key = photoPairKey(for: item.filename)
+            guard format == .raw || format == .jpeg else {
+                merged.append(item)
+                continue
+            }
+
+            if let index = photoIndexes[key] {
+                merged[index] = combinePhotoItems(merged[index], item)
+            } else {
+                photoIndexes[key] = merged.count
+                merged.append(item)
+            }
+        }
+
+        return merged
+    }
+
+    private func combinePhotoItems(_ lhs: GalleryItem, _ rhs: GalleryItem) -> GalleryItem {
+        let rawItem = lhs.rawHandle != nil ? lhs : rhs
+        let jpegItem = lhs.jpegHandle != nil ? lhs : rhs
+        let captureDate = lhs.captureDate ?? rhs.captureDate
+
+        return GalleryItem(
+            id: min(lhs.handle, rhs.handle),
+            filename: jpegItem.jpegFilename ?? rawItem.rawFilename ?? lhs.filename,
+            objectFormat: jpegItem.jpegHandle != nil ? jpegItem.objectFormat : rawItem.objectFormat,
+            fileSize: (rawItem.rawFileSize ?? 0) + (jpegItem.jpegFileSize ?? 0),
+            isVideo: false,
+            captureDate: captureDate,
+            durationSeconds: nil,
+            rawHandle: rawItem.rawHandle,
+            rawFilename: rawItem.rawFilename,
+            rawFileSize: rawItem.rawFileSize,
+            jpegHandle: jpegItem.jpegHandle,
+            jpegFilename: jpegItem.jpegFilename,
+            jpegFileSize: jpegItem.jpegFileSize
+        )
+    }
+
+    private func photoPairKey(for filename: String) -> String {
+        let base = (filename as NSString).deletingPathExtension
+        return base.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
     }
 
     private func fetchStorageIDs(on connection: NWConnection) async throws -> [UInt32] {
@@ -1211,6 +1327,14 @@ final class CameraConnectionService: ObservableObject {
         }
         let ext = fileExtension(filename)
         return ["JPG", "JPEG", "HEIC", "HEIF", "TIF", "TIFF", "PNG", "NEF", "NRW", "DNG", "CR2", "CR3", "ARW"].contains(ext)
+    }
+
+    private func isRAWMedia(objectFormat: UInt16, filename: String) -> Bool {
+        if objectFormat == 0xB802 || objectFormat == 0xB80A {
+            return true
+        }
+        let ext = fileExtension(filename)
+        return ["NEF", "NRW", "DNG", "CR2", "CR3", "ARW", "RAF", "ORF", "RW2", "RWL", "SRW", "PEF", "3FR", "X3F"].contains(ext)
     }
 
     private func isVideoMedia(objectFormat: UInt16, filename: String) -> Bool {
