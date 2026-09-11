@@ -17,6 +17,8 @@ struct GalleryView: View {
     @State private var isThumbnailPumpRunning = false
     @State private var selectedDirectoryID: UInt32?
     @State private var isDirectorySwitching = false
+    @State private var selectedItem: CameraConnectionService.GalleryItem?
+    @Namespace private var galleryTransition
 
     private let spacing: CGFloat = 3
     private let cornerRadius: CGFloat = 6
@@ -73,6 +75,16 @@ struct GalleryView: View {
                 if selectedDirectoryID != newValue {
                     selectedDirectoryID = newValue
                 }
+            }
+            .navigationDestination(item: $selectedItem) { item in
+                GalleryPreviewView(
+                    item: item,
+                    thumbnail: thumbnailImages[item.handle],
+                    camera: camera
+                )
+                .toolbar(.hidden, for: .navigationBar)
+                .toolbar(.hidden, for: .tabBar)
+                .navigationTransition(.zoom(sourceID: item.handle, in: galleryTransition))
             }
         }
     }
@@ -167,6 +179,10 @@ struct GalleryView: View {
                         .aspectRatio(1, contentMode: .fit)
                         .clipped()
                         .contentShape(Rectangle())
+                        .matchedTransitionSource(id: item.handle, in: galleryTransition)
+                        .onTapGesture {
+                            selectedItem = item
+                        }
                         .onAppear {
                             handleCellAppear(item)
                         }
@@ -313,6 +329,167 @@ struct GalleryView: View {
             }
         }
         return nil
+    }
+}
+
+
+private struct GalleryPreviewView: View {
+    let item: CameraConnectionService.GalleryItem
+    let thumbnail: UIImage?
+    let camera: CameraConnectionService
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var image: UIImage?
+    @State private var isLoading = false
+    @State private var hasLoadFailed = false
+    @State private var scale: CGFloat = 1
+    @State private var settledScale: CGFloat = 1
+    @State private var offset: CGSize = .zero
+    @State private var settledOffset: CGSize = .zero
+    @State private var controlsVisible = true
+    @State private var dragOffset: CGFloat = 0
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack {
+                (isImmersive ? Color.black : Color(uiColor: .systemBackground))
+                    .ignoresSafeArea()
+                    .animation(.easeInOut(duration: 0.2), value: isImmersive)
+
+                previewImage
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .scaleEffect(scale)
+                    .offset(x: offset.width, y: offset.height + dragOffset)
+                    .contentShape(Rectangle())
+                    .gesture(dragGesture)
+                    .gesture(magnificationGesture)
+                    .onTapGesture(count: 2) { resetZoom() }
+                    .onTapGesture(count: 1) { toggleControls() }
+
+                if controlsVisible {
+                    VStack {
+                        HStack {
+                            Button { dismiss() } label: {
+                                Image(systemName: "chevron.left")
+                                    .font(.title3.weight(.semibold))
+                                    .frame(width: 44, height: 44)
+                                    .background(.ultraThinMaterial, in: Circle())
+                            }
+                            .accessibilityLabel("返回图库")
+                            Spacer()
+                            Text(item.filename)
+                                .font(.subheadline.weight(.medium))
+                                .lineLimit(1)
+                                .padding(.horizontal, 12)
+                        }
+                        .foregroundStyle(isImmersive ? .white : .primary)
+                        .padding(.horizontal, 16)
+                        .padding(.top, 8)
+                        Spacer()
+                    }
+                    .transition(.opacity)
+                }
+
+                if isLoading {
+                    ProgressView()
+                        .tint(isImmersive ? .white : nil)
+                } else if hasLoadFailed && image == nil {
+                    VStack(spacing: 10) {
+                        Image(systemName: "photo.badge.exclamationmark")
+                            .font(.largeTitle)
+                        Text("无法加载原图")
+                            .font(.subheadline)
+                    }
+                    .foregroundStyle(.secondary)
+                }
+            }
+            .statusBarHidden(isImmersive)
+            .onAppear { loadFullImage() }
+            .animation(.easeInOut(duration: 0.2), value: controlsVisible)
+            .animation(.interactiveSpring(response: 0.28, dampingFraction: 0.82), value: dragOffset)
+            .onChange(of: proxy.size) { _, _ in clampOffset() }
+        }
+    }
+
+    private var isImmersive: Bool { scale > 1.01 || !controlsVisible }
+
+    @ViewBuilder
+    private var previewImage: some View {
+        if let image = image ?? thumbnail {
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFit()
+                .overlay(alignment: .center) {
+                    if isLoading { Color.clear }
+                }
+        } else {
+            Color.clear
+        }
+    }
+
+    private var magnificationGesture: some Gesture {
+        MagnifyGesture()
+            .onChanged { value in
+                scale = min(max(settledScale * value.magnification, 1), 5)
+                if scale > 1.01 {
+                    controlsVisible = false
+                }
+            }
+            .onEnded { _ in
+                settledScale = scale
+                if scale == 1 { settledOffset = .zero; offset = .zero }
+            }
+    }
+
+    private var dragGesture: some Gesture {
+        DragGesture(minimumDistance: 8)
+            .onChanged { value in
+                if scale > 1.01 {
+                    offset = CGSize(width: settledOffset.width + value.translation.width, height: settledOffset.height + value.translation.height)
+                } else if abs(value.translation.height) > abs(value.translation.width) {
+                    dragOffset = value.translation.height
+                }
+            }
+            .onEnded { value in
+                if scale > 1.01 {
+                    settledOffset = offset
+                } else if value.translation.height > 120 || value.predictedEndTranslation.height > 240 {
+                    dismiss()
+                } else {
+                    dragOffset = 0
+                }
+            }
+    }
+
+    private func loadFullImage() {
+        guard !item.isVideo, image == nil, !isLoading else { return }
+        isLoading = true
+        Task {
+            let loaded = await camera.objectImage(for: item.handle)
+            await MainActor.run {
+                image = loaded
+                hasLoadFailed = loaded == nil
+                isLoading = false
+            }
+        }
+    }
+
+    private func toggleControls() {
+        withAnimation { controlsVisible.toggle() }
+    }
+
+    private func resetZoom() {
+        withAnimation(.interactiveSpring(response: 0.28, dampingFraction: 0.82)) {
+            scale = 1
+            settledScale = 1
+            offset = .zero
+            settledOffset = .zero
+            controlsVisible = true
+        }
+    }
+
+    private func clampOffset() {
+        if scale <= 1.01 { offset = .zero; settledOffset = .zero }
     }
 }
 

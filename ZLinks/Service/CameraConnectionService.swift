@@ -71,7 +71,7 @@ final class CameraConnectionService: ObservableObject {
         static let disconnected = LensInfo()
     }
 
-    struct GalleryItem: Identifiable, Equatable {
+    struct GalleryItem: Identifiable, Equatable, Hashable {
         let id: UInt32
         var handle: UInt32 { id }
         var filename: String
@@ -116,6 +116,7 @@ final class CameraConnectionService: ObservableObject {
     private var isOperationBusy = false
     private var operationWaiters: [CheckedContinuation<Void, Never>] = []
     private var thumbnailCache: [UInt32: Data] = [:]
+    private var objectImageCache: [UInt32: Data] = [:]
     private var durationCache: [UInt32: Int] = [:]
 
     func connect(host: String) async {
@@ -214,6 +215,7 @@ final class CameraConnectionService: ObservableObject {
         galleryDirectories = []
         selectedGalleryDirectoryID = nil
         thumbnailCache = [:]
+        objectImageCache = [:]
         durationCache = [:]
         state = .disconnected
     }
@@ -248,6 +250,7 @@ final class CameraConnectionService: ObservableObject {
             guard let selected else {
                 galleryItems = []
                 thumbnailCache = [:]
+                objectImageCache = [:]
                 durationCache = [:]
                 appendLog("[图库] 没有可选择的目录")
                 return
@@ -271,6 +274,7 @@ final class CameraConnectionService: ObservableObject {
         selectedGalleryDirectoryID = id
         galleryItems = []
         thumbnailCache = [:]
+        objectImageCache = [:]
         durationCache = [:]
         await loadGalleryMedia(forDirectoryID: id, clearCaches: true)
     }
@@ -289,6 +293,7 @@ final class CameraConnectionService: ObservableObject {
 
         if clearCaches {
             thumbnailCache = [:]
+            objectImageCache = [:]
             durationCache = [:]
         }
 
@@ -339,6 +344,41 @@ final class CameraConnectionService: ObservableObject {
             return UIImage(data: data)
         } catch {
             appendLog("[图库] 缩略图异常 \(galleryItemLabel(handle: handle, filename: filename)) error=\(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Loads and caches the original image for full-screen preview.
+    /// Videos intentionally use their thumbnail in the gallery preview.
+    func objectImage(for handle: UInt32) async -> UIImage? {
+        if let cached = objectImageCache[handle], let image = UIImage(data: cached) {
+            return image
+        }
+        guard case .connected = state, let commandConnection else { return nil }
+
+        let filename = galleryItems.first(where: { $0.handle == handle })?.filename
+        do {
+            let response = try await operation(
+                .getObject,
+                parameters: [handle],
+                dataPhase: .receive,
+                on: commandConnection,
+                logStyle: .silent
+            )
+            guard response.code == PTPResponseCode.ok.rawValue,
+                  let data = response.data,
+                  !data.isEmpty,
+                  let image = UIImage(data: data) else {
+                appendLog(
+                    "[图库] 原图失败 \(galleryItemLabel(handle: handle, filename: filename)) " +
+                    "code=0x\(String(format: "%04X", response.code)) bytes=\(response.data?.count ?? 0)"
+                )
+                return nil
+            }
+            objectImageCache[handle] = data
+            return image
+        } catch {
+            appendLog("[图库] 原图异常 \(galleryItemLabel(handle: handle, filename: filename)) error=\(error.localizedDescription)")
             return nil
         }
     }
@@ -1436,6 +1476,7 @@ private enum PTPOperationCode: UInt16 {
     case getNumObjects = 0x1006
     case getObjectHandles = 0x1007
     case getObjectInfo = 0x1008
+    case getObject = 0x1009
     case getThumb = 0x100A
     case getDevicePropValue = 0x1015
     case getObjectPropValue = 0x9803
@@ -1449,6 +1490,7 @@ private enum PTPOperationCode: UInt16 {
         case .getNumObjects: return "GetNumObjects"
         case .getObjectHandles: return "GetObjectHandles"
         case .getObjectInfo: return "GetObjectInfo"
+        case .getObject: return "GetObject"
         case .getThumb: return "GetThumb"
         case .getDevicePropValue: return "GetDevicePropValue"
         case .getObjectPropValue: return "GetObjectPropValue"
