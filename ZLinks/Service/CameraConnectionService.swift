@@ -40,6 +40,7 @@ final class CameraConnectionService: ObservableObject {
     @Published private(set) var cameraInfo: CameraInfo?
     @Published private(set) var connectedHost: String?
     @Published private(set) var cameraStatus = CameraStatus()
+    @Published private(set) var debugLog = ""
 
     private var commandConnection: NWConnection?
     private var eventConnection: NWConnection?
@@ -51,31 +52,48 @@ final class CameraConnectionService: ObservableObject {
     }
 
     func connect(endpoint: NWEndpoint, displayHost: String) async {
+        appendLog("开始连接 endpoint=\(displayHost):15740")
         disconnect()
         state = .connecting
 
         do {
             let command = NWConnection(to: endpoint, using: .tcp)
             commandConnection = command
+            appendLog("[command] 创建 TCP 连接")
             try await start(command)
+            appendLog("[command] TCP 已就绪")
 
-            let guid = UUID().uuidString.data(using: .utf8) ?? Data()
+            let guid = Data([
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+                0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF
+            ])
             try await send(ptpIPPacket(type: .initCommandRequest, payload: initCommandPayload(guid: guid)), on: command)
             let acknowledgement = try await receivePacket(on: command)
             guard acknowledgement.type == PTPIPPacketType.initCommandAck.rawValue else {
+                appendLog("[command] InitCommandAck 失败 expected=InitCommandAck actual=\(acknowledgement.typeName) payload=\(acknowledgement.payload.hexDump)")
+                if acknowledgement.type == PTPIPPacketType.initFail.rawValue, acknowledgement.payload.count >= 4 {
+                    throw CameraConnectionError.initFailed(acknowledgement.payload.uint32(at: 0))
+                }
                 throw CameraConnectionError.unexpectedPacket
             }
 
             let initResult = try parseInitCommandAck(acknowledgement.payload)
             connectionNumber = initResult.connectionNumber
+            appendLog("[command] InitCommandAck connectionNumber=\(initResult.connectionNumber), name=\(initResult.name.debugDescription)")
 
             let event = NWConnection(to: endpoint, using: .tcp)
             eventConnection = event
+            appendLog("[event] 创建 TCP 连接")
             try await start(event)
+            appendLog("[event] TCP 已就绪")
             try await send(ptpIPPacket(type: .initEventRequest, payload: uint32Data(initResult.connectionNumber)), on: event)
 
             let eventAcknowledgement = try await receivePacket(on: event)
             guard eventAcknowledgement.type == PTPIPPacketType.initEventAck.rawValue else {
+                appendLog("[event] InitEventAck 失败 expected=InitEventAck actual=\(eventAcknowledgement.typeName) payload=\(eventAcknowledgement.payload.hexDump)")
+                if eventAcknowledgement.type == PTPIPPacketType.initFail.rawValue, eventAcknowledgement.payload.count >= 4 {
+                    throw CameraConnectionError.initFailed(eventAcknowledgement.payload.uint32(at: 0))
+                }
                 throw CameraConnectionError.unexpectedPacket
             }
 
@@ -102,10 +120,13 @@ final class CameraConnectionService: ObservableObject {
             }
 
             cameraInfo = try parseDeviceInfo(deviceInfo)
+            appendLog("DeviceInfo 解析成功 manufacturer=\(cameraInfo?.manufacturer ?? ""), model=\(cameraInfo?.model ?? ""), serial=\(cameraInfo?.serialNumber ?? "")")
             cameraStatus = await readCameraStatus(on: command)
             connectedHost = displayHost
             state = .connected
+            appendLog("连接成功")
         } catch {
+            appendLog("连接失败 error=\(String(reflecting: error)) description=\(error.localizedDescription)")
             disconnectConnections()
             state = .failed(error.localizedDescription)
         }
@@ -121,7 +142,12 @@ final class CameraConnectionService: ObservableObject {
 
     func refreshCameraStatus() async {
         guard case .connected = state, let commandConnection else { return }
+        appendLog("开始刷新相机状态")
         cameraStatus = await readCameraStatus(on: commandConnection)
+    }
+
+    func clearDebugLog() {
+        debugLog = ""
     }
 
     private func operation(
@@ -130,15 +156,24 @@ final class CameraConnectionService: ObservableObject {
         dataPhase: DataPhase?,
         on connection: NWConnection
     ) async throws -> PTPResponse {
-        transactionID &+= 1
-        let currentTransactionID = transactionID
+        let currentTransactionID = max(transactionID &+ 1, 1)
+        transactionID = currentTransactionID
 
         var operationPayload = Data()
+        let dataPhaseValue: UInt32
+        switch dataPhase {
+        case nil:
+            dataPhaseValue = 0x00000001
+        case .receive:
+            dataPhaseValue = 0x00000001
+        }
+        operationPayload.append(uint32Data(dataPhaseValue))
         operationPayload.append(uint16Data(code.rawValue))
         operationPayload.append(uint32Data(currentTransactionID))
         for parameter in parameters {
             operationPayload.append(uint32Data(parameter))
         }
+        appendLog("[command] OperationRequest name=\(code.debugName) code=0x\(String(format: "%04X", code.rawValue)) transaction=\(currentTransactionID) parameters=\(parameters.map { String(format: "0x%08X", $0) }.joined(separator: ","))")
         try await send(ptpIPPacket(type: .operationRequest, payload: operationPayload), on: connection)
 
         var receivedData = Data()
@@ -177,10 +212,13 @@ final class CameraConnectionService: ObservableObject {
                 let responseCode = packet.payload.uint16(at: 0)
                 let responseTransactionID = packet.payload.uint32(at: 2)
                 guard responseTransactionID == currentTransactionID else {
+                    appendLog("[command] 事务号不匹配 expected=\(currentTransactionID) actual=\(responseTransactionID)")
                     throw CameraConnectionError.transactionMismatch
                 }
+                appendLog("[command] OperationResponse name=\(code.debugName) code=0x\(String(format: "%04X", responseCode)) transaction=\(responseTransactionID) dataBytes=\(receivedData.count)")
                 return PTPResponse(code: responseCode, data: dataPhase == .receive ? receivedData : nil)
             default:
+                appendLog("[command] 忽略未预期包 type=\(packet.typeName)")
                 continue
             }
         }
@@ -191,12 +229,15 @@ final class CameraConnectionService: ObservableObject {
             connection.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
+                    Task { @MainActor in self.appendLog("NWConnection state=ready") }
                     connection.stateUpdateHandler = nil
                     continuation.resume()
                 case .failed(let error):
+                    Task { @MainActor in self.appendLog("NWConnection state=failed error=\(String(reflecting: error))") }
                     connection.stateUpdateHandler = nil
                     continuation.resume(throwing: error)
                 case .cancelled:
+                    Task { @MainActor in self.appendLog("NWConnection state=cancelled") }
                     connection.stateUpdateHandler = nil
                     continuation.resume(throwing: CameraConnectionError.connectionCancelled)
                 default:
@@ -208,6 +249,7 @@ final class CameraConnectionService: ObservableObject {
     }
 
     private func send(_ packet: Data, on connection: NWConnection) async throws {
+        appendLog("发送 PTP/IP type=\(packet.packetTypeName) totalBytes=\(packet.count) hex=\(packet.hexDump)")
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             connection.send(content: packet, completion: .contentProcessed { error in
                 if let error {
@@ -223,11 +265,14 @@ final class CameraConnectionService: ObservableObject {
         let header = try await receiveExactly(8, on: connection)
         let totalLength = Int(header.uint32(at: 0))
         guard totalLength >= 8 else {
+            appendLog("接收报文长度非法 totalLength=\(totalLength) header=\(header.hexDump)")
             throw CameraConnectionError.malformedPacket
         }
         let type = header.uint32(at: 4)
         let payload = totalLength > 8 ? try await receiveExactly(totalLength - 8, on: connection) : Data()
-        return PTPIPPacket(type: type, payload: payload)
+        let packet = PTPIPPacket(type: type, payload: payload)
+        appendLog("接收 PTP/IP type=\(packet.typeName) totalBytes=\(totalLength) payloadBytes=\(payload.count) hex=\(packet.hexDump)")
+        return packet
     }
 
     private func receiveExactly(_ count: Int, on connection: NWConnection) async throws -> Data {
@@ -306,37 +351,78 @@ final class CameraConnectionService: ObservableObject {
         if payload.count < 16 {
             payload.append(Data(repeating: 0, count: 16 - payload.count))
         }
-        payload.append(ptpString("ZLinks iOS"))
-        payload.append(uint32Data(1))
+        payload.append(utf16NullTerminatedString("ZLinks iOS"))
+        payload.append(uint32Data(0x00010000))
         return payload
     }
 
     private func parseInitCommandAck(_ data: Data) throws -> (connectionNumber: UInt32, name: String) {
-        guard data.count >= 21 else {
+        guard data.count >= 24 else {
             throw CameraConnectionError.malformedPacket
         }
         let connectionNumber = data.uint32(at: 0)
-        let name = try readPTPString(from: data, offset: 20).value
+        let protocolVersionOffset = data.count - 4
+        guard protocolVersionOffset >= 20, protocolVersionOffset % 2 == 0 else {
+            throw CameraConnectionError.malformedPacket
+        }
+
+        var nameEnd = 20
+        while nameEnd + 1 < protocolVersionOffset {
+            if data.uint16(at: nameEnd) == 0 {
+                break
+            }
+            nameEnd += 2
+        }
+        guard nameEnd + 1 < protocolVersionOffset,
+              data.uint16(at: nameEnd) == 0 else {
+            appendLog("InitCommandAck FriendlyName 未找到 UTF-16 终止符 start=20 end=\(protocolVersionOffset)")
+            throw CameraConnectionError.malformedPacket
+        }
+
+        let nameData = data[20..<nameEnd]
+        let name = String(data: nameData, encoding: .utf16LittleEndian) ?? ""
+        let protocolVersion = data.uint32(at: protocolVersionOffset)
+        appendLog("InitCommandAck FriendlyName=\(name.debugDescription) protocolVersion=0x\(String(format: "%08X", protocolVersion))")
         return (connectionNumber, name)
     }
 
     private func parseDeviceInfo(_ data: Data) throws -> CameraInfo {
-        var offset = 0
+        appendLog("开始解析 DeviceInfo bytes=\(data.count) hex=\(data.hexDump)")
         guard data.count >= 8 else {
             throw CameraConnectionError.malformedPacket
         }
-        offset += 8 // StandardVersion, VendorExtensionID, VendorExtensionVersion
+
+        // FunctionalMode follows the variable-length vendor extension string.
+        // Nikon Z5 returns the standard field order with this placement.
+        return try parseDeviceInfoFields(data)
+    }
+
+    private func parseDeviceInfoFields(_ data: Data) throws -> CameraInfo {
+        var offset = 8 // StandardVersion, VendorExtensionID, VendorExtensionVersion
         offset = try skipPTPString(in: data, at: offset)
+        appendLog("DeviceInfo VendorExtension offset=\(offset)")
+        guard data.count >= offset + 2 else {
+            throw CameraConnectionError.malformedPacket
+        }
+        let functionalMode = data.uint16(at: offset)
+        appendLog("DeviceInfo FunctionalMode=0x\(String(format: "%04X", functionalMode)) offset=\(offset)")
+        offset += 2
         offset = try skipUInt16Array(in: data, at: offset)
+        appendLog("DeviceInfo Operations offset=\(offset)")
         offset = try skipUInt16Array(in: data, at: offset)
+        appendLog("DeviceInfo Events offset=\(offset)")
         offset = try skipUInt16Array(in: data, at: offset)
+        appendLog("DeviceInfo DeviceProperties offset=\(offset)")
         offset = try skipUInt16Array(in: data, at: offset)
+        appendLog("DeviceInfo CaptureFormats offset=\(offset)")
         offset = try skipUInt16Array(in: data, at: offset)
+        appendLog("DeviceInfo ImageFormats offset=\(offset)")
 
         let manufacturer = try readPTPString(from: data, offset: offset)
         let model = try readPTPString(from: data, offset: manufacturer.nextOffset)
         let version = try readPTPString(from: data, offset: model.nextOffset)
         let serial = try readPTPString(from: data, offset: version.nextOffset)
+        appendLog("DeviceInfo 字段 manufacturerOffset=\(offset) modelOffset=\(manufacturer.nextOffset) versionOffset=\(model.nextOffset) serialOffset=\(version.nextOffset) end=\(serial.nextOffset)")
 
         return CameraInfo(
             manufacturer: manufacturer.value.isEmpty ? "Nikon" : manufacturer.value,
@@ -363,6 +449,7 @@ final class CameraConnectionService: ObservableObject {
 
     private func readPTPString(from data: Data, offset: Int) throws -> (value: String, nextOffset: Int) {
         guard offset < data.count else {
+            appendLog("PTP 字符串偏移越界 offset=\(offset) dataBytes=\(data.count)")
             throw CameraConnectionError.malformedPacket
         }
         let characterCount = Int(data[offset])
@@ -372,11 +459,23 @@ final class CameraConnectionService: ObservableObject {
         let byteCount = characterCount * 2
         let end = offset + 1 + byteCount
         guard end <= data.count else {
+            appendLog("PTP 字符串长度越界 offset=\(offset) characterCount=\(characterCount) end=\(end) dataBytes=\(data.count)")
             throw CameraConnectionError.malformedPacket
         }
         let stringData = data[(offset + 1)..<(end - 2)]
         let value = String(data: stringData, encoding: .utf16LittleEndian) ?? ""
         return (value, end)
+    }
+
+    private func appendLog(_ message: String) {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let line = "[\(formatter.string(from: Date()))] \(message)"
+        if debugLog.isEmpty {
+            debugLog = line
+        } else {
+            debugLog += "\n" + line
+        }
     }
 }
 
@@ -392,6 +491,9 @@ private struct PTPResponse {
 private struct PTPIPPacket {
     let type: UInt32
     let payload: Data
+
+    var typeName: String { PTPIPPacketType(rawValue: type)?.debugName ?? String(format: "0x%08X", type) }
+    var hexDump: String { uint32Data(UInt32(payload.count + 8)).hexDump + " " + uint32Data(type).hexDump + (payload.isEmpty ? "" : " " + payload.hexDump) }
 }
 
 private enum PTPIPPacketType: UInt32 {
@@ -399,12 +501,29 @@ private enum PTPIPPacketType: UInt32 {
     case initCommandAck = 0x00000002
     case initEventRequest = 0x00000003
     case initEventAck = 0x00000004
+    case initFail = 0x00000005
     case operationRequest = 0x00000006
     case operationResponse = 0x00000007
     case event = 0x00000008
     case startData = 0x00000009
     case data = 0x0000000A
     case endData = 0x0000000C
+
+    var debugName: String {
+        switch self {
+        case .initCommandRequest: return "InitCommandRequest"
+        case .initCommandAck: return "InitCommandAck"
+        case .initEventRequest: return "InitEventRequest"
+        case .initEventAck: return "InitEventAck"
+        case .initFail: return "InitFail"
+        case .operationRequest: return "OperationRequest"
+        case .operationResponse: return "OperationResponse"
+        case .event: return "Event"
+        case .startData: return "StartData"
+        case .data: return "Data"
+        case .endData: return "EndData"
+        }
+    }
 }
 
 private enum PTPOperationCode: UInt16 {
@@ -414,6 +533,17 @@ private enum PTPOperationCode: UInt16 {
     case getStorageInfo = 0x1005
     case getNumObjects = 0x1006
     case getDevicePropValue = 0x1015
+
+    var debugName: String {
+        switch self {
+        case .getDeviceInfo: return "GetDeviceInfo"
+        case .openSession: return "OpenSession"
+        case .getStorageIDs: return "GetStorageIDs"
+        case .getStorageInfo: return "GetStorageInfo"
+        case .getNumObjects: return "GetNumObjects"
+        case .getDevicePropValue: return "GetDevicePropValue"
+        }
+    }
 }
 
 private enum PTPResponseCode: UInt16 {
@@ -430,6 +560,7 @@ private enum CameraConnectionError: LocalizedError {
     case unexpectedPacket
     case transactionMismatch
     case ptpResponse(UInt16)
+    case initFailed(UInt32)
 
     var errorDescription: String? {
         switch self {
@@ -443,6 +574,8 @@ private enum CameraConnectionError: LocalizedError {
             return "相机响应与当前请求不匹配。"
         case .ptpResponse(let code):
             return String(format: "相机拒绝了请求（0x%04X）。", code)
+        case .initFailed(let code):
+            return String(format: "相机拒绝了 PTP/IP 初始化（失败码 0x%08X）。", code)
         }
     }
 }
@@ -469,7 +602,27 @@ private func ptpString(_ string: String) -> Data {
     return data
 }
 
+private func utf16NullTerminatedString(_ string: String) -> Data {
+    var data = Data()
+    for codeUnit in string.utf16 {
+        data.append(uint16Data(codeUnit))
+    }
+    data.append(uint16Data(0))
+    return data
+}
+
 private extension Data {
+    var hexDump: String {
+        let limit = 4096
+        let bytes = prefix(limit).map { String(format: "%02X", $0) }.joined(separator: " ")
+        return count > limit ? "\(bytes) ... [truncated, total=\(count)]" : bytes
+    }
+
+    var packetTypeName: String {
+        guard count >= 8 else { return "invalid-header" }
+        return PTPIPPacketType(rawValue: uint32(at: 4))?.debugName ?? String(format: "0x%08X", uint32(at: 4))
+    }
+
     func uint16(at offset: Int) -> UInt16 {
         UInt16(self[offset]) | UInt16(self[offset + 1]) << 8
     }
