@@ -171,6 +171,9 @@ final class CameraConnectionService: ObservableObject {
     @Published private(set) var galleryItems: [GalleryItem] = []
     @Published private(set) var debugLog = ""
     @Published private(set) var isReconnecting = false
+    @Published private(set) var liveViewImage: UIImage?
+    @Published private(set) var isLiveViewActive = false
+    @Published private(set) var liveViewError: String?
 
     private var commandConnection: NWConnection?
     private var eventConnection: NWConnection?
@@ -183,6 +186,10 @@ final class CameraConnectionService: ObservableObject {
     private var objectImageCache: [UInt32: Data] = [:]
     private var durationCache: [UInt32: Int] = [:]
     private var supportsPreviewImage = false
+    private var supportedOperations: Set<UInt16> = []
+    private var liveViewTask: Task<Void, Never>?
+    private var liveViewGeneration = 0
+    private var liveViewConsumers = 0
     private var lastEndpoint: NWEndpoint?
     private var lastDisplayHost: String?
     private var reconnectTask: Task<Void, Never>?
@@ -342,6 +349,8 @@ final class CameraConnectionService: ObservableObject {
         objectImageCache = [:]
         durationCache = [:]
         supportsPreviewImage = false
+        supportedOperations = []
+        stopLiveViewInternal(sendEndCommand: false)
         state = .disconnected
 
         if clearRememberedDevice {
@@ -669,6 +678,261 @@ final class CameraConnectionService: ObservableObject {
 
     func clearDebugLog() {
         debugLog = ""
+    }
+
+    /// Begin requesting Nikon live-view frames for the Capture tab.
+    /// Safe to call repeatedly; consumers are reference-counted.
+    func startLiveView() async {
+        liveViewConsumers += 1
+        liveViewError = nil
+        guard liveViewConsumers == 1 else { return }
+        await beginLiveViewSession()
+    }
+
+    /// Stop live-view when the Capture tab leaves the screen.
+    func stopLiveView() async {
+        guard liveViewConsumers > 0 else { return }
+        liveViewConsumers -= 1
+        guard liveViewConsumers == 0 else { return }
+        await endLiveViewSession()
+    }
+
+    private func beginLiveViewSession() async {
+        guard case .connected = state, let commandConnection else {
+            liveViewError = "相机未连接"
+            isLiveViewActive = false
+            liveViewImage = nil
+            return
+        }
+        guard supportsLiveView else {
+            liveViewError = "当前相机不支持实时图传"
+            isLiveViewActive = false
+            appendLog("[liveview] 相机未声明 StartLiveView/GetLiveViewImage")
+            return
+        }
+
+        liveViewGeneration &+= 1
+        let generation = liveViewGeneration
+        liveViewTask?.cancel()
+        liveViewTask = nil
+        isLiveViewActive = false
+        liveViewImage = nil
+        appendLog("[liveview] 开始启动实时图传 generation=\(generation)")
+
+        do {
+            try await prepareLiveView(on: commandConnection)
+            guard generation == liveViewGeneration, liveViewConsumers > 0, case .connected = state else { return }
+            isLiveViewActive = true
+            liveViewError = nil
+            liveViewTask = Task { [weak self] in
+                await self?.runLiveViewLoop(generation: generation)
+            }
+        } catch {
+            guard generation == liveViewGeneration else { return }
+            isLiveViewActive = false
+            liveViewImage = nil
+            liveViewError = error.localizedDescription
+            appendLog("[liveview] 启动失败 error=\(error.localizedDescription)")
+        }
+    }
+
+    private func endLiveViewSession() async {
+        stopLiveViewInternal(sendEndCommand: true)
+    }
+
+    private func stopLiveViewInternal(sendEndCommand: Bool) {
+        liveViewGeneration &+= 1
+        liveViewTask?.cancel()
+        liveViewTask = nil
+        isLiveViewActive = false
+        liveViewImage = nil
+        if !sendEndCommand {
+            liveViewError = nil
+            return
+        }
+        guard case .connected = state, let commandConnection, supportsOperation(.endLiveView) else {
+            liveViewError = nil
+            return
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let response = try await self.operation(
+                    .endLiveView,
+                    parameters: [],
+                    dataPhase: nil,
+                    on: commandConnection,
+                    logStyle: .compact
+                )
+                self.appendLog("[liveview] EndLiveView code=0x\(String(format: "%04X", response.code))")
+            } catch {
+                self.appendLog("[liveview] EndLiveView 失败 error=\(error.localizedDescription)")
+            }
+            if self.liveViewConsumers == 0 {
+                self.liveViewError = nil
+            }
+        }
+    }
+
+    private var supportsLiveView: Bool {
+        supportsOperation(.startLiveView) && (supportsOperation(.getLiveViewImage) || supportsOperation(.getLiveViewImageEx))
+    }
+
+    private func supportsOperation(_ code: PTPOperationCode) -> Bool {
+        supportedOperations.contains(code.rawValue)
+    }
+
+    private func prepareLiveView(on connection: NWConnection) async throws {
+        // Prefer leaving the camera body monitor usable: only enter application mode
+        // when StartLiveView is rejected without it.
+        var start = try await operation(
+            .startLiveView,
+            parameters: [],
+            dataPhase: nil,
+            on: connection,
+            logStyle: .compact
+        )
+        if start.code != PTPResponseCode.ok.rawValue,
+           supportsOperation(.changeApplicationMode) {
+            appendLog("[liveview] StartLiveView 初次失败 code=0x\(String(format: "%04X", start.code))，尝试 ChangeApplicationMode")
+            let mode = try await operation(
+                .changeApplicationMode,
+                parameters: [1],
+                dataPhase: nil,
+                on: connection,
+                logStyle: .compact
+            )
+            appendLog("[liveview] ChangeApplicationMode code=0x\(String(format: "%04X", mode.code))")
+            start = try await operation(
+                .startLiveView,
+                parameters: [],
+                dataPhase: nil,
+                on: connection,
+                logStyle: .compact
+            )
+        }
+        guard start.code == PTPResponseCode.ok.rawValue else {
+            throw CameraConnectionError.ptpResponse(start.code)
+        }
+        try await waitUntilDeviceReady(on: connection)
+    }
+
+    private func waitUntilDeviceReady(on connection: NWConnection) async throws {
+        guard supportsOperation(.deviceReady) else {
+            try await Task.sleep(for: .milliseconds(400))
+            return
+        }
+        for attempt in 1...12 {
+            if Task.isCancelled { throw CameraConnectionError.connectionCancelled }
+            let response = try await operation(
+                .deviceReady,
+                parameters: [],
+                dataPhase: nil,
+                on: connection,
+                logStyle: .silent
+            )
+            if response.code == PTPResponseCode.ok.rawValue {
+                appendLog("[liveview] DeviceReady OK attempt=\(attempt)")
+                return
+            }
+            if response.code == PTPResponseCode.deviceBusy.rawValue {
+                try await Task.sleep(for: .milliseconds(250))
+                continue
+            }
+            appendLog("[liveview] DeviceReady code=0x\(String(format: "%04X", response.code)) attempt=\(attempt)")
+            try await Task.sleep(for: .milliseconds(250))
+        }
+        // Some bodies keep returning busy briefly; still allow frame polling to proceed.
+        appendLog("[liveview] DeviceReady 超时，继续尝试拉流")
+    }
+
+    private func runLiveViewLoop(generation: Int) async {
+        appendLog("[liveview] 拉流循环开始 generation=\(generation)")
+        var consecutiveFailures = 0
+        while !Task.isCancelled,
+              generation == liveViewGeneration,
+              liveViewConsumers > 0,
+              case .connected = state,
+              let commandConnection {
+            do {
+                if let frame = try await fetchLiveViewFrame(on: commandConnection) {
+                    liveViewImage = frame
+                    liveViewError = nil
+                    consecutiveFailures = 0
+                } else {
+                    consecutiveFailures += 1
+                }
+            } catch is CancellationError {
+                break
+            } catch {
+                consecutiveFailures += 1
+                if consecutiveFailures == 1 || consecutiveFailures % 20 == 0 {
+                    appendLog("[liveview] 拉帧失败 count=\(consecutiveFailures) error=\(error.localizedDescription)")
+                }
+                if consecutiveFailures >= 40 {
+                    liveViewError = error.localizedDescription
+                    isLiveViewActive = false
+                    break
+                }
+                try? await Task.sleep(for: .milliseconds(120))
+                continue
+            }
+            // Yield the command channel so gallery/status requests can interleave.
+            try? await Task.sleep(for: .milliseconds(33))
+        }
+        if generation == liveViewGeneration {
+            isLiveViewActive = false
+        }
+        appendLog("[liveview] 拉流循环结束 generation=\(generation)")
+    }
+
+    private func fetchLiveViewFrame(on connection: NWConnection) async throws -> UIImage? {
+        let preferred: [PTPOperationCode] = supportsOperation(.getLiveViewImage)
+            ? [.getLiveViewImage, .getLiveViewImageEx]
+            : [.getLiveViewImageEx, .getLiveViewImage]
+        var lastCode: UInt16 = 0
+        for code in preferred where supportsOperation(code) || code == .getLiveViewImage {
+            // Always allow 0x9203 attempt even if DeviceInfo omitted it; some bodies still answer.
+            let response = try await operation(
+                code,
+                parameters: [],
+                dataPhase: .receive,
+                on: connection,
+                logStyle: .silent
+            )
+            lastCode = response.code
+            if response.code == PTPResponseCode.deviceBusy.rawValue {
+                try await Task.sleep(for: .milliseconds(40))
+                return nil
+            }
+            guard response.code == PTPResponseCode.ok.rawValue, let data = response.data, data.count > 64 else {
+                continue
+            }
+            if let image = decodeLiveViewJPEG(from: data) {
+                return image
+            }
+            appendLog("[liveview] \(code.debugName) 返回数据无法解码 bytes=\(data.count)")
+        }
+        if lastCode != 0, lastCode != PTPResponseCode.ok.rawValue, lastCode != PTPResponseCode.deviceBusy.rawValue {
+            throw CameraConnectionError.ptpResponse(lastCode)
+        }
+        return nil
+    }
+
+    private func decodeLiveViewJPEG(from data: Data) -> UIImage? {
+        if let image = UIImage(data: data) {
+            return image
+        }
+        guard let jpeg = extractJPEGPayload(from: data) else { return nil }
+        return UIImage(data: jpeg)
+    }
+
+    private func extractJPEGPayload(from data: Data) -> Data? {
+        guard let soi = data.range(of: Data([0xFF, 0xD8])) else { return nil }
+        if let eoi = data.range(of: Data([0xFF, 0xD9]), options: [], in: soi.lowerBound..<data.endIndex) {
+            return Data(data[soi.lowerBound..<eoi.upperBound])
+        }
+        return Data(data[soi.lowerBound...])
     }
 
     private func operation(
@@ -1770,9 +2034,19 @@ final class CameraConnectionService: ObservableObject {
         appendLog("DeviceInfo FunctionalMode=0x\(String(format: "%04X", functionalMode)) offset=\(offset)")
         offset += 2
         let operationList = try readUInt16Array(in: data, at: offset)
-        supportsPreviewImage = operationList.values.contains(PTPOperationCode.getPreviewImage.rawValue)
+        supportedOperations = Set(operationList.values)
+        supportsPreviewImage = supportedOperations.contains(PTPOperationCode.getPreviewImage.rawValue)
+        let liveViewOps = [
+            ("StartLiveView", PTPOperationCode.startLiveView.rawValue),
+            ("EndLiveView", PTPOperationCode.endLiveView.rawValue),
+            ("GetLiveViewImg", PTPOperationCode.getLiveViewImage.rawValue),
+            ("GetLiveViewImageEx", PTPOperationCode.getLiveViewImageEx.rawValue),
+            ("DeviceReady", PTPOperationCode.deviceReady.rawValue),
+            ("ChangeApplicationMode", PTPOperationCode.changeApplicationMode.rawValue)
+        ].filter { supportedOperations.contains($0.1) }.map(\.0)
         appendLog(
-            "DeviceInfo Operations count=\(operationList.values.count) previewImage=\(supportsPreviewImage) offset=\(operationList.nextOffset)"
+            "DeviceInfo Operations count=\(operationList.values.count) previewImage=\(supportsPreviewImage) " +
+                "liveView=[\(liveViewOps.joined(separator: ","))] offset=\(operationList.nextOffset)"
         )
         offset = operationList.nextOffset
         offset = try skipUInt16Array(in: data, at: offset)
@@ -1939,9 +2213,15 @@ private enum PTPOperationCode: UInt16 {
     case getObject = 0x1009
     case getThumb = 0x100a
     case getPartialObject = 0x101b
-    case getPreviewImage = 0x9200
     case getDevicePropValue = 0x1015
     case getObjectPropValue = 0x9803
+    case deviceReady = 0x90c8
+    case getPreviewImage = 0x9200
+    case startLiveView = 0x9201
+    case endLiveView = 0x9202
+    case getLiveViewImage = 0x9203
+    case getLiveViewImageEx = 0x9428
+    case changeApplicationMode = 0x9435
 
     var debugName: String {
         switch self {
@@ -1955,15 +2235,22 @@ private enum PTPOperationCode: UInt16 {
         case .getObject: return "GetObject"
         case .getThumb: return "GetThumb"
         case .getPartialObject: return "GetPartialObject"
-        case .getPreviewImage: return "GetPreviewImg"
         case .getDevicePropValue: return "GetDevicePropValue"
         case .getObjectPropValue: return "GetObjectPropValue"
+        case .deviceReady: return "DeviceReady"
+        case .getPreviewImage: return "GetPreviewImg"
+        case .startLiveView: return "StartLiveView"
+        case .endLiveView: return "EndLiveView"
+        case .getLiveViewImage: return "GetLiveViewImg"
+        case .getLiveViewImageEx: return "GetLiveViewImageEx"
+        case .changeApplicationMode: return "ChangeApplicationMode"
         }
     }
 }
 
 private enum PTPResponseCode: UInt16 {
     case ok = 0x2001
+    case deviceBusy = 0x2019
 }
 
 private extension UInt16 {

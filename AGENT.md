@@ -202,6 +202,7 @@ Joining a camera AP does not guarantee simultaneous cellular routing. `joinOnce`
 - `ZLinks/Service/CameraWiFiService.swift`: iOS-managed AP network join request.
 - `ZLinks/HomeView/MyCameraView.swift`: camera status UI, lens info card, connection sheet, and the full-screen connection log drawer opened from the toolbar info button.
 - `ZLinks/HomeView/GalleryView.swift`: camera storage gallery grid. Loads object handles/info over PTP, shows a 4-column newest-first thumbnail list, and overlays video duration when available.
+- `ZLinks/HomeView/CaptureView.swift`: capture tab. Owns a full-width 4:3 live-view preview and starts/stops remote live view while the tab is visible.
 - `CameraConnectionService` is owned by `ZLinksApp` and shared across tabs through `environmentObject`.
 
 ## Gallery / Media Listing
@@ -232,6 +233,71 @@ Property scale:
 - aperture properties use f-number * 100
 
 Missing properties must leave the corresponding module as `--` and keep the camera session alive. Toolbar refresh reloads both camera status and lens info.
+
+
+
+## Capture / Live View
+
+Entering the Capture tab starts Nikon live view over the existing PTP/IP command session. Leaving the tab stops the stream so gallery and status traffic can use the command channel.
+
+Pipeline:
+
+1. Prefer `StartLiveView` (`0x9201`) without forcing PC mode first, so the camera body monitor can keep working.
+2. If start fails and the camera advertises it, optionally send `ChangeApplicationMode` (`0x9435`, param `1`) and retry start.
+3. Poll `DeviceReady` (`0x90C8`) until OK or short timeout. `DeviceBusy` (`0x2019`) means keep waiting.
+4. Loop `GetLiveViewImage` (`0x9203`); fall back to `GetLiveViewImageEx` (`0x9428`) when needed.
+5. Live-view object payload is a metadata header plus JPEG. Decode by scanning for `FF D8` … `FF D9`.
+6. On stop: cancel the pull loop and send `EndLiveView` (`0x9202`).
+
+All live-view transactions share the same serial operation gate as gallery thumbnails.
+
+Useful log markers:
+
+```text
+DeviceInfo ... liveView=[StartLiveView,EndLiveView,GetLiveViewImg,...]
+[liveview] 开始启动实时图传
+[liveview] DeviceReady OK
+[liveview] 拉流循环开始
+[liveview] EndLiveView
+```
+
+## Nikon Capture-Related Operations (reference)
+
+These opcodes are commonly useful for later capture-tab features. Support still depends on each body's `DeviceInfo.OperationsSupported`.
+
+| Opcode | Name | Notes |
+|---|---|---|
+| `0x100E` | `InitiateCapture` | Standard still capture trigger |
+| `0x1014` | `GetDevicePropDesc` | Enumerate allowed property values |
+| `0x1015` | `GetDevicePropValue` | Read current exposure/focus/etc. |
+| `0x1016` | `SetDevicePropValue` | Write current exposure/focus/etc. |
+| `0x90C7` | `GetEvent` | Nikon vendor event poll |
+| `0x90C8` | `DeviceReady` | Wait out busy after start/capture |
+| `0x9200` | `GetPreviewImg` | Gallery/full-image preview helper |
+| `0x9201` | `StartLiveView` | Enable live view stream |
+| `0x9202` | `EndLiveView` | Disable live view stream |
+| `0x9203` | `GetLiveViewImg` | Pull one live-view JPEG object |
+| `0x9204` | `MfDrive` | Manual focus drive |
+| `0x9205` | `ChangeAfArea` | Move AF area (`X`, `Y`) |
+| `0x9206` | `AfDriveCancel` | Cancel AF drive |
+| `0x9207` | `InitiateCaptureRecInMedia` | Capture to card while remote-controlled |
+| `0x920A` | `StartMovieRecInCard` | Start movie recording to card |
+| `0x920B` | `EndMovieRec` | Stop movie recording |
+| `0x9428` | `GetLiveViewImageEx` | Z-series extended live-view object |
+| `0x9435` | `ChangeApplicationMode` | App/PC control mode gate on some Z bodies |
+
+Common device properties for capture UI later:
+
+| Code | Name | Decode |
+|---|---|---|
+| `0x5001` | BatteryLevel | percent |
+| `0x5007` | FNumber | value / 100 |
+| `0x5008` | FocalLength | value / 100 mm |
+| `0x500A` | FocusMode | vendor-specific enums |
+| `0x500D` | ExposureTime / Shutter | often hi/lo 16-bit fraction |
+| `0x500E` | ExposureProgramMode | P/A/S/M style |
+| `0x500F` | ExposureIndex (ISO) | integer ISO |
+| `0x5010` | ExposureBiasCompensation | 1/1000 EV style on many bodies |
 
 ## Verification Notes
 
