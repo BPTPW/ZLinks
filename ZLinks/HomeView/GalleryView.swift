@@ -73,9 +73,19 @@ struct GalleryView: View {
                             .accessibilityLabel("取消多选")
                     } else {
                         HStack(spacing: 26) {
-                            Button { enterSelectionMode() } label: { Image(systemName: "checkmark.circle") }
-                            Button { Task { await reloadGallery(force: true) } } label: { Image(systemName: "arrow.clockwise") }
-                                .disabled(!isConnected || isRefreshing || isDirectorySwitching)
+                            Button {
+                                enterSelectionMode()
+                            } label: {
+                                Image(systemName: "checkmark.circle")
+                            }
+                            Button {
+                                Task {
+                                    await reloadGallery(force: true)
+                                }
+                            } label: {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                            .disabled(!isConnected || isRefreshing || isDirectorySwitching)
                         }
                         .padding(.horizontal, 5)
                     }
@@ -204,12 +214,7 @@ struct GalleryView: View {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(gallerySections) { section in
                         if !section.title.isEmpty {
-                            Text(section.title)
-                                .font(.subheadline.weight(.semibold))
-                                .foregroundStyle(.primary)
-                                .padding(.horizontal, 6)
-                                .padding(.top, section.id == gallerySections.first?.id ? 6 : 22)
-                                .padding(.bottom, 12)
+                            sectionHeader(for: section, isFirst: section.id == gallerySections.first?.id)
                         }
 
                         LazyVGrid(columns: columns, spacing: spacing) {
@@ -394,6 +399,59 @@ struct GalleryView: View {
         }
         .padding(.horizontal, 20).frame(maxWidth: .infinity).frame(height: 49)
         .background(.bar)
+    }
+
+    @ViewBuilder
+    private func sectionHeader(for section: GalleryTimeSection, isFirst: Bool) -> some View {
+        let handles = selectableHandles(in: section)
+        let isFullySelected = !handles.isEmpty && handles.allSatisfy(selectedHandles.contains)
+
+        HStack(spacing: 8) {
+            Text(section.title)
+                .font(.headline.weight(.semibold))
+                .foregroundStyle(.primary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Button {
+                toggleSectionSelection(section)
+            } label: {
+                Image(systemName: isFullySelected ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 22, weight: .regular))
+                    .symbolRenderingMode(.palette)
+                    .foregroundStyle(isFullySelected ? .white : .secondary, isFullySelected ? .blue : .secondary)
+                    .symbolRenderingMode(.monochrome)
+            }
+            .buttonStyle(.plain)
+            .disabled(handles.isEmpty)
+            .opacity(handles.isEmpty ? 0.35 : 1)
+            .accessibilityLabel(isFullySelected ? "取消选择本分类全部照片" : "选择本分类全部照片")
+        }
+        .padding(.horizontal, 8)
+        .padding(.top, isFirst ? 6 : 22)
+        .padding(.bottom, 12)
+    }
+
+    private func selectableHandles(in section: GalleryTimeSection) -> [UInt32] {
+        section.items.compactMap { item in
+            item.isVideo ? nil : item.handle
+        }
+    }
+
+    private func toggleSectionSelection(_ section: GalleryTimeSection) {
+        let handles = selectableHandles(in: section)
+        guard !handles.isEmpty else { return }
+
+        let isFullySelected = handles.allSatisfy(selectedHandles.contains)
+        if isFullySelected {
+            for handle in handles {
+                selectedHandles.remove(handle)
+            }
+        } else {
+            if !isSelectionMode {
+                isSelectionMode = true
+            }
+            selectedHandles.formUnion(handles)
+        }
     }
 
     private func enterSelectionMode(selecting handle: UInt32? = nil) {
@@ -1439,7 +1497,17 @@ private struct GalleryThumbnailCell: View {
                         .padding(5)
                 }
             }
-            .overlay { if selectionMode && isSelected { Color.white.opacity(0.42); Image(systemName: "checkmark.circle.fill").font(.title2).foregroundStyle(.blue).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing).padding(6) } }
+            .overlay {
+                if selectionMode && isSelected {
+                    Color.white.opacity(0.42)
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.title2)
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(.white, .blue)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                        .padding(6)
+                }
+            }
             .overlay(alignment: .bottomTrailing) {
                 if item.isVideo {
                     Text(Self.durationText(for: item.durationSeconds))
