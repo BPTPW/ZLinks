@@ -28,14 +28,18 @@ struct GalleryView: View {
     @State private var transferItems: [GalleryDownload] = []
     @State private var transferRequiresConfirmation = false
     @State private var selectedItem: CameraConnectionService.GalleryItem?
+    @State private var timeGrouping: GalleryTimeGrouping = .all
     @Namespace private var galleryTransition
 
-    private let spacing: CGFloat = 3
-    private let cornerRadius: CGFloat = 6
-    private let columns = Array(
-        repeating: GridItem(.flexible(minimum: 0), spacing: 3),
-        count: 4
-    )
+    private let spacing: CGFloat = 2
+    private let cornerRadius: CGFloat = 4
+
+    private var columns: [GridItem] {
+        Array(
+            repeating: GridItem(.flexible(minimum: 0), spacing: spacing),
+            count: timeGrouping.columnCount
+        )
+    }
 
     var body: some View {
         NavigationStack {
@@ -53,7 +57,7 @@ struct GalleryView: View {
                     statusPlaceholder(
                         title: "未连接相机",
                         systemImage: "photo.on.rectangle.angled",
-                        message: "请先在“我的相机”中连接 Nikon 相机，再刷新图库。"
+                        message: "请先在“我的相机”中连接相机，再刷新图库。"
                     )
                 }
             }
@@ -87,7 +91,13 @@ struct GalleryView: View {
             }
             .toolbar(isSelectionMode ? .hidden : .automatic, for: .tabBar)
             .safeAreaInset(edge: .bottom) {
-                if isSelectionMode { selectionToolbar }
+                if isSelectionMode {
+                    selectionToolbar
+                } else if showsTimeGroupingPicker {
+                    timeGroupingPicker
+                        .padding(.horizontal, 36)
+                        .padding(.vertical, 12)
+                }
             }
             .sheet(isPresented: $isTransferPresented) {
                 TransferSheet(
@@ -191,55 +201,21 @@ struct GalleryView: View {
             )
         } else {
             ScrollView {
-                LazyVGrid(columns: columns, spacing: spacing) {
-                    ForEach(camera.galleryItems) { item in
-                        GalleryThumbnailCell(
-                            item: item,
-                            image: thumbnailImages[item.handle],
-                            cornerRadius: cornerRadius,
-                            hasFailed: failedThumbnails.contains(item.handle),
-                            isSelected: selectedHandles.contains(item.handle),
-                            selectionMode: isSelectionMode
-                        )
-                        .frame(maxWidth: .infinity)
-                        .aspectRatio(1, contentMode: .fit)
-                        .clipped()
-                        .contentShape(Rectangle())
-                        .matchedTransitionSource(id: item.handle, in: galleryTransition)
-                        .onTapGesture {
-                            if isSelectionMode {
-                                if item.isVideo { return }
-                                if selectedHandles.contains(item.handle) { selectedHandles.remove(item.handle) } else { selectedHandles.insert(item.handle) }
-                            } else { selectedItem = item }
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(gallerySections) { section in
+                        if !section.title.isEmpty {
+                            Text(section.title)
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.primary)
+                                .padding(.horizontal, 6)
+                                .padding(.top, section.id == gallerySections.first?.id ? 6 : 22)
+                                .padding(.bottom, 12)
                         }
-                        .contextMenu {
-                            if !item.isVideo {
-                                Button { enterSelectionMode(selecting: item.handle) } label: {
-                                    Label("多选", systemImage: "checkmark.circle")
-                                }
+
+                        LazyVGrid(columns: columns, spacing: spacing) {
+                            ForEach(section.items) { item in
+                                galleryCell(for: item)
                             }
-                            if let format = item.photoFormat {
-                                if format.supportsRAW {
-                                    Button {
-                                        startTransfer(item: item, format: .raw)
-                                    } label: {
-                                        Label("下载 RAW", systemImage: "r.square")
-                                    }
-                                }
-                                if format.supportsJPEG {
-                                    Button {
-                                        startTransfer(item: item, format: .jpeg)
-                                    } label: {
-                                        Label("下载 JPEG", systemImage: "j.square")
-                                    }
-                                }
-                            }
-                        }
-                        .onAppear {
-                            handleCellAppear(item)
-                        }
-                        .onDisappear {
-                            handleCellDisappear(item)
                         }
                     }
                 }
@@ -250,6 +226,149 @@ struct GalleryView: View {
             .refreshable {
                 await reloadGallery(force: true)
             }
+        }
+    }
+
+    private var showsTimeGroupingPicker: Bool {
+        isConnected && !camera.galleryItems.isEmpty
+    }
+
+    private var timeGroupingPicker: some View {
+        Picker("分类", selection: $timeGrouping) {
+            ForEach(GalleryTimeGrouping.allCases) { mode in
+                Text(mode.title).tag(mode)
+                    .font(.headline)
+            }
+        }
+        .pickerStyle(.segmented)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity)
+        .glassEffect(.regular,in: .capsule)
+        .accessibilityLabel("按时间分类")
+    }
+
+    private var gallerySections: [GalleryTimeSection] {
+        let items = camera.galleryItems
+        guard timeGrouping != .all else {
+            return [GalleryTimeSection(id: "all", title: "", items: items)]
+        }
+
+        let calendar = Calendar.current
+        var sections: [GalleryTimeSection] = []
+        var currentKey: String?
+        var currentTitle = ""
+        var currentItems: [CameraConnectionService.GalleryItem] = []
+
+        for item in items {
+            let identity = timeSectionIdentity(for: item.captureDate, mode: timeGrouping, calendar: calendar)
+            if identity.key != currentKey {
+                if let currentKey, !currentItems.isEmpty {
+                    sections.append(
+                        GalleryTimeSection(id: currentKey, title: currentTitle, items: currentItems)
+                    )
+                }
+                currentKey = identity.key
+                currentTitle = identity.title
+                currentItems = [item]
+            } else {
+                currentItems.append(item)
+            }
+        }
+
+        if let currentKey, !currentItems.isEmpty {
+            sections.append(
+                GalleryTimeSection(id: currentKey, title: currentTitle, items: currentItems)
+            )
+        }
+
+        return sections
+    }
+
+    private func timeSectionIdentity(
+        for date: Date?,
+        mode: GalleryTimeGrouping,
+        calendar: Calendar
+    ) -> (key: String, title: String) {
+        guard let date else {
+            return ("unknown", "未知日期")
+        }
+
+        let components = calendar.dateComponents([.year, .month, .day], from: date)
+        guard let year = components.year else {
+            return ("unknown", "未知日期")
+        }
+
+        switch mode {
+        case .year:
+            return ("y-\(year)", "\(year)年")
+        case .month:
+            let month = components.month ?? 1
+            return ("y-\(year)-m-\(month)", "\(year)年\(month)月")
+        case .day:
+            let month = components.month ?? 1
+            let day = components.day ?? 1
+            return ("y-\(year)-m-\(month)-d-\(day)", "\(year)年\(month)月\(day)日")
+        case .all:
+            return ("all", "")
+        }
+    }
+
+    @ViewBuilder
+    private func galleryCell(for item: CameraConnectionService.GalleryItem) -> some View {
+        GalleryThumbnailCell(
+            item: item,
+            image: thumbnailImages[item.handle],
+            cornerRadius: cornerRadius,
+            hasFailed: failedThumbnails.contains(item.handle),
+            isSelected: selectedHandles.contains(item.handle),
+            selectionMode: isSelectionMode
+        )
+        .frame(maxWidth: .infinity)
+        .aspectRatio(1, contentMode: .fit)
+        .clipped()
+        .contentShape(Rectangle())
+        .matchedTransitionSource(id: item.handle, in: galleryTransition)
+        .onTapGesture {
+            if isSelectionMode {
+                if item.isVideo { return }
+                if selectedHandles.contains(item.handle) {
+                    selectedHandles.remove(item.handle)
+                } else {
+                    selectedHandles.insert(item.handle)
+                }
+            } else {
+                selectedItem = item
+            }
+        }
+        .contextMenu {
+            if !item.isVideo {
+                Button { enterSelectionMode(selecting: item.handle) } label: {
+                    Label("多选", systemImage: "checkmark.circle")
+                }
+            }
+            if let format = item.photoFormat {
+                if format.supportsRAW {
+                    Button {
+                        startTransfer(item: item, format: .raw)
+                    } label: {
+                        Label("下载 RAW", systemImage: "r.square")
+                    }
+                }
+                if format.supportsJPEG {
+                    Button {
+                        startTransfer(item: item, format: .jpeg)
+                    } label: {
+                        Label("下载 JPEG", systemImage: "j.square")
+                    }
+                }
+            }
+        }
+        .onAppear {
+            handleCellAppear(item)
+        }
+        .onDisappear {
+            handleCellDisappear(item)
         }
     }
 
@@ -502,6 +621,38 @@ struct GalleryView: View {
         }
         return nil
     }
+}
+
+private enum GalleryTimeGrouping: String, CaseIterable, Identifiable {
+    case year
+    case month
+    case day
+    case all
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .year: return "年"
+        case .month: return "月"
+        case .day: return "日"
+        case .all: return "全部"
+        }
+    }
+
+    var columnCount: Int {
+        switch self {
+        case .year: return 6
+        case .month: return 4
+        case .day, .all: return 3
+        }
+    }
+}
+
+private struct GalleryTimeSection: Identifiable, Equatable {
+    let id: String
+    let title: String
+    let items: [CameraConnectionService.GalleryItem]
 }
 
 private enum GalleryDownloadFormat: String, Hashable {
