@@ -645,11 +645,6 @@ struct GalleryView: View {
                 continue
             }
 
-            if item.isVideo, item.durationSeconds == nil {
-                guard visibleHandles.contains(item.handle) else { continue }
-                _ = await camera.videoDurationSeconds(for: item.handle)
-            }
-
             if thumbnailImages[item.handle] != nil || failedThumbnails.contains(item.handle) {
                 continue
             }
@@ -669,11 +664,10 @@ struct GalleryView: View {
     @MainActor
     private func nextVisibleItemNeedingWork() -> CameraConnectionService.GalleryItem? {
         for item in camera.galleryItems where visibleHandles.contains(item.handle) {
-            let needsDuration = item.isVideo && item.durationSeconds == nil
             let needsThumb =
                 thumbnailImages[item.handle] == nil
                     && !failedThumbnails.contains(item.handle)
-            if needsDuration || needsThumb {
+            if needsThumb {
                 return item
             }
         }
@@ -1490,11 +1484,10 @@ private struct GalleryThumbnailCell: View {
             }
             .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
             .overlay(alignment: .topLeading) {
-                if let format = item.photoFormat, let symbol = format.thumbnailSymbol {
-                    Image(systemName: symbol)
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(format == .raw ? .orange : .white)
-                        .padding(5)
+                if item.isVideo {
+                    thumbnailBadge(symbol: "play.circle.fill", color: .white)
+                } else if let format = item.photoFormat, let symbol = format.thumbnailSymbol {
+                    thumbnailBadge(symbol: symbol, color: format == .raw ? .orange : .white)
                 }
             }
             .overlay {
@@ -1508,37 +1501,25 @@ private struct GalleryThumbnailCell: View {
                         .padding(6)
                 }
             }
-            .overlay(alignment: .bottomTrailing) {
-                if item.isVideo {
-                    Text(Self.durationText(for: item.durationSeconds))
-                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .background(Color.black.opacity(0.55), in: Capsule())
-                        .padding(5)
-                }
-            }
             .accessibilityLabel(accessibilityLabel)
+    }
+
+    private func thumbnailBadge(symbol: String, color: Color) -> some View {
+        Image(systemName: symbol)
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(color)
+            .frame(width: 24, height: 24)
+            .background(Color.black.opacity(0.28), in: RoundedRectangle(cornerRadius: 4))
+            .shadow(color: .black.opacity(0.3), radius: 1, y: 1)
+            .padding(5)
     }
 
     private var accessibilityLabel: String {
         if item.isVideo {
-            return "视频 \(item.filename) \(Self.durationText(for: item.durationSeconds))"
+            return "视频 \(item.filename)"
         }
         let format = item.photoFormat?.title ?? "照片"
         return "\(format) \(item.filename)"
-    }
-
-    private static func durationText(for seconds: Int?) -> String {
-        let total = max(seconds ?? 0, 0)
-        let hours = total / 3600
-        let minutes = (total % 3600) / 60
-        let secs = total % 60
-        if hours > 0 {
-            return String(format: "%d:%02d:%02d", hours, minutes, secs)
-        }
-        return String(format: "%02d:%02d", minutes, secs)
     }
 }
 

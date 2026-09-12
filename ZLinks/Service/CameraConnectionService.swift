@@ -73,7 +73,7 @@ final class CameraConnectionService: ObservableObject {
         static let disconnected = LensInfo()
     }
 
-    enum GalleryPhotoFormat: String, Equatable, Hashable {
+    enum GalleryPhotoFormat: String, Equatable, Hashable, Sendable {
         case raw
         case rawAndJPEG
         case jpeg
@@ -108,7 +108,7 @@ final class CameraConnectionService: ObservableObject {
         case original(UIImage)
     }
 
-    struct GalleryItem: Identifiable, Equatable, Hashable {
+    struct GalleryItem: Identifiable, Equatable, Hashable, Sendable {
         let id: UInt32
         var handle: UInt32 { id }
         var filename: String
@@ -116,7 +116,6 @@ final class CameraConnectionService: ObservableObject {
         var fileSize: UInt64
         var isVideo: Bool
         var captureDate: Date?
-        var durationSeconds: Int?
         var rawHandle: UInt32?
         var rawFilename: String?
         var rawFileSize: UInt64?
@@ -129,7 +128,8 @@ final class CameraConnectionService: ObservableObject {
             switch (rawHandle != nil, jpegHandle != nil) {
             case (true, true): return .rawAndJPEG
             case (true, false): return .raw
-            default: return .jpeg
+            case (false, true): return .jpeg
+            case (false, false): return nil
             }
         }
 
@@ -143,7 +143,7 @@ final class CameraConnectionService: ObservableObject {
         }
     }
 
-    struct GalleryDirectory: Identifiable, Equatable, Hashable {
+    struct GalleryDirectory: Identifiable, Equatable, Hashable, Sendable {
         /// Stable ID for picker selection. Root synthetic directory uses 0.
         let id: UInt32
         var handle: UInt32 { id }
@@ -180,13 +180,18 @@ final class CameraConnectionService: ObservableObject {
     private var connectionNumber: UInt32?
     private var transactionID: UInt32 = 0
     private var isOperationBusy = false
-    private var operationWaiters: [CheckedContinuation<Void, Never>] = []
+    private var foregroundOperationWaiters: [CheckedContinuation<Void, Never>] = []
+    private var backgroundOperationWaiters: [CheckedContinuation<Void, Never>] = []
+    private var foregroundOperationWaiterIndex = 0
+    private var backgroundOperationWaiterIndex = 0
+    private var activeOperationTransactionID: UInt32?
     private var thumbnailCache: [UInt32: Data] = [:]
     private var previewImageCache: [UInt32: Data] = [:]
     private var objectImageCache: [UInt32: Data] = [:]
-    private var durationCache: [UInt32: Int] = [:]
     private var supportsPreviewImage = false
     private var supportedOperations: Set<UInt16> = []
+    private var galleryLoadGeneration = 0
+    private var galleryEnrichmentTask: Task<Void, Never>?
     private var liveViewTask: Task<Void, Never>?
     private var liveViewGeneration = 0
     private var liveViewConsumers = 0
@@ -333,6 +338,7 @@ final class CameraConnectionService: ObservableObject {
     }
 
     private func disconnect(clearRememberedDevice: Bool) {
+        invalidateGalleryLoad()
         reconnectTask?.cancel()
         reconnectTask = nil
         isReconnecting = false
@@ -347,7 +353,6 @@ final class CameraConnectionService: ObservableObject {
         thumbnailCache = [:]
         previewImageCache = [:]
         objectImageCache = [:]
-        durationCache = [:]
         supportsPreviewImage = false
         supportedOperations = []
         stopLiveViewInternal(sendEndCommand: false)
@@ -394,7 +399,8 @@ final class CameraConnectionService: ObservableObject {
     }
 
     private func beginAutomaticReconnect(reason: String) {
-        guard reconnectTask == nil, let endpoint = lastEndpoint, let displayHost = lastDisplayHost else {
+        if reconnectTask != nil { return }
+        guard let endpoint = lastEndpoint, let displayHost = lastDisplayHost else {
             state = .disconnected
             return
         }
@@ -433,8 +439,52 @@ final class CameraConnectionService: ObservableObject {
         lensInfo = await readLensInfo(on: commandConnection)
     }
 
+    private func beginGalleryLoad() -> Int {
+        invalidateGalleryLoad()
+        return galleryLoadGeneration
+    }
+
+    private func invalidateGalleryLoad() {
+        galleryLoadGeneration &+= 1
+        galleryEnrichmentTask?.cancel()
+        galleryEnrichmentTask = nil
+    }
+
+    private func isCurrentGalleryLoad(_ generation: Int, directoryID: UInt32? = nil) -> Bool {
+        guard isMatchingGalleryLoad(generation, directoryID: directoryID), case .connected = state else {
+            return false
+        }
+        return true
+    }
+
+    private func isMatchingGalleryLoad(_ generation: Int, directoryID: UInt32? = nil) -> Bool {
+        guard generation == galleryLoadGeneration, !Task.isCancelled else { return false }
+        if let directoryID {
+            return selectedGalleryDirectoryID == directoryID
+        }
+        return true
+    }
+
+    private func waitForRecoveredCommandConnection(
+        generation: Int,
+        directoryID: UInt32
+    ) async -> NWConnection? {
+        for _ in 0..<60 {
+            guard isMatchingGalleryLoad(generation, directoryID: directoryID) else { return nil }
+            if case .connected = state,
+               let connection = commandConnection,
+               case .ready = connection.state
+            {
+                return connection
+            }
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+        return nil
+    }
+
     /// Refresh directory list, keep/select a directory, then load that directory's media.
     func refreshGallery(selectingDirectoryID directoryID: UInt32? = nil) async {
+        let generation = beginGalleryLoad()
         guard case .connected = state, let commandConnection else {
             galleryItems = []
             galleryDirectories = []
@@ -446,6 +496,7 @@ final class CameraConnectionService: ObservableObject {
         appendLog("[图库] 开始刷新目录列表")
         do {
             let directories = try await loadGalleryDirectories(on: commandConnection)
+            guard isCurrentGalleryLoad(generation) else { return }
             galleryDirectories = directories
             appendLog("[图库] 目录列表完成 count=\(directories.count)")
 
@@ -457,13 +508,13 @@ final class CameraConnectionService: ObservableObject {
                 galleryItems = []
                 thumbnailCache = [:]
                 objectImageCache = [:]
-                durationCache = [:]
                 appendLog("[图库] 没有可选择的目录")
                 return
             }
 
-            await loadGalleryMedia(forDirectoryID: selected, clearCaches: true)
+            await loadGalleryMedia(forDirectoryID: selected, clearCaches: true, generation: generation)
         } catch {
+            guard isCurrentGalleryLoad(generation) else { return }
             appendLog("[图库] 目录列表失败 error=\(error.localizedDescription)")
         }
     }
@@ -477,23 +528,25 @@ final class CameraConnectionService: ObservableObject {
         if selectedGalleryDirectoryID == id, !galleryItems.isEmpty {
             return
         }
+        let generation = beginGalleryLoad()
         selectedGalleryDirectoryID = id
         galleryItems = []
         thumbnailCache = [:]
         previewImageCache = [:]
         objectImageCache = [:]
-        durationCache = [:]
-        await loadGalleryMedia(forDirectoryID: id, clearCaches: true)
+        await loadGalleryMedia(forDirectoryID: id, clearCaches: true, generation: generation)
     }
 
-    private func loadGalleryMedia(forDirectoryID directoryID: UInt32, clearCaches: Bool) async {
+    private func loadGalleryMedia(
+        forDirectoryID directoryID: UInt32,
+        clearCaches: Bool,
+        generation: Int
+    ) async {
         guard case .connected = state, let commandConnection else {
-            galleryItems = []
             appendLog("[图库] 未连接相机，跳过媒体加载")
             return
         }
         guard let directory = galleryDirectories.first(where: { $0.id == directoryID }) else {
-            galleryItems = []
             appendLog("[图库] 媒体加载失败：目录无效")
             return
         }
@@ -502,13 +555,61 @@ final class CameraConnectionService: ObservableObject {
             thumbnailCache = [:]
             previewImageCache = [:]
             objectImageCache = [:]
-            durationCache = [:]
         }
 
         let startedAt = Date()
         appendLog("[图库] 开始加载目录 \(directory.pickerTitle) path=\(directory.path) handle=0x\(String(format: "%08X", directory.handle))")
+        var mediaConnection = commandConnection
+        if supportedOperations.contains(PTPOperationCode.getObjectsMetadata.rawValue) {
+            appendLog("[图库] GetObjectsMetaData可用")
+            appendLog("[图库] 使用 GetObjectsMetaData 获取列表")
+            do {
+                let metadata = try await fetchNikonObjectsMetadata(in: directory, on: commandConnection)
+                guard isCurrentGalleryLoad(generation, directoryID: directoryID) else { return }
+                let records = metadata.records
+                let skeleton = await Task.detached(priority: .userInitiated) {
+                    records.map(Self.makeSkeletonItem)
+                }.value
+                guard isCurrentGalleryLoad(generation, directoryID: directoryID) else { return }
+                galleryItems = skeleton
+                appendLog("[图库] GetObjectsMetaData成功生成对象数=\(skeleton.count)")
+                galleryEnrichmentTask = Task { [weak self] in
+                    await self?.enrichMetadataGallery(
+                        metadata,
+                        in: directory,
+                        on: commandConnection,
+                        generation: generation
+                    )
+                }
+                return
+            } catch {
+                guard isMatchingGalleryLoad(generation, directoryID: directoryID) else { return }
+                appendLog("[图库] GetObjectsMetaData失败 reason=\(error.localizedDescription)")
+                appendLog("[图库] GetObjectsMetaData失败，回退标准对象枚举")
+                if case .ready = commandConnection.state {
+                    mediaConnection = commandConnection
+                } else if let recovered = await waitForRecoveredCommandConnection(
+                    generation: generation,
+                    directoryID: directoryID
+                ) {
+                    mediaConnection = recovered
+                    appendLog("[图库] 连接恢复完成，开始标准对象枚举")
+                } else {
+                    appendLog("[图库] 标准对象枚举未启动 reason=连接恢复超时")
+                    return
+                }
+            }
+        } else {
+            appendLog("[图库] 相机未公布 GetObjectsMetaData(0x9434)")
+        }
+
         do {
-            let items = try await loadMediaItems(in: directory, on: commandConnection)
+            let items = try await loadMediaItems(
+                in: directory,
+                on: mediaConnection,
+                generation: generation
+            )
+            guard isCurrentGalleryLoad(generation, directoryID: directoryID) else { return }
             galleryItems = items
             let photos = items.filter { !$0.isVideo }.count
             let videos = items.filter(\.isVideo).count
@@ -518,7 +619,7 @@ final class CameraConnectionService: ObservableObject {
                     "total=\(items.count) elapsedMs=\(elapsedMs)"
             )
         } catch {
-            galleryItems = []
+            guard isCurrentGalleryLoad(generation, directoryID: directoryID) else { return }
             appendLog("[图库] 目录媒体失败 dir=\(directory.pickerTitle) error=\(error.localizedDescription)")
         }
     }
@@ -666,14 +767,6 @@ final class CameraConnectionService: ObservableObject {
             }
             offset += UInt32(data.count)
         }
-    }
-
-    func videoDurationSeconds(for handle: UInt32) async -> Int? {
-        if let cached = durationCache[handle] {
-            return cached
-        }
-        guard case .connected = state, let commandConnection else { return nil }
-        return await fetchVideoDurationSeconds(handle: handle, on: commandConnection)
     }
 
     func clearDebugLog() {
@@ -940,13 +1033,57 @@ final class CameraConnectionService: ObservableObject {
         parameters: [UInt32],
         dataPhase: DataPhase?,
         on connection: NWConnection,
-        logStyle: OperationLogStyle = .verbose
+        logStyle: OperationLogStyle = .verbose,
+        priority: OperationPriority = .foreground,
+        timeout: Duration? = nil
     ) async throws -> PTPResponse {
-        await acquireOperationSlot()
-        defer { releaseOperationSlot() }
+        await acquireOperationSlot(priority: priority)
 
         let currentTransactionID = max(transactionID &+ 1, 1)
         transactionID = currentTransactionID
+        activeOperationTransactionID = currentTransactionID
+        let timeoutTask = timeout.map { timeout in
+            Task { [weak self, weak connection] in
+                guard let self, let connection else { return }
+                do {
+                    try await Task.sleep(for: timeout)
+                } catch {
+                    return
+                }
+                guard self.activeOperationTransactionID == currentTransactionID else { return }
+                self.appendLog(
+                    "[command] Operation timeout name=\(code.debugName) " +
+                        "transaction=\(currentTransactionID)，发送 CancelTransaction"
+                )
+                try? await self.send(
+                    ptpIPPacket(
+                        type: .cancelTransaction,
+                        payload: uint32Data(currentTransactionID)
+                    ),
+                    on: connection,
+                    logStyle: .compact
+                )
+                do {
+                    try await Task.sleep(for: .seconds(2))
+                } catch {
+                    return
+                }
+                guard self.activeOperationTransactionID == currentTransactionID else { return }
+                self.appendLog(
+                    "[command] CancelTransaction未收到响应 name=\(code.debugName) " +
+                        "transaction=\(currentTransactionID)，重建连接"
+                )
+                connection.cancel()
+                self.beginAutomaticReconnect(reason: "\(code.debugName) 超时")
+            }
+        }
+        defer {
+            timeoutTask?.cancel()
+            if activeOperationTransactionID == currentTransactionID {
+                activeOperationTransactionID = nil
+            }
+            releaseOperationSlot()
+        }
 
         var operationPayload = Data()
         let dataPhaseValue: UInt32
@@ -1188,23 +1325,51 @@ final class CameraConnectionService: ObservableObject {
         connectionNumber = nil
     }
 
-    private func acquireOperationSlot() async {
+    private func acquireOperationSlot(priority: OperationPriority) async {
         if !isOperationBusy {
             isOperationBusy = true
             return
         }
         await withCheckedContinuation { continuation in
-            operationWaiters.append(continuation)
+            switch priority {
+            case .foreground:
+                foregroundOperationWaiters.append(continuation)
+            case .background:
+                backgroundOperationWaiters.append(continuation)
+            }
         }
     }
 
     private func releaseOperationSlot() {
-        if operationWaiters.isEmpty {
-            isOperationBusy = false
-        } else {
-            let next = operationWaiters.removeFirst()
+        if let next = dequeueForegroundOperationWaiter() {
             next.resume()
+        } else if let next = dequeueBackgroundOperationWaiter() {
+            next.resume()
+        } else {
+            isOperationBusy = false
         }
+    }
+
+    private func dequeueForegroundOperationWaiter() -> CheckedContinuation<Void, Never>? {
+        guard foregroundOperationWaiterIndex < foregroundOperationWaiters.count else { return nil }
+        let waiter = foregroundOperationWaiters[foregroundOperationWaiterIndex]
+        foregroundOperationWaiterIndex += 1
+        if foregroundOperationWaiterIndex == foregroundOperationWaiters.count {
+            foregroundOperationWaiters.removeAll(keepingCapacity: true)
+            foregroundOperationWaiterIndex = 0
+        }
+        return waiter
+    }
+
+    private func dequeueBackgroundOperationWaiter() -> CheckedContinuation<Void, Never>? {
+        guard backgroundOperationWaiterIndex < backgroundOperationWaiters.count else { return nil }
+        let waiter = backgroundOperationWaiters[backgroundOperationWaiterIndex]
+        backgroundOperationWaiterIndex += 1
+        if backgroundOperationWaiterIndex == backgroundOperationWaiters.count {
+            backgroundOperationWaiters.removeAll(keepingCapacity: true)
+            backgroundOperationWaiterIndex = 0
+        }
+        return waiter
     }
 
     private func loadGalleryDirectories(on connection: NWConnection) async throws -> [GalleryDirectory] {
@@ -1358,9 +1523,265 @@ final class CameraConnectionService: ObservableObject {
         return directories
     }
 
-    private func loadMediaItems(
+    private func fetchNikonObjectsMetadata(
         in directory: GalleryDirectory,
         on connection: NWConnection
+    ) async throws -> NikonObjectsMetadata {
+        guard !directory.isSyntheticRoot else {
+            throw NikonMetadataLoadError.allStrategiesFailed(
+                responseCode: nil,
+                reason: "合成根目录没有可用于 Nikon 指令的真实 association handle"
+            )
+        }
+
+        let pathPrefix = directory.path.isEmpty ? "" : directory.path + "/"
+        let descendants = galleryDirectories
+            .filter {
+                !$0.isSyntheticRoot
+                    && $0.storageID == directory.storageID
+                    && $0.id != directory.id
+                    && $0.path.hasPrefix(pathPrefix)
+            }
+            .sorted { lhs, rhs in
+                let lhsDepth = lhs.path.split(separator: "/").count
+                let rhsDepth = rhs.path.split(separator: "/").count
+                if lhsDepth != rhsDepth { return lhsDepth < rhsDepth }
+                return lhs.path.localizedStandardCompare(rhs.path) == .orderedAscending
+            }
+        let targets = [directory] + descendants
+        appendLog(
+            "[图库] GetObjectsMetaData目录范围 selected=\(directory.path) " +
+                "targets=\(targets.count) descendants=\(descendants.count)"
+        )
+
+        var lastFailure = "没有可用响应"
+        var lastResponseCode: UInt16?
+        var firstHeader: UInt32?
+        var recordsByHandle: [UInt32: NikonObjectMetadata] = [:]
+        var hadFailure = false
+
+        for (index, target) in targets.enumerated() {
+            let strategyName = index == 0 ? "selected-directory" : "descendant-directory"
+            let parameters = [directory.storageID, UInt32(0), target.handle]
+            let parameterText = parameters
+                .map { String(format: "0x%08X", $0) }
+                .joined(separator: ",")
+            appendLog(
+                "[图库] GetObjectsMetaData策略=\(strategyName) path=\(target.path) " +
+                    "parameters=[\(parameterText)]"
+            )
+
+            let response: PTPResponse
+            do {
+                response = try await operation(
+                    .getObjectsMetadata,
+                    parameters: parameters,
+                    dataPhase: .receive,
+                    on: connection,
+                    logStyle: .compact,
+                    timeout: .seconds(8)
+                )
+            } catch {
+                hadFailure = true
+                lastFailure = "策略 \(strategyName) path=\(target.path) 传输异常：\(error.localizedDescription)"
+                appendLog("[图库] GetObjectsMetaData策略失败 strategy=\(strategyName) reason=\(lastFailure)")
+                if case .ready = connection.state {
+                    continue
+                }
+                throw NikonMetadataLoadError.allStrategiesFailed(
+                    responseCode: lastResponseCode,
+                    reason: lastFailure
+                )
+            }
+
+            lastResponseCode = response.code
+            let byteCount = response.data?.count ?? 0
+            appendLog(
+                "[图库] GetObjectsMetaData响应 strategy=\(strategyName) path=\(target.path) " +
+                    "code=0x\(String(format: "%04X", response.code)) bytes=\(byteCount)"
+            )
+            guard response.code == PTPResponseCode.ok.rawValue else {
+                hadFailure = true
+                lastFailure = "策略 \(strategyName) path=\(target.path) 返回码 0x\(String(format: "%04X", response.code))"
+                continue
+            }
+            guard let data = response.data, !data.isEmpty else {
+                hadFailure = true
+                lastFailure = "策略 \(strategyName) path=\(target.path) 返回空数据"
+                continue
+            }
+
+            let parseStarted = DispatchTime.now().uptimeNanoseconds
+            do {
+                let metadata = try await Task.detached(priority: .userInitiated) {
+                    try NikonObjectsMetadataParser.parse(data)
+                }.value
+                let elapsedNanoseconds = DispatchTime.now().uptimeNanoseconds - parseStarted
+                let elapsedMilliseconds = elapsedNanoseconds / 1_000_000
+                appendLog(
+                    "[图库] GetObjectsMetaData解析 bytes=\(data.count) records=\(metadata.records.count) " +
+                        "elapsedMs=\(elapsedMilliseconds) strategy=\(strategyName) path=\(target.path)"
+                )
+                if metadata.records.isEmpty {
+                    lastFailure = "策略 \(strategyName) path=\(target.path) 返回 0 条记录"
+                    continue
+                }
+                if firstHeader == nil {
+                    firstHeader = metadata.header
+                }
+                for record in metadata.records {
+                    recordsByHandle[record.handle] = record
+                }
+            } catch {
+                hadFailure = true
+                lastFailure = "策略 \(strategyName) path=\(target.path) 数据格式异常：\(error)"
+                appendLog("[图库] GetObjectsMetaData解析失败 strategy=\(strategyName) reason=\(error)")
+            }
+        }
+
+        if !hadFailure, !recordsByHandle.isEmpty {
+            let records = await Task.detached(priority: .userInitiated) {
+                NikonObjectsMetadataParser.sortedRecords(Array(recordsByHandle.values))
+            }.value
+            appendLog(
+                "[图库] GetObjectsMetaData目录合并完成 targets=\(targets.count) " +
+                    "objects=\(records.count)"
+            )
+            return NikonObjectsMetadata(header: firstHeader ?? 0, records: records)
+        }
+
+        if hadFailure, !recordsByHandle.isEmpty {
+            lastFailure += "；为避免发布不完整列表，丢弃已取得的 \(recordsByHandle.count) 条记录"
+        } else if !hadFailure {
+            lastFailure = "选中目录及其 \(descendants.count) 个后代目录均返回 0 条记录"
+        }
+
+        throw NikonMetadataLoadError.allStrategiesFailed(
+            responseCode: lastResponseCode,
+            reason: lastFailure
+        )
+    }
+
+    nonisolated private static func makeSkeletonItem(from record: NikonObjectMetadata) -> GalleryItem {
+        GalleryItem(
+            id: record.handle,
+            filename: "",
+            objectFormat: 0,
+            fileSize: 0,
+            isVideo: false,
+            captureDate: record.captureDate,
+            rawHandle: nil,
+            rawFilename: nil,
+            rawFileSize: nil,
+            jpegHandle: nil,
+            jpegFilename: nil,
+            jpegFileSize: nil
+        )
+    }
+
+    private func enrichMetadataGallery(
+        _ metadata: NikonObjectsMetadata,
+        in directory: GalleryDirectory,
+        on connection: NWConnection,
+        generation: Int
+    ) async {
+        var resolved: [UInt32: GalleryItem] = [:]
+        var excludedHandles = Set<UInt32>()
+        var failedInfo = 0
+        var pendingChanges = 0
+        var lastPublish = Date()
+
+        for (index, record) in metadata.records.enumerated() {
+            guard isCurrentGalleryLoad(generation, directoryID: directory.id) else { return }
+            do {
+                if let info = try await fetchObjectInfo(
+                    handle: record.handle,
+                    on: connection,
+                    priority: .background
+                ) {
+                    if isAssociationObject(objectFormat: info.objectFormat)
+                        || !isGalleryMedia(objectFormat: info.objectFormat, filename: info.filename)
+                    {
+                        excludedHandles.insert(record.handle)
+                    } else {
+                        let isVideo = isVideoMedia(objectFormat: info.objectFormat, filename: info.filename)
+                        let isRAW = !isVideo && isRAWMedia(objectFormat: info.objectFormat, filename: info.filename)
+                        resolved[record.handle] = GalleryItem(
+                            id: record.handle,
+                            filename: info.filename,
+                            objectFormat: info.objectFormat,
+                            fileSize: info.fileSize,
+                            isVideo: isVideo,
+                            captureDate: record.captureDate ?? info.captureDate ?? info.modificationDate,
+                            rawHandle: isRAW ? record.handle : nil,
+                            rawFilename: isRAW ? info.filename : nil,
+                            rawFileSize: isRAW ? info.fileSize : nil,
+                            jpegHandle: !isVideo && !isRAW ? record.handle : nil,
+                            jpegFilename: !isVideo && !isRAW ? info.filename : nil,
+                            jpegFileSize: !isVideo && !isRAW ? info.fileSize : nil
+                        )
+                    }
+                } else {
+                    failedInfo += 1
+                }
+            } catch {
+                failedInfo += 1
+                appendLog(
+                    "[图库] 后台 ObjectInfo 跳过 handle=0x\(String(format: "%08X", record.handle)) " +
+                        "error=\(error.localizedDescription)"
+                )
+            }
+
+            pendingChanges += 1
+            let isLast = index == metadata.records.count - 1
+            let shouldPublish = isLast || pendingChanges >= 16 || Date().timeIntervalSince(lastPublish) >= 0.35
+            if shouldPublish {
+                let records = metadata.records
+                let resolvedSnapshot = resolved
+                let excludedSnapshot = excludedHandles
+                let published = await Task.detached(priority: .utility) {
+                    Self.buildEnrichedGalleryItems(
+                        records: records,
+                        resolved: resolvedSnapshot,
+                        excludedHandles: excludedSnapshot
+                    )
+                }.value
+                guard isCurrentGalleryLoad(generation, directoryID: directory.id) else { return }
+                if published != galleryItems {
+                    galleryItems = published
+                }
+                pendingChanges = 0
+                lastPublish = Date()
+            }
+
+            await Task.yield()
+        }
+
+        guard isCurrentGalleryLoad(generation, directoryID: directory.id) else { return }
+        let photos = galleryItems.filter { !$0.isVideo }.count
+        let videos = galleryItems.filter(\.isVideo).count
+        appendLog(
+            "[图库] GetObjectsMetaData补充完成 dir=\(directory.pickerTitle) " +
+                "objects=\(galleryItems.count) photos=\(photos) videos=\(videos) infoErrors=\(failedInfo)"
+        )
+    }
+
+    nonisolated private static func buildEnrichedGalleryItems(
+        records: [NikonObjectMetadata],
+        resolved: [UInt32: GalleryItem],
+        excludedHandles: Set<UInt32>
+    ) -> [GalleryItem] {
+        let candidates = records.compactMap { record -> GalleryItem? in
+            if excludedHandles.contains(record.handle) { return nil }
+            return resolved[record.handle] ?? makeSkeletonItem(from: record)
+        }
+        return sortedGalleryItems(mergePairedPhotos(candidates))
+    }
+
+    private func loadMediaItems(
+        in directory: GalleryDirectory,
+        on connection: NWConnection,
+        generation: Int
     ) async throws -> [GalleryItem] {
         let rootHandles = try await fetchObjectHandles(
             storageID: directory.storageID,
@@ -1375,13 +1796,18 @@ final class CameraConnectionService: ObservableObject {
         var skippedNonMedia = 0
         var skippedErrors = 0
         var visited = Set<UInt32>()
-        // Nikon object handles normally increase with capture order, so this gets recent
-        // photos onto the screen first while capture dates are still being read.
-        var queue: [UInt32] = rootHandles.sorted(by: >)
+        var queue = rootHandles
+        var queueIndex = 0
         var processed = 0
+        var itemsSincePublish = 0
+        var lastPublish = Date()
 
-        while !queue.isEmpty {
-            let handle = queue.removeFirst()
+        while queueIndex < queue.count {
+            guard isCurrentGalleryLoad(generation, directoryID: directory.id) else {
+                throw CancellationError()
+            }
+            let handle = queue[queueIndex]
+            queueIndex += 1
             if !visited.insert(handle).inserted { continue }
             processed += 1
             do {
@@ -1418,7 +1844,6 @@ final class CameraConnectionService: ObservableObject {
                         fileSize: info.fileSize,
                         isVideo: isVideo,
                         captureDate: info.captureDate ?? info.modificationDate,
-                        durationSeconds: isVideo ? durationCache[handle] : nil,
                         rawHandle: isRAW ? handle : nil,
                         rawFilename: isRAW ? info.filename : nil,
                         rawFileSize: isRAW ? info.fileSize : nil,
@@ -1427,6 +1852,7 @@ final class CameraConnectionService: ObservableObject {
                         jpegFileSize: !isVideo && !isRAW ? info.fileSize : nil
                     )
                 )
+                itemsSincePublish += 1
             } catch {
                 skippedErrors += 1
                 appendLog(
@@ -1435,22 +1861,34 @@ final class CameraConnectionService: ObservableObject {
                 )
             }
 
-            if !items.isEmpty, (items.count == 1 || processed % 8 == 0 || queue.isEmpty) {
-                let partialItems = sortedGalleryItems(mergePairedPhotos(items))
-                if selectedGalleryDirectoryID == directory.id, partialItems != galleryItems {
+            let isLast = queueIndex >= queue.count
+            let shouldPublish = !items.isEmpty
+                && (isLast || itemsSincePublish >= 24 || Date().timeIntervalSince(lastPublish) >= 0.4)
+            if shouldPublish {
+                let snapshot = items
+                let partialItems = await Task.detached(priority: .utility) {
+                    Self.sortedGalleryItems(Self.mergePairedPhotos(snapshot))
+                }.value
+                if isCurrentGalleryLoad(generation, directoryID: directory.id), partialItems != galleryItems {
                     galleryItems = partialItems
                 }
+                itemsSincePublish = 0
+                lastPublish = Date()
             }
 
-            if processed % 25 == 0 || queue.isEmpty {
+            if processed % 25 == 0 || isLast {
                 appendLog(
-                    "[图库] 目录解析进度 dir=\(directory.pickerTitle) processed=\(processed) pending=\(queue.count) " +
+                    "[图库] 目录解析进度 dir=\(directory.pickerTitle) processed=\(processed) pending=\(queue.count - queueIndex) " +
                         "media=\(items.count)"
                 )
             }
+
+            await Task.yield()
         }
 
-        items = sortedGalleryItems(mergePairedPhotos(items))
+        items = await Task.detached(priority: .utility) {
+            Self.sortedGalleryItems(Self.mergePairedPhotos(items))
+        }.value
 
         appendLog(
             "[图库] 目录解析结束 dir=\(directory.pickerTitle) media=\(items.count) " +
@@ -1459,7 +1897,7 @@ final class CameraConnectionService: ObservableObject {
         return items
     }
 
-    private func sortedGalleryItems(_ items: [GalleryItem]) -> [GalleryItem] {
+    nonisolated private static func sortedGalleryItems(_ items: [GalleryItem]) -> [GalleryItem] {
         items.sorted { lhs, rhs in
             switch (lhs.captureDate, rhs.captureDate) {
             case (let l?, let r?):
@@ -1471,26 +1909,28 @@ final class CameraConnectionService: ObservableObject {
             case (nil, nil):
                 break
             }
-            return lhs.handle > rhs.handle
+            return lhs.id > rhs.id
         }
     }
 
-    private func mergePairedPhotos(_ sourceItems: [GalleryItem]) -> [GalleryItem] {
+    nonisolated private static func mergePairedPhotos(_ sourceItems: [GalleryItem]) -> [GalleryItem] {
         var merged: [GalleryItem] = []
         var photoIndexes: [String: Int] = [:]
 
         for item in sourceItems {
-            guard !item.isVideo, let format = item.photoFormat else {
+            guard !item.isVideo else {
+                merged.append(item)
+                continue
+            }
+
+            let hasRAW = item.rawHandle != nil
+            let hasJPEG = item.jpegHandle != nil
+            guard hasRAW != hasJPEG else {
                 merged.append(item)
                 continue
             }
 
             let key = photoPairKey(for: item.filename)
-            guard format == .raw || format == .jpeg else {
-                merged.append(item)
-                continue
-            }
-
             if let index = photoIndexes[key] {
                 merged[index] = combinePhotoItems(merged[index], item)
             } else {
@@ -1502,19 +1942,18 @@ final class CameraConnectionService: ObservableObject {
         return merged
     }
 
-    private func combinePhotoItems(_ lhs: GalleryItem, _ rhs: GalleryItem) -> GalleryItem {
+    nonisolated private static func combinePhotoItems(_ lhs: GalleryItem, _ rhs: GalleryItem) -> GalleryItem {
         let rawItem = lhs.rawHandle != nil ? lhs : rhs
         let jpegItem = lhs.jpegHandle != nil ? lhs : rhs
         let captureDate = lhs.captureDate ?? rhs.captureDate
 
         return GalleryItem(
-            id: min(lhs.handle, rhs.handle),
+            id: min(lhs.id, rhs.id),
             filename: jpegItem.jpegFilename ?? rawItem.rawFilename ?? lhs.filename,
             objectFormat: jpegItem.jpegHandle != nil ? jpegItem.objectFormat : rawItem.objectFormat,
             fileSize: (rawItem.rawFileSize ?? 0) + (jpegItem.jpegFileSize ?? 0),
             isVideo: false,
             captureDate: captureDate,
-            durationSeconds: nil,
             rawHandle: rawItem.rawHandle,
             rawFilename: rawItem.rawFilename,
             rawFileSize: rawItem.rawFileSize,
@@ -1524,7 +1963,7 @@ final class CameraConnectionService: ObservableObject {
         )
     }
 
-    private func photoPairKey(for filename: String) -> String {
+    nonisolated private static func photoPairKey(for filename: String) -> String {
         let base = (filename as NSString).deletingPathExtension
         return base.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
     }
@@ -1602,7 +2041,7 @@ final class CameraConnectionService: ObservableObject {
         objectFormat == 0x3001
     }
 
-    private struct ParsedObjectInfo {
+    private struct ParsedObjectInfo: Sendable {
         var objectFormat: UInt16
         var fileSize: UInt64
         var filename: String
@@ -1610,13 +2049,18 @@ final class CameraConnectionService: ObservableObject {
         var modificationDate: Date?
     }
 
-    private func fetchObjectInfo(handle: UInt32, on connection: NWConnection) async throws -> ParsedObjectInfo? {
+    private func fetchObjectInfo(
+        handle: UInt32,
+        on connection: NWConnection,
+        priority: OperationPriority = .foreground
+    ) async throws -> ParsedObjectInfo? {
         let response = try await operation(
             .getObjectInfo,
             parameters: [handle],
             dataPhase: .receive,
             on: connection,
-            logStyle: .silent
+            logStyle: .silent,
+            priority: priority
         )
         guard response.code == PTPResponseCode.ok.rawValue, let data = response.data else {
             appendLog(
@@ -1649,62 +2093,6 @@ final class CameraConnectionService: ObservableObject {
             captureDate: parsePTPDateTime(captureDate.value),
             modificationDate: parsePTPDateTime(modificationDate.value)
         )
-    }
-
-    private func fetchVideoDurationSeconds(handle: UInt32, on connection: NWConnection) async -> Int? {
-        if let cached = durationCache[handle] {
-            return cached
-        }
-
-        let filename = galleryItems.first(where: { $0.handle == handle })?.filename
-
-        // MTP ObjectPropCode Duration = 0xDC89, typically milliseconds.
-        do {
-            let response = try await operation(
-                .getObjectPropValue,
-                parameters: [handle, 0x0000dc89],
-                dataPhase: .receive,
-                on: connection,
-                logStyle: .silent
-            )
-            guard response.code == PTPResponseCode.ok.rawValue,
-                  let data = response.data,
-                  let raw = readIntegerValue(from: data),
-                  raw > 0
-            else {
-                // Many cameras omit Duration; keep the log quiet unless it's an unexpected hard failure.
-                if response.code != PTPResponseCode.ok.rawValue,
-                   response.code != 0x200a, // DevicePropNotSupported-ish / common reject
-                   response.code != 0xa801
-                {
-                    appendLog(
-                        "[图库] 视频时长读取被拒 \(galleryItemLabel(handle: handle, filename: filename)) " +
-                            "code=0x\(String(format: "%04X", response.code))"
-                    )
-                }
-                return nil
-            }
-
-            let seconds: Int
-            if raw >= 1000 {
-                seconds = Int(raw / 1000)
-            } else {
-                seconds = Int(raw)
-            }
-            durationCache[handle] = seconds
-            if let index = galleryItems.firstIndex(where: { $0.handle == handle }) {
-                var items = galleryItems
-                items[index].durationSeconds = seconds
-                galleryItems = items
-            }
-            return seconds
-        } catch {
-            appendLog(
-                "[图库] 视频时长读取异常 \(galleryItemLabel(handle: handle, filename: filename)) " +
-                    "error=\(error.localizedDescription)"
-            )
-            return nil
-        }
     }
 
     private func isGalleryMedia(objectFormat: UInt16, filename: String) -> Bool {
@@ -2036,6 +2424,7 @@ final class CameraConnectionService: ObservableObject {
         let operationList = try readUInt16Array(in: data, at: offset)
         supportedOperations = Set(operationList.values)
         supportsPreviewImage = supportedOperations.contains(PTPOperationCode.getPreviewImage.rawValue)
+        let supportsObjectsMetadata = supportedOperations.contains(PTPOperationCode.getObjectsMetadata.rawValue)
         let liveViewOps = [
             ("StartLiveView", PTPOperationCode.startLiveView.rawValue),
             ("EndLiveView", PTPOperationCode.endLiveView.rawValue),
@@ -2046,8 +2435,15 @@ final class CameraConnectionService: ObservableObject {
         ].filter { supportedOperations.contains($0.1) }.map(\.0)
         appendLog(
             "DeviceInfo Operations count=\(operationList.values.count) previewImage=\(supportsPreviewImage) " +
+                "getObjectsMetaData=\(supportsObjectsMetadata) " +
                 "liveView=[\(liveViewOps.joined(separator: ","))] offset=\(operationList.nextOffset)"
         )
+        if supportsObjectsMetadata {
+            appendLog("[图库] 相机公布 GetObjectsMetaData(0x9434)")
+            appendLog("[图库] GetObjectsMetaData可用")
+        } else {
+            appendLog("[图库] 相机未公布 GetObjectsMetaData(0x9434)")
+        }
         offset = operationList.nextOffset
         offset = try skipUInt16Array(in: data, at: offset)
         appendLog("DeviceInfo Events offset=\(offset)")
@@ -2152,6 +2548,11 @@ private enum OperationLogStyle {
     case silent
 }
 
+private enum OperationPriority {
+    case foreground
+    case background
+}
+
 private struct PTPResponse {
     let code: UInt16
     let data: Data?
@@ -2183,6 +2584,7 @@ private enum PTPIPPacketType: UInt32 {
     case event = 0x00000008
     case startData = 0x00000009
     case data = 0x0000000a
+    case cancelTransaction = 0x0000000b
     case endData = 0x0000000c
 
     var debugName: String {
@@ -2197,6 +2599,7 @@ private enum PTPIPPacketType: UInt32 {
         case .event: return "Event"
         case .startData: return "StartData"
         case .data: return "Data"
+        case .cancelTransaction: return "CancelTransaction"
         case .endData: return "EndData"
         }
     }
@@ -2221,6 +2624,7 @@ private enum PTPOperationCode: UInt16 {
     case endLiveView = 0x9202
     case getLiveViewImage = 0x9203
     case getLiveViewImageEx = 0x9428
+    case getObjectsMetadata = 0x9434
     case changeApplicationMode = 0x9435
 
     var debugName: String {
@@ -2243,6 +2647,7 @@ private enum PTPOperationCode: UInt16 {
         case .endLiveView: return "EndLiveView"
         case .getLiveViewImage: return "GetLiveViewImg"
         case .getLiveViewImageEx: return "GetLiveViewImageEx"
+        case .getObjectsMetadata: return "GetObjectsMetaData"
         case .changeApplicationMode: return "ChangeApplicationMode"
         }
     }
@@ -2279,6 +2684,20 @@ private enum CameraConnectionError: LocalizedError {
             return String(format: "相机拒绝了请求（0x%04X）。", code)
         case .initFailed(let code):
             return String(format: "相机拒绝了 PTP/IP 初始化（失败码 0x%08X）。", code)
+        }
+    }
+}
+
+private enum NikonMetadataLoadError: LocalizedError {
+    case allStrategiesFailed(responseCode: UInt16?, reason: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .allStrategiesFailed(let responseCode, let reason):
+            if let responseCode {
+                return "全部参数策略失败，最后返回码 0x\(String(format: "%04X", responseCode))：\(reason)"
+            }
+            return "全部参数策略失败：\(reason)"
         }
     }
 }
