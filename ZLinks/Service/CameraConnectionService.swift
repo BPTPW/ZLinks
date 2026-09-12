@@ -132,8 +132,9 @@ final class CameraConnectionService: ObservableObject {
             jpegHandle ?? rawHandle ?? handle
         }
 
+        /// Full-screen previews prefer the paired JPEG because RAW objects are much larger.
         var previewHandle: UInt32 {
-            thumbnailHandle
+            jpegHandle ?? rawHandle ?? handle
         }
     }
 
@@ -879,18 +880,31 @@ final class CameraConnectionService: ObservableObject {
         var rootHasDirectMedia = false
 
         for storageID in storageIDs {
-            // Seed from root objects.
+            // Most PTP cameras support filtering handles by Association (folder) format.
+            // This avoids fetching ObjectInfo for every photo before the first grid can appear.
+            let filteredFolders = try? await fetchObjectHandles(
+                storageID: storageID,
+                objectFormat: 0x3001,
+                parent: 0xffffffff,
+                on: connection
+            )
+            let usesAssociationFilter = filteredFolders?.isEmpty == false
             var seedHandles: [UInt32] = []
-            if let root = try? await fetchObjectHandles(
+            if usesAssociationFilter {
+                seedHandles = filteredFolders ?? []
+                appendLog(
+                    "[图库] 使用目录过滤 storageID=0x\(String(format: "%08X", storageID)) folders=\(seedHandles.count)"
+                )
+            } else if let root = try? await fetchObjectHandles(
                 storageID: storageID,
                 objectFormat: 0,
                 parent: 0xffffffff,
                 on: connection
             ) {
                 appendLog(
-                    "[图库] 根目录句柄 storageID=0x\(String(format: "%08X", storageID)) count=\(root.count)"
+                    "[图库] 目录过滤不可用，回退根目录扫描 storageID=0x\(String(format: "%08X", storageID)) count=\(root.count)"
                 )
-                seedHandles.append(contentsOf: root)
+                seedHandles = root
             }
 
             // Walk folders breadth-first. Keep folders that directly contain media.
@@ -909,7 +923,7 @@ final class CameraConnectionService: ObservableObject {
                     do {
                         childHandles = try await fetchObjectHandles(
                             storageID: storageID,
-                            objectFormat: 0,
+                            objectFormat: usesAssociationFilter ? 0x3001 : 0,
                             parent: folderHandle,
                             on: connection
                         )
@@ -1018,7 +1032,9 @@ final class CameraConnectionService: ObservableObject {
         var skippedNonMedia = 0
         var skippedErrors = 0
         var visited = Set<UInt32>()
-        var queue: [UInt32] = rootHandles
+        // Nikon object handles normally increase with capture order, so this gets recent
+        // photos onto the screen first while capture dates are still being read.
+        var queue: [UInt32] = rootHandles.sorted(by: >)
         var processed = 0
 
         while !queue.isEmpty {
@@ -1076,6 +1092,13 @@ final class CameraConnectionService: ObservableObject {
                 )
             }
 
+            if !items.isEmpty, (items.count == 1 || processed % 8 == 0 || queue.isEmpty) {
+                let partialItems = sortedGalleryItems(mergePairedPhotos(items))
+                if selectedGalleryDirectoryID == directory.id, partialItems != galleryItems {
+                    galleryItems = partialItems
+                }
+            }
+
             if processed % 25 == 0 || queue.isEmpty {
                 appendLog(
                     "[图库] 目录解析进度 dir=\(directory.pickerTitle) processed=\(processed) pending=\(queue.count) " +
@@ -1084,9 +1107,17 @@ final class CameraConnectionService: ObservableObject {
             }
         }
 
-        items = mergePairedPhotos(items)
+        items = sortedGalleryItems(mergePairedPhotos(items))
 
-        items.sort { lhs, rhs in
+        appendLog(
+            "[图库] 目录解析结束 dir=\(directory.pickerTitle) media=\(items.count) " +
+                "skippedNonMedia=\(skippedNonMedia) errors=\(skippedErrors)"
+        )
+        return items
+    }
+
+    private func sortedGalleryItems(_ items: [GalleryItem]) -> [GalleryItem] {
+        items.sorted { lhs, rhs in
             switch (lhs.captureDate, rhs.captureDate) {
             case (let l?, let r?):
                 if l != r { return l > r }
@@ -1099,12 +1130,6 @@ final class CameraConnectionService: ObservableObject {
             }
             return lhs.handle > rhs.handle
         }
-
-        appendLog(
-            "[图库] 目录解析结束 dir=\(directory.pickerTitle) media=\(items.count) " +
-                "skippedNonMedia=\(skippedNonMedia) errors=\(skippedErrors)"
-        )
-        return items
     }
 
     private func mergePairedPhotos(_ sourceItems: [GalleryItem]) -> [GalleryItem] {
