@@ -565,6 +565,8 @@ private struct GalleryPreviewView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var image: UIImage?
     @State private var isLoading = false
+    @State private var isHighQualityPreview = false
+    @State private var isOriginalImageLoading = false
     @State private var hasLoadFailed = false
     @State private var scale: CGFloat = 1
     @State private var settledScale: CGFloat = 1
@@ -625,6 +627,33 @@ private struct GalleryPreviewView: View {
                         .padding(.horizontal, 16)
                         .padding(.top, 8)
                         Spacer()
+                        if isHighQualityPreview {
+                            Button(action: loadOriginalImage) {
+                                VStack(spacing: 2) {
+                                    Text("高清预览")
+                                        .font(.caption.weight(.semibold))
+                                    if isOriginalImageLoading {
+                                        HStack(spacing: 5) {
+                                            ProgressView()
+                                                .controlSize(.mini)
+                                            Text("正在加载原图…")
+                                                .font(.caption2)
+                                        }
+                                    } else {
+                                        Text("点击查看原图")
+                                            .font(.caption2)
+                                    }
+                                }
+                                .foregroundStyle(.primary)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 7)
+                            }
+                            .buttonStyle(.plain)
+                            .glassEffect(.regular.interactive(), in: .capsule)
+                            .disabled(isOriginalImageLoading)
+                            .accessibilityLabel("查看原图")
+                            .padding(.bottom, 10)
+                        }
                         HStack {
                             if let format = item.photoFormat {
                                 Menu {
@@ -707,7 +736,7 @@ private struct GalleryPreviewView: View {
                     .font(.caption.weight(.semibold))
                     
                 Text(captureDateParts.time)
-                    .font(.caption)
+                    .font(.caption2)
             }
             .fontDesign(.rounded)
             .foregroundStyle(isImmersive ? .white : .primary)
@@ -819,12 +848,42 @@ private struct GalleryPreviewView: View {
         guard !item.isVideo, image == nil, !isLoading else { return }
         isLoading = true
         Task {
+            let result = await camera.galleryPreviewImage(for: item.previewHandle)
+            await MainActor.run {
+                withAnimation(.easeIn(duration: 0.28)) {
+                    switch result {
+                    case .preview(let loaded):
+                        image = loaded
+                        isHighQualityPreview = true
+                        hasLoadFailed = false
+                    case .original(let loaded):
+                        image = loaded
+                        isHighQualityPreview = false
+                        hasLoadFailed = false
+                    case nil:
+                        image = nil
+                        isHighQualityPreview = false
+                        hasLoadFailed = true
+                    }
+                    isLoading = false
+                }
+            }
+        }
+    }
+
+    private func loadOriginalImage() {
+        guard isHighQualityPreview, !isOriginalImageLoading else { return }
+        isOriginalImageLoading = true
+        Task {
             let loaded = await camera.objectImage(for: item.previewHandle)
             await MainActor.run {
                 withAnimation(.easeIn(duration: 0.28)) {
-                    image = loaded
-                    hasLoadFailed = loaded == nil
-                    isLoading = false
+                    if let loaded {
+                        image = loaded
+                        isHighQualityPreview = false
+                        hasLoadFailed = false
+                    }
+                    isOriginalImageLoading = false
                 }
             }
         }

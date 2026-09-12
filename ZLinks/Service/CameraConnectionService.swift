@@ -103,6 +103,11 @@ final class CameraConnectionService: ObservableObject {
         }
     }
 
+    enum GalleryImageLoadResult {
+        case preview(UIImage)
+        case original(UIImage)
+    }
+
     struct GalleryItem: Identifiable, Equatable, Hashable {
         let id: UInt32
         var handle: UInt32 { id }
@@ -174,8 +179,10 @@ final class CameraConnectionService: ObservableObject {
     private var isOperationBusy = false
     private var operationWaiters: [CheckedContinuation<Void, Never>] = []
     private var thumbnailCache: [UInt32: Data] = [:]
+    private var previewImageCache: [UInt32: Data] = [:]
     private var objectImageCache: [UInt32: Data] = [:]
     private var durationCache: [UInt32: Int] = [:]
+    private var supportsPreviewImage = false
     private var lastEndpoint: NWEndpoint?
     private var lastDisplayHost: String?
     private var reconnectTask: Task<Void, Never>?
@@ -331,8 +338,10 @@ final class CameraConnectionService: ObservableObject {
         galleryDirectories = []
         selectedGalleryDirectoryID = nil
         thumbnailCache = [:]
+        previewImageCache = [:]
         objectImageCache = [:]
         durationCache = [:]
+        supportsPreviewImage = false
         state = .disconnected
 
         if clearRememberedDevice {
@@ -462,6 +471,7 @@ final class CameraConnectionService: ObservableObject {
         selectedGalleryDirectoryID = id
         galleryItems = []
         thumbnailCache = [:]
+        previewImageCache = [:]
         objectImageCache = [:]
         durationCache = [:]
         await loadGalleryMedia(forDirectoryID: id, clearCaches: true)
@@ -481,6 +491,7 @@ final class CameraConnectionService: ObservableObject {
 
         if clearCaches {
             thumbnailCache = [:]
+            previewImageCache = [:]
             objectImageCache = [:]
             durationCache = [:]
         }
@@ -551,8 +562,50 @@ final class CameraConnectionService: ObservableObject {
         }
     }
 
-    /// Loads and caches the original image for full-screen preview.
-    /// Videos intentionally use their thumbnail in the gallery preview.
+    /// Loads the fastest usable full-screen image. Nikon preview is attempted only when
+    /// the connected camera advertises OperationCode 0x9200; invalid preview data falls
+    /// back to the complete object read.
+    func galleryPreviewImage(for handle: UInt32) async -> GalleryImageLoadResult? {
+        if supportsPreviewImage {
+            if let cached = previewImageCache[handle], let image = UIImage(data: cached) {
+                return .preview(image)
+            }
+
+            guard case .connected = state, let commandConnection else { return nil }
+            let filename = galleryItems.first(where: { $0.handle == handle })?.filename
+            do {
+                let response = try await operation(
+                    .getPreviewImage,
+                    parameters: [],
+                    dataPhase: .receive,
+                    on: commandConnection,
+                    logStyle: .silent
+                )
+                if response.code == PTPResponseCode.ok.rawValue,
+                   let data = response.data,
+                   !data.isEmpty,
+                   let image = UIImage(data: data)
+                {
+                    previewImageCache[handle] = data
+                    appendLog("[图库] 高清预览成功 \(galleryItemLabel(handle: handle, filename: filename)) bytes=\(data.count)")
+                    return .preview(image)
+                }
+                appendLog(
+                    "[图库] 高清预览无效，回落原图 \(galleryItemLabel(handle: handle, filename: filename)) " +
+                        "code=0x\(String(format: "%04X", response.code)) bytes=\(response.data?.count ?? 0)"
+                )
+            } catch {
+                appendLog(
+                    "[图库] 高清预览失败，回落原图 \(galleryItemLabel(handle: handle, filename: filename)) " +
+                        "error=\(error.localizedDescription)"
+                )
+            }
+        }
+
+        return await objectImage(for: handle).map(GalleryImageLoadResult.original)
+    }
+
+    /// Loads and caches the original image with standard PTP partial-object reads.
     func objectImage(for handle: UInt32) async -> UIImage? {
         if let cached = objectImageCache[handle], let image = UIImage(data: cached) {
             return image
@@ -561,29 +614,48 @@ final class CameraConnectionService: ObservableObject {
 
         let filename = galleryItems.first(where: { $0.handle == handle })?.filename
         do {
-            let response = try await operation(
-                .getObject,
-                parameters: [handle],
-                dataPhase: .receive,
-                on: commandConnection,
-                logStyle: .silent
-            )
-            guard response.code == PTPResponseCode.ok.rawValue,
-                  let data = response.data,
-                  !data.isEmpty,
-                  let image = UIImage(data: data)
-            else {
-                appendLog(
-                    "[图库] 原图失败 \(galleryItemLabel(handle: handle, filename: filename)) " +
-                        "code=0x\(String(format: "%04X", response.code)) bytes=\(response.data?.count ?? 0)"
-                )
+            let data = try await fetchPartialObject(handle: handle, on: commandConnection)
+            guard !data.isEmpty, let image = UIImage(data: data) else {
+                appendLog("[图库] 分块原图无效 \(galleryItemLabel(handle: handle, filename: filename)) bytes=\(data.count)")
                 return nil
             }
             objectImageCache[handle] = data
             return image
         } catch {
-            appendLog("[图库] 原图异常 \(galleryItemLabel(handle: handle, filename: filename)) error=\(error.localizedDescription)")
+            appendLog("[图库] 分块原图异常 \(galleryItemLabel(handle: handle, filename: filename)) error=\(error.localizedDescription)")
             return nil
+        }
+    }
+
+    private func fetchPartialObject(handle: UInt32, on connection: NWConnection) async throws -> Data {
+        let chunkSize: UInt32 = 4 * 1024 * 1024
+        var offset: UInt32 = 0
+        var collected = Data()
+
+        while true {
+            let response = try await operation(
+                .getPartialObject,
+                parameters: [handle, offset, chunkSize],
+                dataPhase: .receive,
+                on: connection,
+                logStyle: .silent
+            )
+            guard response.code == PTPResponseCode.ok.rawValue,
+                  let data = response.data,
+                  !data.isEmpty
+            else {
+                throw CameraConnectionError.ptpResponse(response.code)
+            }
+
+            collected.append(data)
+            let returnedBytes = response.parameters.first.map(Int.init) ?? data.count
+            if returnedBytes < Int(chunkSize) || data.count < Int(chunkSize) {
+                return collected
+            }
+            guard offset <= UInt32.max - UInt32(data.count) else {
+                throw CameraConnectionError.malformedPacket
+            }
+            offset += UInt32(data.count)
         }
     }
 
@@ -682,6 +754,9 @@ final class CameraConnectionService: ObservableObject {
                 }
                 let responseCode = packet.payload.uint16(at: 0)
                 let responseTransactionID = packet.payload.uint32(at: 2)
+                let responseParameters = stride(from: 6, through: packet.payload.count - 4, by: 4).map {
+                    packet.payload.uint32(at: $0)
+                }
                 guard responseTransactionID == currentTransactionID else {
                     appendLog("[command] 事务号不匹配 expected=\(currentTransactionID) actual=\(responseTransactionID)")
                     throw CameraConnectionError.transactionMismatch
@@ -697,7 +772,11 @@ final class CameraConnectionService: ObservableObject {
                             "transaction=\(responseTransactionID) dataBytes=\(receivedData.count)"
                     )
                 }
-                return PTPResponse(code: responseCode, data: dataPhase == .receive ? receivedData : nil)
+                return PTPResponse(
+                    code: responseCode,
+                    data: dataPhase == .receive ? receivedData : nil,
+                    parameters: responseParameters
+                )
             default:
                 if logStyle != .silent {
                     appendLog("[command] 忽略未预期包 type=\(packet.typeName)")
@@ -1690,8 +1769,12 @@ final class CameraConnectionService: ObservableObject {
         let functionalMode = data.uint16(at: offset)
         appendLog("DeviceInfo FunctionalMode=0x\(String(format: "%04X", functionalMode)) offset=\(offset)")
         offset += 2
-        offset = try skipUInt16Array(in: data, at: offset)
-        appendLog("DeviceInfo Operations offset=\(offset)")
+        let operationList = try readUInt16Array(in: data, at: offset)
+        supportsPreviewImage = operationList.values.contains(PTPOperationCode.getPreviewImage.rawValue)
+        appendLog(
+            "DeviceInfo Operations count=\(operationList.values.count) previewImage=\(supportsPreviewImage) offset=\(operationList.nextOffset)"
+        )
+        offset = operationList.nextOffset
         offset = try skipUInt16Array(in: data, at: offset)
         appendLog("DeviceInfo Events offset=\(offset)")
         offset = try skipUInt16Array(in: data, at: offset)
@@ -1725,7 +1808,7 @@ final class CameraConnectionService: ObservableObject {
         return trimmed
     }
 
-    private func skipUInt16Array(in data: Data, at offset: Int) throws -> Int {
+    private func readUInt16Array(in data: Data, at offset: Int) throws -> (values: [UInt16], nextOffset: Int) {
         guard data.count >= offset + 4 else {
             throw CameraConnectionError.malformedPacket
         }
@@ -1734,7 +1817,16 @@ final class CameraConnectionService: ObservableObject {
         guard nextOffset <= data.count else {
             throw CameraConnectionError.malformedPacket
         }
-        return nextOffset
+        var values: [UInt16] = []
+        values.reserveCapacity(count)
+        for index in 0..<count {
+            values.append(data.uint16(at: offset + 4 + index * 2))
+        }
+        return (values, nextOffset)
+    }
+
+    private func skipUInt16Array(in data: Data, at offset: Int) throws -> Int {
+        try readUInt16Array(in: data, at: offset).nextOffset
     }
 
     private func skipPTPString(in data: Data, at offset: Int) throws -> Int {
@@ -1789,6 +1881,13 @@ private enum OperationLogStyle {
 private struct PTPResponse {
     let code: UInt16
     let data: Data?
+    let parameters: [UInt32]
+
+    init(code: UInt16, data: Data?, parameters: [UInt32] = []) {
+        self.code = code
+        self.data = data
+        self.parameters = parameters
+    }
 }
 
 private struct PTPIPPacket {
@@ -1839,6 +1938,8 @@ private enum PTPOperationCode: UInt16 {
     case getObjectInfo = 0x1008
     case getObject = 0x1009
     case getThumb = 0x100a
+    case getPartialObject = 0x101b
+    case getPreviewImage = 0x9200
     case getDevicePropValue = 0x1015
     case getObjectPropValue = 0x9803
 
@@ -1853,6 +1954,8 @@ private enum PTPOperationCode: UInt16 {
         case .getObjectInfo: return "GetObjectInfo"
         case .getObject: return "GetObject"
         case .getThumb: return "GetThumb"
+        case .getPartialObject: return "GetPartialObject"
+        case .getPreviewImage: return "GetPreviewImg"
         case .getDevicePropValue: return "GetDevicePropValue"
         case .getObjectPropValue: return "GetObjectPropValue"
         }
