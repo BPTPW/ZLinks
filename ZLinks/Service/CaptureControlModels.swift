@@ -8,7 +8,7 @@ import Foundation
 enum CaptureParameter: UInt16, CaseIterable, Hashable, Identifiable, Sendable {
     case whiteBalance = 0x5005
     case aperture = 0x5007
-    case focusMode = 0x500A
+    case focusMode = 0xD061
     case meteringMode = 0x500B
     case shutterSpeed = 0x500D
     case exposureMode = 0x500E
@@ -52,10 +52,14 @@ enum CaptureParameter: UInt16, CaseIterable, Hashable, Identifiable, Sendable {
         }
     }
 
-    /// Nikon Z bodies expose the same shutter value through 0xD100 when
-    /// the standard 0x500D property cannot be written.
-    var nikonFallbackCode: UInt16? {
-        self == .shutterSpeed ? 0xD100 : nil
+    /// Alternate property used when the preferred code is not writable.
+    /// Nikon Z live-view focus uses 0xD061, while older bodies use 0x500A.
+    var fallbackPropertyCode: UInt16? {
+        switch self {
+        case .shutterSpeed: return 0xD100
+        case .focusMode: return 0x500A
+        default: return nil
+        }
     }
 
     func standardData(for value: UInt64) -> Data {
@@ -67,18 +71,26 @@ enum CaptureParameter: UInt16, CaseIterable, Hashable, Identifiable, Sendable {
             let seconds = Self.shutterSeconds(fromPacked: value)
             let scaled = UInt32(max(1, min(Double(UInt32.max), (seconds * 10_000).rounded())))
             return captureUInt32Data(scaled)
+        case .focusMode:
+            return captureUInt8Data(UInt8(clamping: value))
         case .iso:
             return captureUInt16Data(UInt16(clamping: value))
         case .exposureCompensation:
             return captureUInt16Data(UInt16(truncatingIfNeeded: value))
-        case .whiteBalance, .aperture, .focusMode, .meteringMode, .exposureMode:
+        case .whiteBalance, .aperture, .meteringMode, .exposureMode:
             return captureUInt16Data(UInt16(clamping: value))
         }
     }
 
     func fallbackData(for value: UInt64) -> Data? {
-        guard self == .shutterSpeed else { return nil }
-        return captureUInt32Data(UInt32(truncatingIfNeeded: value))
+        switch self {
+        case .shutterSpeed:
+            return captureUInt32Data(UInt32(truncatingIfNeeded: value))
+        case .focusMode:
+            return captureUInt16Data(Self.legacyFocusModeValue(for: value))
+        default:
+            return nil
+        }
     }
 
     func normalizeStandardRead(_ value: UInt64) -> UInt64 {
@@ -97,7 +109,34 @@ enum CaptureParameter: UInt16, CaseIterable, Hashable, Identifiable, Sendable {
     }
 
     func normalizeFallbackRead(_ value: UInt64) -> UInt64 {
-        self == .shutterSpeed ? value : normalizeStandardRead(value)
+        switch self {
+        case .shutterSpeed:
+            return value
+        case .focusMode:
+            return Self.liveViewFocusModeValue(fromLegacy: value)
+        default:
+            return normalizeStandardRead(value)
+        }
+    }
+
+    private static func legacyFocusModeValue(for liveViewValue: UInt64) -> UInt16 {
+        switch liveViewValue {
+        case 0: return 0x8010 // AF-S
+        case 1: return 0x8011 // AF-C
+        case 2: return 0x8013 // AF-F
+        case 4: return 0x0001 // MF
+        default: return UInt16(clamping: liveViewValue)
+        }
+    }
+
+    private static func liveViewFocusModeValue(fromLegacy value: UInt64) -> UInt64 {
+        switch value & 0xFFFF {
+        case 0x8010: return 0
+        case 0x8011: return 1
+        case 0x8013: return 2
+        case 0x0001: return 4
+        default: return value
+        }
     }
 
     private static func shutterSeconds(fromPacked value: UInt64) -> Double {
@@ -213,11 +252,9 @@ enum CaptureOptionCatalog {
     ]
 
     private static let focusModeOptions: [CaptureOption] = [
-        CaptureOption(rawValue: 0x8012, title: "AF-A"),
-        CaptureOption(rawValue: 0x8010, title: "AF-S"),
-        CaptureOption(rawValue: 0x8011, title: "AF-C"),
-        CaptureOption(rawValue: 0x8013, title: "AF-F"),
-        CaptureOption(rawValue: 0x0001, title: "MF")
+        CaptureOption(rawValue: 0, title: "AF-S"),
+        CaptureOption(rawValue: 1, title: "AF-C"),
+        CaptureOption(rawValue: 4, title: "MF")
     ]
 
     private static let meteringModeOptions: [CaptureOption] = [
@@ -356,6 +393,11 @@ private struct ShutterValue {
         .init(numerator: 25, denominator: 1),
         .init(numerator: 30, denominator: 1)
     ]
+}
+
+private func captureUInt8Data(_ value: UInt8) -> Data {
+    var littleEndian = value.littleEndian
+    return withUnsafeBytes(of: &littleEndian) { Data($0) }
 }
 
 private func captureUInt16Data(_ value: UInt16) -> Data {

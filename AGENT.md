@@ -262,7 +262,7 @@ Mapped camera properties:
 |---|---|---|
 | `0x5007` | FNumber | UInt16, value / 100 |
 | `0x5005` | WhiteBalance | UInt16; Nikon: Auto `0x0002`, Daylight `0x0004`, Fluorescent `0x0005`, Tungsten `0x0006`, Flash `0x0007`, Cloudy `0x8010`, Shade `0x8011` |
-| `0x500A` | FocusMode | UInt16; Nikon Z: AF-S `0x8010`, AF-C `0x8011`, AF-A `0x8012`, AF-F `0x8013`, MF `0x0001` |
+| `0xD061` | LiveViewAFFocus / StillFocusMode | UInt8; Nikon Z5 real-time view: AF-S `0`, AF-C `1`, MF `4`. Standard `0x500A` is read-only on Z5 and is used only as a fallback for older bodies. |
 | `0x500B` | ExposureMeteringMode | UInt16: Average `0x0001`, CenterWeighted `0x0002`, MultiSpot/Matrix `0x0003`, CenterSpot `0x0004` |
 | `0x500D` | ExposureTime | UInt32; standard Nikon scalar value / 10000 = seconds. Nikon `0xD100` fallback uses packed `(numerator << 16) | denominator` |
 | `0x500E` | ExposureProgramMode | UInt16: M `0x0001`, P `0x0002`, A `0x0003`, S `0x0004`, Nikon Auto `0x8010` |

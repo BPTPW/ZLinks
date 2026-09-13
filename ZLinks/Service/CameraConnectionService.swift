@@ -978,12 +978,13 @@ final class CameraConnectionService: ObservableObject {
 
             var usedFallback = false
             if response.code != PTPResponseCode.ok.rawValue,
-               let fallbackCode = parameter.nikonFallbackCode,
+               let fallbackCode = parameter.fallbackPropertyCode,
                let fallbackData = parameter.fallbackData(for: rawValue) {
                 appendLog(
-                    "[capture] \(parameter.title) 标准属性失败 code=0x" +
-                        String(format: "%04X", response.code) +
-                        "，尝试 Nikon 0x\(String(format: "%04X", fallbackCode))"
+                    "[capture] \(parameter.title) 属性 0x" +
+                        String(format: "%04X", parameter.rawValue) +
+                        " 失败 code=0x" + String(format: "%04X", response.code) +
+                        "，尝试备用属性 0x\(String(format: "%04X", fallbackCode))"
                 )
                 response = try await operation(
                     .setDevicePropValue,
@@ -1032,7 +1033,7 @@ final class CameraConnectionService: ObservableObject {
         if let value = await readDeviceProperty(parameter.rawValue, on: connection) {
             return parameter.normalizeStandardRead(value)
         }
-        if let fallbackCode = parameter.nikonFallbackCode,
+        if let fallbackCode = parameter.fallbackPropertyCode,
            let value = await readDeviceProperty(fallbackCode, on: connection) {
             return parameter.normalizeFallbackRead(value)
         }
