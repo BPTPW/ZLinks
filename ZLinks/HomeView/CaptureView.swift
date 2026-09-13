@@ -24,8 +24,7 @@ struct CaptureView: View {
 
     private let rightRailParameters: [CaptureParameter] = [
         .focusMode,
-        .meteringMode,
-        .exposureMode
+        .meteringMode
     ]
 
     var body: some View {
@@ -308,6 +307,7 @@ struct CaptureView: View {
     }
 
     private func editorOptions(for parameter: CaptureParameter) -> [CaptureOption]? {
+        guard parameter != .exposureMode else { return nil }
         let options = CaptureOptionCatalog.options(for: parameter)
         return options.isEmpty ? nil : options
     }
@@ -332,8 +332,7 @@ private struct CaptureFullscreenMonitor: View {
 
     private let rightRailParameters: [CaptureParameter] = [
         .focusMode,
-        .meteringMode,
-        .exposureMode
+        .meteringMode
     ]
 
     var body: some View {
@@ -360,24 +359,31 @@ private struct CaptureFullscreenMonitor: View {
             0,
             canvasSize.width - (sideColumnMinWidth * 2)
         )
-        let availablePreviewHeight = max(0, canvasSize.height)
+        let statusBarReservedHeight: CGFloat = 52
+        let availablePreviewHeight = max(0, canvasSize.height - statusBarReservedHeight)
         let previewWidth = min(availablePreviewWidth, availablePreviewHeight * 4 / 3)
         let sideColumnWidth = max(sideColumnMinWidth, (canvasSize.width - availablePreviewWidth)/2)
 
         ZStack {
-            HStack(alignment: .center) {
-                CaptureFullscreenReadouts(
-                    parameters: leftRailParameters,
-                    onSelect: openEditor
-                )
-                .frame(width: sideColumnWidth - 30, alignment: .leading)
+            VStack(spacing: 8) {
+                CaptureLiveViewStatusBar()
+                    .environment(\.colorScheme, .dark)
 
-                fullscreenVideoSurface
-                    .frame(width: previewWidth, height: previewWidth * 3 / 4)
+                HStack(alignment: .center) {
+                    CaptureFullscreenReadouts(
+                        parameters: leftRailParameters,
+                        onSelect: openEditor
+                    )
+                    .frame(width: sideColumnWidth - 30, alignment: .leading)
 
-                fullscreenRightControls
-                    .frame(width: sideColumnWidth + 30)
-                    .frame(maxHeight: .infinity)
+                    fullscreenVideoSurface
+                        .frame(width: previewWidth, height: previewWidth * 3 / 4)
+
+                    fullscreenRightControls
+                        .frame(width: sideColumnWidth + 30)
+                        .frame(maxHeight: .infinity)
+                }
+                .frame(maxHeight: .infinity)
             }
             .allowsHitTesting(editingParameter == nil)
 
@@ -524,6 +530,7 @@ private struct CaptureFullscreenMonitor: View {
     }
 
     private func openEditor(_ parameter: CaptureParameter) {
+        guard parameter != .exposureMode else { return }
         let options = CaptureOptionCatalog.options(for: parameter)
         guard !options.isEmpty else { return }
         let current = camera.captureParameters[parameter]
@@ -778,8 +785,7 @@ private struct CapturePortraitKeyDeck: View {
         .focusMode,
         .iso,
         .whiteBalance,
-        .meteringMode,
-        .exposureMode
+        .meteringMode
     ]
 
     var body: some View {
@@ -1164,6 +1170,13 @@ private struct CaptureLiveViewStatusBar: View {
         return "\(batteryLevel)%"
     }
 
+    private var exposureModeText: String {
+        CaptureOptionCatalog.displayedValue(
+            for: .exposureMode,
+            rawValue: camera.captureParameters[.exposureMode]
+        )
+    }
+
     var body: some View {
         HStack(spacing: 18) {
             HStack(spacing: 6) {
@@ -1178,6 +1191,7 @@ private struct CaptureLiveViewStatusBar: View {
             Spacer(minLength: 12)
 
             HStack(spacing: 16) {
+                CaptureLiveViewMetric(title: "模式", value: exposureModeText)
                 CaptureLiveViewMetric(title: "帧率", value: frameRateText)
                 CaptureLiveViewMetric(title: "电量", value: batteryText)
             }
