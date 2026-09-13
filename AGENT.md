@@ -250,6 +250,26 @@ Pipeline:
 6. On stop: cancel the pull loop and send `EndLiveView` (`0x9202`).
 
 All live-view transactions share the same serial operation gate as gallery thumbnails.
+## Capture Physical Keys
+
+The Capture tab renders a physical-key-style control deck while live view is active. Each camera key reads its current value after live view starts, cycles through supported values on tap, writes through `SetDevicePropValue` (`0x1016`), and reads the value back so clamped values are reflected in the UI.
+
+PTP/IP data-out transactions use `DataPhaseInfo=2`: send `StartData` with transaction ID, total byte count and a zero reserved field, then one `Data`/`EndData` packet with transaction ID plus payload, then receive `OperationResponse`.
+
+Mapped camera properties:
+
+| Code | Value | Encoding / important values |
+|---|---|---|
+| `0x5007` | FNumber | UInt16, value / 100 |
+| `0x5005` | WhiteBalance | UInt16; Nikon: Auto `0x0002`, Daylight `0x0004`, Fluorescent `0x0005`, Tungsten `0x0006`, Flash `0x0007`, Cloudy `0x8010`, Shade `0x8011` |
+| `0x500A` | FocusMode | UInt16; Nikon Z: AF-S `0x8010`, AF-C `0x8011`, AF-A `0x8012`, AF-F `0x8013`, MF `0x0001` |
+| `0x500B` | ExposureMeteringMode | UInt16: Average `0x0001`, CenterWeighted `0x0002`, MultiSpot/Matrix `0x0003`, CenterSpot `0x0004` |
+| `0x500D` | ExposureTime | UInt32; standard Nikon scalar value / 10000 = seconds. Nikon `0xD100` fallback uses packed `(numerator << 16) | denominator` |
+| `0x500E` | ExposureProgramMode | UInt16: M `0x0001`, P `0x0002`, A `0x0003`, S `0x0004`, Nikon Auto `0x8010` |
+| `0x500F` | ExposureIndex / ISO | UInt16 integer |
+| `0x5010` | ExposureBiasCompensation | Int16, value / 1000 EV |
+
+If standard `0x500D` rejects a Nikon shutter write, retry via Nikon vendor `0xD100`. Grid and horizontal preview mirror are local real-time overlays and do not modify the camera.
 
 Useful log markers:
 

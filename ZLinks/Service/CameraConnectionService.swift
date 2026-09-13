@@ -174,6 +174,10 @@ final class CameraConnectionService: ObservableObject {
     @Published private(set) var liveViewImage: UIImage?
     @Published private(set) var isLiveViewActive = false
     @Published private(set) var liveViewError: String?
+    @Published private(set) var captureParameters: [CaptureParameter: UInt64] = [:]
+    @Published private(set) var isRefreshingCaptureParameters = false
+    @Published private(set) var activeCaptureWrite: CaptureParameter?
+    @Published private(set) var captureControlError: String?
 
     private var commandConnection: NWConnection?
     private var eventConnection: NWConnection?
@@ -355,6 +359,10 @@ final class CameraConnectionService: ObservableObject {
         objectImageCache = [:]
         supportsPreviewImage = false
         supportedOperations = []
+        captureParameters = [:]
+        activeCaptureWrite = nil
+        isRefreshingCaptureParameters = false
+        captureControlError = nil
         stopLiveViewInternal(sendEndCommand: false)
         state = .disconnected
 
@@ -773,6 +781,133 @@ final class CameraConnectionService: ObservableObject {
         debugLog = ""
     }
 
+    func clearCaptureControlError() {
+        captureControlError = nil
+    }
+
+    /// Read the exposure-related PTP properties shown in the Capture tab.
+    func refreshCaptureParameters() async {
+        guard case .connected = state, let commandConnection else {
+            captureParameters = [:]
+            return
+        }
+        guard activeCaptureWrite == nil, !isRefreshingCaptureParameters else { return }
+
+        isRefreshingCaptureParameters = true
+        captureControlError = nil
+        defer { isRefreshingCaptureParameters = false }
+
+        var values: [CaptureParameter: UInt64] = [:]
+        for parameter in CaptureParameter.allCases {
+            if Task.isCancelled { break }
+            if let value = await readCaptureParameter(parameter, on: commandConnection) {
+                values[parameter] = value
+            }
+        }
+
+        if values.isEmpty {
+            captureControlError = "相机未返回可控制的曝光参数。"
+            appendLog("[capture] 参数读取失败：没有可用的曝光属性")
+            return
+        }
+
+        captureParameters = values
+        appendLog(
+            "[capture] 参数读取完成 names=" +
+                values.keys.map(\.title).sorted().joined(separator: ",")
+        )
+    }
+
+    /// Write one camera parameter and immediately read it back to show the value
+    /// the body actually accepted. Standard PTP is preferred; Nikon shutter
+    /// falls back to 0xD100 for bodies that do not allow 0x500D writes.
+    @discardableResult
+    func setCaptureParameter(_ parameter: CaptureParameter, rawValue: UInt64) async -> Bool {
+        guard case .connected = state, let commandConnection else {
+            captureControlError = "相机未连接。"
+            return false
+        }
+        guard activeCaptureWrite == nil else { return false }
+
+        let previousValue = captureParameters[parameter]
+        activeCaptureWrite = parameter
+        captureParameters[parameter] = rawValue
+        captureControlError = nil
+        defer { activeCaptureWrite = nil }
+
+        do {
+            var response = try await operation(
+                .setDevicePropValue,
+                parameters: [UInt32(parameter.rawValue)],
+                dataPhase: .send(parameter.standardData(for: rawValue)),
+                on: commandConnection,
+                logStyle: .compact,
+                timeout: .seconds(5)
+            )
+
+            var usedFallback = false
+            if response.code != PTPResponseCode.ok.rawValue,
+               let fallbackCode = parameter.nikonFallbackCode,
+               let fallbackData = parameter.fallbackData(for: rawValue) {
+                appendLog(
+                    "[capture] \(parameter.title) 标准属性失败 code=0x" +
+                        String(format: "%04X", response.code) +
+                        "，尝试 Nikon 0x\(String(format: "%04X", fallbackCode))"
+                )
+                response = try await operation(
+                    .setDevicePropValue,
+                    parameters: [UInt32(fallbackCode)],
+                    dataPhase: .send(fallbackData),
+                    on: commandConnection,
+                    logStyle: .compact,
+                    timeout: .seconds(5)
+                )
+                usedFallback = true
+            }
+
+            guard response.code == PTPResponseCode.ok.rawValue else {
+                throw CameraConnectionError.ptpResponse(response.code)
+            }
+
+            appendLog(
+                "[capture] 参数写入成功 name=\(parameter.title) raw=\(rawValue) " +
+                    "fallback=\(usedFallback)"
+            )
+
+            // Let the body settle before refreshing the real value. This keeps
+            // the UI truthful when the camera clamps a value to its own steps.
+            try? await Task.sleep(for: .milliseconds(180))
+            if let actualValue = await readCaptureParameter(parameter, on: commandConnection) {
+                captureParameters[parameter] = actualValue
+                appendLog("[capture] 参数回读 name=\(parameter.title) raw=\(actualValue)")
+            }
+            return true
+        } catch {
+            if let previousValue {
+                captureParameters[parameter] = previousValue
+            } else {
+                captureParameters.removeValue(forKey: parameter)
+            }
+            captureControlError = "\(parameter.title)修改失败：\(error.localizedDescription)"
+            appendLog("[capture] 参数写入失败 name=\(parameter.title) error=\(error.localizedDescription)")
+            return false
+        }
+    }
+
+    private func readCaptureParameter(
+        _ parameter: CaptureParameter,
+        on connection: NWConnection
+    ) async -> UInt64? {
+        if let value = await readDeviceProperty(parameter.rawValue, on: connection) {
+            return parameter.normalizeStandardRead(value)
+        }
+        if let fallbackCode = parameter.nikonFallbackCode,
+           let value = await readDeviceProperty(fallbackCode, on: connection) {
+            return parameter.normalizeFallbackRead(value)
+        }
+        return nil
+    }
+
     /// Begin requesting Nikon live-view frames for the Capture tab.
     /// Safe to call repeatedly; consumers are reference-counted.
     func startLiveView() async {
@@ -1092,6 +1227,8 @@ final class CameraConnectionService: ObservableObject {
             dataPhaseValue = 0x00000001
         case .receive:
             dataPhaseValue = 0x00000001
+        case .send:
+            dataPhaseValue = 0x00000002
         }
         operationPayload.append(uint32Data(dataPhaseValue))
         operationPayload.append(uint16Data(code.rawValue))
@@ -1112,6 +1249,32 @@ final class CameraConnectionService: ObservableObject {
             on: connection,
             logStyle: logStyle
         )
+
+        if let dataPhase, case .send(let outgoingData) = dataPhase {
+            let startDataPayload =
+                uint32Data(currentTransactionID) +
+                uint32Data(UInt32(outgoingData.count)) +
+                uint32Data(0)
+            try await send(
+                ptpIPPacket(type: .startData, payload: startDataPayload),
+                on: connection,
+                logStyle: logStyle
+            )
+
+            let bytes = Array(outgoingData)
+            var offset = 0
+            while offset < bytes.count {
+                let end = min(offset + 65_536, bytes.count)
+                let packetType: PTPIPPacketType = end == bytes.count ? .endData : .data
+                let payload = uint32Data(currentTransactionID) + Data(bytes[offset..<end])
+                try await send(
+                    ptpIPPacket(type: packetType, payload: payload),
+                    on: connection,
+                    logStyle: logStyle
+                )
+                offset = end
+            }
+        }
 
         var receivedData = Data()
         while true {
@@ -1173,9 +1336,15 @@ final class CameraConnectionService: ObservableObject {
                             "transaction=\(responseTransactionID) dataBytes=\(receivedData.count)"
                     )
                 }
+                let responseData: Data?
+                if let dataPhase, case .receive = dataPhase {
+                    responseData = receivedData
+                } else {
+                    responseData = nil
+                }
                 return PTPResponse(
                     code: responseCode,
-                    data: dataPhase == .receive ? receivedData : nil,
+                    data: responseData,
                     parameters: responseParameters
                 )
             default:
@@ -2313,6 +2482,24 @@ final class CameraConnectionService: ObservableObject {
         return info
     }
 
+    private func readDeviceProperty(
+        _ propertyCode: UInt16,
+        on connection: NWConnection
+    ) async -> UInt64? {
+        guard let response = try? await operation(
+            .getDevicePropValue,
+            parameters: [UInt32(propertyCode)],
+            dataPhase: .receive,
+            on: connection,
+            logStyle: .silent,
+            timeout: .seconds(4)
+        ),
+        response.code == PTPResponseCode.ok.rawValue,
+        let data = response.data else {
+            return nil
+        }
+        return readIntegerValue(from: data)
+    }
     private func readIntegerValue(from data: Data) -> UInt64? {
         switch data.count {
         case 0:
@@ -2537,6 +2724,7 @@ final class CameraConnectionService: ObservableObject {
 
 private enum DataPhase {
     case receive
+    case send(Data)
 }
 
 private enum OperationLogStyle {
@@ -2617,6 +2805,7 @@ private enum PTPOperationCode: UInt16 {
     case getThumb = 0x100a
     case getPartialObject = 0x101b
     case getDevicePropValue = 0x1015
+    case setDevicePropValue = 0x1016
     case getObjectPropValue = 0x9803
     case deviceReady = 0x90c8
     case getPreviewImage = 0x9200
@@ -2640,6 +2829,7 @@ private enum PTPOperationCode: UInt16 {
         case .getThumb: return "GetThumb"
         case .getPartialObject: return "GetPartialObject"
         case .getDevicePropValue: return "GetDevicePropValue"
+        case .setDevicePropValue: return "SetDevicePropValue"
         case .getObjectPropValue: return "GetObjectPropValue"
         case .deviceReady: return "DeviceReady"
         case .getPreviewImage: return "GetPreviewImg"
@@ -2681,7 +2871,16 @@ private enum CameraConnectionError: LocalizedError {
         case .transactionMismatch:
             return "相机响应与当前请求不匹配。"
         case .ptpResponse(let code):
-            return String(format: "相机拒绝了请求（0x%04X）。", code)
+            switch code {
+            case 0x200A:
+                return "当前相机或拍摄模式不支持该参数。"
+            case 0x2019:
+                return "相机正忙，请稍后重试。"
+            case 0x201A:
+                return "相机拒绝修改该参数。"
+            default:
+                return String(format: "相机拒绝了请求（0x%04X）。", code)
+            }
         case .initFailed(let code):
             return String(format: "相机拒绝了 PTP/IP 初始化（失败码 0x%08X）。", code)
         }
