@@ -300,7 +300,7 @@ These opcodes are commonly useful for later capture-tab features. Support still 
 | `0x9204` | `MfDrive` | Manual focus drive |
 | `0x9205` | `ChangeAfArea` | Move AF area (`X`, `Y`) |
 | `0x9206` | `AfDriveCancel` | Cancel AF drive |
-| `0x9207` | `InitiateCaptureRecInMedia` | Capture to card while remote-controlled |
+| `0x9207` | `InitiateCaptureRecInMedia` | Capture to card while remote-controlled. Requires operation parameters: send `[0xFFFFFFFF, 0]` (no AF, card target); retry with `[0xFFFFFFFF]` only when the body returns `0x2006` or `0x201D`. Wait for `DeviceReady` after success. |
 | `0x920A` | `StartMovieRecInCard` | Start movie recording to card |
 | `0x920B` | `EndMovieRec` | Stop movie recording |
 | `0x9428` | `GetLiveViewImageEx` | Z-series extended live-view object |
