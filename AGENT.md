@@ -252,7 +252,7 @@ Pipeline:
 All live-view transactions share the same serial operation gate as gallery thumbnails.
 ## Capture Physical Keys
 
-The Capture tab renders a landscape-oriented live-view monitor with liquid-glass key rails on both sides in landscape, and a glass key grid in portrait. Tapping a camera key opens a slider editor instead of cycling immediately. Dragging the slider sends the latest value through a coalescing write queue, writes via `SetDevicePropValue` (`0x1016`), and reads the value back so clamped values are reflected in the UI.
+The Capture tab renders a landscape-oriented live-view monitor with liquid-glass key rails on both sides in landscape, and a glass key grid in portrait. A full-screen button on the monitor opens a tab-bar-free monitoring surface with the same camera controls distributed across the left and right glass rails. Tapping a camera key opens a slider editor instead of cycling immediately. Dragging the slider sends the latest value through a coalescing write queue, writes via `SetDevicePropValue` (`0x1016`), and reads the value back so clamped values are reflected in the UI.
 
 PTP/IP data-out transactions use `DataPhaseInfo=2`: send `StartData` with transaction ID, total byte count and a zero reserved field, then one `Data`/`EndData` packet with transaction ID plus payload, then receive `OperationResponse`.
 
