@@ -4,6 +4,7 @@
 //
 
 import Photos
+import Combine
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
@@ -13,6 +14,7 @@ import CoreLocation
 
 struct GalleryView: View {
     @EnvironmentObject private var camera: CameraConnectionService
+    @StateObject private var downloadStore = GalleryDownloadStore()
 
     @State private var isRefreshing = false
     @State private var loadError: String?
@@ -24,9 +26,9 @@ struct GalleryView: View {
     @State private var isDirectorySwitching = false
     @State private var isSelectionMode = false
     @State private var selectedHandles: Set<UInt32> = []
-    @State private var isTransferPresented = false
-    @State private var transferItems: [GalleryDownload] = []
-    @State private var transferRequiresConfirmation = false
+    @State private var isDownloadDrawerPresented = false
+    @State private var pendingMultiDownloads: [GalleryDownload] = []
+    @State private var isMultiDownloadConfirmationPresented = false
     @State private var selectedItem: CameraConnectionService.GalleryItem?
     @State private var timeGrouping: GalleryTimeGrouping = .all
     @Namespace private var galleryTransition
@@ -90,6 +92,22 @@ struct GalleryView: View {
                         .padding(.horizontal, 5)
                     }
                 }
+                ToolbarItem(placement: .topBarLeading) {
+                    Button { isDownloadDrawerPresented = true } label: {
+                        Image(systemName: "arrow.down.circle.dotted")
+                            .overlay(alignment: .topTrailing) {
+                                if downloadStore.activeCount > 0 {
+                                    Text("\(downloadStore.activeCount)")
+                                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                                        .foregroundStyle(.white)
+                                        .frame(minWidth: 17, minHeight: 17)
+                                        .background(.blue, in: Capsule())
+                                        .offset(x: 10, y: -9)
+                                }
+                            }
+                    }
+                    .accessibilityLabel("下载任务列表")
+                }
             }
             .task(id: connectionTaskID) {
                 await reloadGallery(force: false)
@@ -98,6 +116,9 @@ struct GalleryView: View {
                 if selectedDirectoryID != newValue {
                     selectedDirectoryID = newValue
                 }
+            }
+            .onChange(of: camera.state) { _, _ in
+                downloadStore.cameraStateChanged(camera)
             }
             .toolbar(isSelectionMode ? .hidden : .automatic, for: .tabBar)
             .safeAreaInset(edge: .bottom) {
@@ -109,13 +130,27 @@ struct GalleryView: View {
                         .padding(.vertical, 12)
                 }
             }
-            .sheet(isPresented: $isTransferPresented) {
-                TransferSheet(
-                    items: transferItems,
-                    camera: camera,
-                    requiresConfirmation: transferRequiresConfirmation
+            .sheet(isPresented: $isDownloadDrawerPresented) {
+                DownloadTaskDrawer(store: downloadStore)
+                    .presentationDetents([.large])
+                    .presentationDragIndicator(.visible)
+            }
+            .sheet(isPresented: $isMultiDownloadConfirmationPresented) {
+                MultiDownloadConfirmationSheet(
+                    count: pendingMultiDownloads.count,
+                    onConfirm: {
+                        let downloads = pendingMultiDownloads
+                        pendingMultiDownloads = []
+                        isMultiDownloadConfirmationPresented = false
+                        Task { await downloadStore.enqueue(downloads: downloads, camera: camera) }
+                    },
+                    onCancel: {
+                        pendingMultiDownloads = []
+                        isMultiDownloadConfirmationPresented = false
+                    }
                 )
-                .id(transferItems.map { "\($0.handle)-\($0.format.rawValue)" }.joined(separator: ","))
+                .presentationDetents([.height(250)])
+                .presentationDragIndicator(.visible)
             }
             .navigationDestination(item: $selectedItem) { item in
                 GalleryPreviewView(
@@ -123,7 +158,10 @@ struct GalleryView: View {
                     thumbnail: thumbnailImages[item.handle],
                     camera: camera,
                     onDownload: { format in
-                        startTransfer(item: item, format: format)
+                        Task { await startTransfer(item: item, format: format) }
+                    },
+                    isDownloadQueued: { format in
+                        downloadStore.contains(handle: item.handle, format: format)
                     }
                 )
                 .toolbar(.hidden, for: .navigationBar)
@@ -355,14 +393,14 @@ struct GalleryView: View {
             if let format = item.photoFormat {
                 if format.supportsRAW {
                     Button {
-                        startTransfer(item: item, format: .raw)
+                        Task { await startTransfer(item: item, format: .raw) }
                     } label: {
                         Label("下载 RAW", systemImage: "r.square")
                     }
                 }
                 if format.supportsJPEG {
                     Button {
-                        startTransfer(item: item, format: .jpeg)
+                        Task { await startTransfer(item: item, format: .jpeg) }
                     } label: {
                         Label("下载 JPEG", systemImage: "j.square")
                     }
@@ -491,14 +529,16 @@ struct GalleryView: View {
         let downloads = selectedPhotoItems.compactMap {
             makeDownload(for: $0, format: option.format, fallbackToOtherFormat: option.isPreferred)
         }
-        startTransfer(downloads: downloads, requiresConfirmation: true)
+        pendingMultiDownloads = downloads
+        isMultiDownloadConfirmationPresented = true
+        exitSelectionMode()
     }
 
-    private func startTransfer(item: CameraConnectionService.GalleryItem, format: GalleryDownloadFormat) {
+    private func startTransfer(item: CameraConnectionService.GalleryItem, format: GalleryDownloadFormat) async {
         guard let download = makeDownload(for: item, format: format, fallbackToOtherFormat: false) else {
             return
         }
-        startTransfer(downloads: [download], requiresConfirmation: false)
+        await downloadStore.enqueue(downloads: [download], camera: camera)
     }
 
     private func makeDownload(
@@ -535,16 +575,15 @@ struct GalleryView: View {
             handle: handle,
             filename: filename,
             fileSize: fileSize,
-            format: requestedFormat
+            format: requestedFormat,
+            thumbnailHandle: item.thumbnailHandle
         )
     }
 
     private func startTransfer(downloads: [GalleryDownload], requiresConfirmation: Bool) {
         guard !downloads.isEmpty else { return }
-        transferItems = downloads
-        transferRequiresConfirmation = requiresConfirmation
-        isTransferPresented = false
-        DispatchQueue.main.async { isTransferPresented = true }
+        pendingMultiDownloads = downloads
+        isMultiDownloadConfirmationPresented = requiresConfirmation
         exitSelectionMode()
     }
 
@@ -707,7 +746,7 @@ private struct GalleryTimeSection: Identifiable, Equatable {
     let items: [CameraConnectionService.GalleryItem]
 }
 
-private enum GalleryDownloadFormat: String, Hashable {
+private enum GalleryDownloadFormat: String, Hashable, Codable {
     case raw
     case jpeg
 }
@@ -717,6 +756,7 @@ private struct GalleryDownload: Identifiable, Hashable {
     let filename: String
     let fileSize: UInt64
     let format: GalleryDownloadFormat
+    let thumbnailHandle: UInt32
 
     var id: String {
         "\(handle)-\(format.rawValue)"
@@ -764,6 +804,7 @@ private struct GalleryPreviewView: View {
     let thumbnail: UIImage?
     let camera: CameraConnectionService
     let onDownload: (GalleryDownloadFormat) -> Void
+    let isDownloadQueued: (GalleryDownloadFormat) -> Bool
 
     @Environment(\.dismiss) private var dismiss
     @State private var image: UIImage?
@@ -864,15 +905,18 @@ private struct GalleryPreviewView: View {
                                         Button { onDownload(.raw) } label: {
                                             Label("下载 RAW", systemImage: "r.square")
                                         }
+                                        .disabled(isDownloadQueued(.raw))
                                     }
                                     if format.supportsJPEG {
                                         Button { onDownload(.jpeg) } label: {
                                             Label("下载 JPEG", systemImage: "j.square")
                                         }
+                                        .disabled(isDownloadQueued(.jpeg))
                                     }
                                 } label: {
-                                    Image(systemName: "square.and.arrow.down")
+                                    Image(systemName: isAnyDownloadQueued ? "square.and.arrow.down.badge.clock" : "square.and.arrow.down")
                                         .foregroundStyle(.primary)
+                                        .contentTransition(.symbolEffect(.replace.magic(fallback: .downUp.byLayer), options: .nonRepeating))
                                 }
                                 .buttonStyle(.plain)
                                 .frame(width: 42, height: 42)
@@ -930,6 +974,10 @@ private struct GalleryPreviewView: View {
     }
 
     private var isImmersive: Bool { scale > 1.01 || !controlsVisible }
+    private var isAnyDownloadQueued: Bool {
+        guard let format = item.photoFormat else { return false }
+        return (format.supportsRAW && isDownloadQueued(.raw)) || (format.supportsJPEG && isDownloadQueued(.jpeg))
+    }
 
     @ViewBuilder
     private var captureTimestampView: some View {
@@ -1528,85 +1576,388 @@ private struct GalleryThumbnailCell: View {
         .environmentObject(CameraConnectionService())
 }
 
-private struct TransferSheet: View {
-    let items: [GalleryDownload]
-    let camera: CameraConnectionService
-    let requiresConfirmation: Bool
-    @Environment(\.dismiss) private var dismiss
-    @State private var phase: Phase = .confirm
-    @State private var current = 0
-    @State private var received = 0
-    @State private var failed = 0
-    @State private var cancelled = 0
-    @State private var bytesReceived: UInt64 = 0
-    @State private var totalBytes: UInt64 = 0
-    @State private var currentName = ""
-    @State private var transferTask: Task<Void, Never>?
-    @State private var showCancelConfirmation = false
-    enum Phase { case confirm, transferring, completed }
-    init(items: [GalleryDownload], camera: CameraConnectionService, requiresConfirmation: Bool) {
-        self.items = items
+@MainActor
+private final class GalleryDownloadStore: ObservableObject {
+    enum Status: String, CaseIterable, Codable {
+        case waiting, downloading, cancelled, failed, completed
+
+        var title: String {
+            switch self {
+            case .waiting: return "等待"
+            case .downloading: return "下载中"
+            case .cancelled: return "取消"
+            case .failed: return "失败"
+            case .completed: return "完成"
+            }
+        }
+    }
+
+    struct TaskItem: Identifiable {
+        let id: String
+        let handle: UInt32
+        let filename: String
+        var fileSize: UInt64
+        let format: GalleryDownloadFormat
+        let thumbnailURL: URL?
+        var status: Status
+        var receivedBytes: UInt64 = 0
+        var speed: Double = 0
+        var task: Task<Void, Never>?
+        var addedAt: Date
+    }
+
+    private struct PersistedTask: Codable {
+        let id: String
+        let handle: UInt32
+        let filename: String
+        let fileSize: UInt64
+        let format: GalleryDownloadFormat
+        let thumbnailPath: String?
+        let status: Status
+        let receivedBytes: UInt64
+        let addedAt: Date
+    }
+
+    @Published private(set) var items: [TaskItem] = []
+    private var worker: Task<Void, Never>?
+    private var camera: CameraConnectionService?
+    private var lastPersistedAt = Date.distantPast
+
+    private var persistenceURL: URL {
+        let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory.appendingPathComponent("gallery-download-tasks.json")
+    }
+
+    init() {
+        loadPersistedTasks()
+    }
+
+    var activeCount: Int {
+        items.reduce(into: 0) { count, item in
+            if item.status == .waiting || item.status == .downloading { count += 1 }
+        }
+    }
+
+    func contains(handle: UInt32, format: GalleryDownloadFormat) -> Bool {
+        items.contains { $0.handle == handle && $0.format == format && $0.status != .completed }
+    }
+
+    func enqueue(downloads: [GalleryDownload], camera: CameraConnectionService) async {
         self.camera = camera
-        self.requiresConfirmation = requiresConfirmation
-        _phase = State(initialValue: requiresConfirmation ? .confirm : .transferring)
+        for download in downloads where !contains(handle: download.handle, format: download.format) {
+            let thumbnailURL = await saveThumbnail(for: download, camera: camera)
+            items.append(TaskItem(
+                id: download.id,
+                handle: download.handle,
+                filename: download.filename,
+                fileSize: download.fileSize,
+                format: download.format,
+                thumbnailURL: thumbnailURL,
+                status: .waiting,
+                addedAt: Date()
+            ))
+        }
+        persistTasks()
+        startWorkerIfNeeded()
     }
 
-    var body: some View {
-        NavigationStack {
-            VStack(spacing: 14) {
-                if phase == .confirm { Text("保存 \(items.count) 张图片到相册").font(.headline); Spacer(); Button("确认") { begin() }.buttonStyle(.borderedProminent); Button("取消") { dismiss() } }
-                else if phase == .transferring { transferringView }
-                else {
-                    Text("成功接收\(received)个文件 失败\(failed)个\(cancelled > 0 ? " 取消传输\(cancelled)个" : "")")
-                        .multilineTextAlignment(.center); Spacer(); Button("完成") {
-                            dismiss()
-                        }
-                        .buttonStyle(.borderedProminent)
+    func cameraStateChanged(_ camera: CameraConnectionService) {
+        self.camera = camera
+        if case .connected = camera.state { startWorkerIfNeeded() }
+    }
+
+    func cancel(_ id: String) {
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        items[index].task?.cancel()
+        items[index].task = nil
+        if items[index].status == .downloading || items[index].status == .waiting {
+            items[index].status = .cancelled
+        }
+        persistTasks()
+        startWorkerIfNeeded()
+    }
+
+    func retry(_ id: String) {
+        guard let index = items.firstIndex(where: { $0.id == id }),
+              items[index].status == .cancelled || items[index].status == .failed
+        else { return }
+        items[index].status = .waiting
+        items[index].receivedBytes = 0
+        items[index].speed = 0
+        persistTasks()
+        startWorkerIfNeeded()
+    }
+
+    func delete(_ id: String) {
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        items[index].task?.cancel()
+        if let url = items[index].thumbnailURL { try? FileManager.default.removeItem(at: url) }
+        items.remove(at: index)
+        persistTasks()
+    }
+
+    private func startWorkerIfNeeded() {
+        guard worker == nil else { return }
+        worker = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                guard let camera = self.camera else { break }
+                guard case .connected = camera.state else {
+                    self.markActiveTasksWaiting()
+                    break
                 }
+                guard let index = self.nextIndex else { break }
+                await self.process(index: index, camera: camera)
             }
-            .padding(20)
-            .navigationTitle(phase == .transferring ? "传输中" : phase == .completed ? "传输完成" : "确认下载").navigationBarTitleDisplayMode(.inline)
-        }.presentationDetents([.height(250)]).interactiveDismissDisabled(phase == .transferring)
-            .onAppear { if phase == .transferring && transferTask == nil { begin() } }
-            .onDisappear { transferTask?.cancel() }
-    }
-
-    private var progress: Double { totalBytes > 0 ? min(Double(bytesReceived) / Double(totalBytes), 1) : (items.isEmpty ? 0 : Double(current) / Double(items.count)) }
-    private var transferringView: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack { Text("已接收 \(received)/\(items.count)"); Spacer(); Text("\(Int(progress * 100))%") }
-            ProgressView(value: progress)
-            HStack { Text("正在接收 \(currentName)").lineLimit(1); Spacer(); Text("处理中") }.font(.caption)
-            Spacer()
-            HStack { Spacer(); Button("取消") { showCancelConfirmation = true } }
-                .confirmationDialog("取消传输？", isPresented: $showCancelConfirmation) {
-                    Button("取消传输", role: .destructive) { transferTask?.cancel(); cancelled = max(items.count - current, 0); phase = .completed }
-                    Button("继续传输", role: .cancel) {}
-                }
+            self.worker = nil
+            self.persistTasks()
         }
     }
 
-    private func begin() {
-        phase = .transferring; current = 0; totalBytes = items.reduce(0) { $0 + $1.fileSize }
-        transferTask = Task { @MainActor in
-            let auth = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
-            guard auth == .authorized || auth == .limited else { failed = items.count; phase = .completed; return }
-            for (index, item) in items.enumerated() {
-                if Task.isCancelled { cancelled = items.count - index; break }
-                current = index; currentName = item.filename
-                guard let data = await camera.objectData(for: item.handle) else { failed += 1; continue }
-                bytesReceived += UInt64(data.count)
-                let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + "-" + item.filename)
-                do { try data.write(to: url, options: .atomic); try await save(url: url); received += 1 } catch { failed += 1 }; try? FileManager.default.removeItem(at: url)
+    private var nextIndex: Int? {
+        items.firstIndex { $0.status == .waiting || $0.status == .downloading }
+    }
+
+    private func markActiveTasksWaiting() {
+        for index in items.indices where items[index].status == .downloading {
+            items[index].status = .waiting
+            items[index].task = nil
+        }
+        persistTasks()
+    }
+
+    private func process(index: Int, camera: CameraConnectionService) async {
+        guard items.indices.contains(index) else { return }
+        items[index].status = .downloading
+        items[index].receivedBytes = 0
+        let started = Date()
+        let id = items[index].id
+        do {
+            let data = try await camera.objectData(for: items[index].handle) { [weak self] received, total in
+                guard let self, let current = self.items.firstIndex(where: { $0.id == id }) else { return }
+                self.items[current].receivedBytes = received
+                self.items[current].speed = Date().timeIntervalSince(started) > 0
+                    ? Double(received) / Date().timeIntervalSince(started)
+                    : 0
+                if total > 0 && self.items[current].fileSize == 0 {
+                    self.items[current].fileSize = total
+                }
+                self.persistTasksIfNeeded()
             }
-            phase = .completed
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + "-" + items[index].filename)
+            try data.write(to: url, options: .atomic)
+            try await saveToPhotos(url: url)
+            try? FileManager.default.removeItem(at: url)
+            if let current = items.firstIndex(where: { $0.id == id }) {
+                items[current].receivedBytes = items[current].fileSize
+                items[current].status = .completed
+                items[current].task = nil
+                persistTasks()
+            }
+        } catch is CancellationError {
+            if let current = items.firstIndex(where: { $0.id == id }), items[current].status == .downloading {
+                items[current].status = .cancelled
+                persistTasks()
+            }
+        } catch {
+            if let current = items.firstIndex(where: { $0.id == id }) {
+                if case .connected = camera.state {
+                    items[current].status = .failed
+                } else {
+                    items[current].status = .waiting
+                }
+                items[current].task = nil
+                persistTasks()
+            }
         }
     }
 
-    private func save(url: URL) async throws {
+    private func saveThumbnail(for download: GalleryDownload, camera: CameraConnectionService) async -> URL? {
+        guard let image = await camera.thumbnailImage(for: download.thumbnailHandle),
+              let data = image.jpegData(compressionQuality: 0.82)
+        else { return nil }
+        let directory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("GalleryDownloadThumbnails", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent(download.id.replacingOccurrences(of: "/", with: "_") + ".jpg")
+        do { try data.write(to: url, options: .atomic); return url } catch { return nil }
+    }
+
+    private func loadPersistedTasks() {
+        guard let data = try? Data(contentsOf: persistenceURL),
+              let saved = try? JSONDecoder().decode([PersistedTask].self, from: data)
+        else { return }
+
+        let expiration = Date().addingTimeInterval(-7 * 24 * 60 * 60)
+        items = saved.compactMap { task in
+            if task.status == .completed && task.addedAt < expiration {
+                if let path = task.thumbnailPath { try? FileManager.default.removeItem(atPath: path) }
+                return nil
+            }
+            return TaskItem(
+                id: task.id,
+                handle: task.handle,
+                filename: task.filename,
+                fileSize: task.fileSize,
+                format: task.format,
+                thumbnailURL: task.thumbnailPath.map(URL.init(fileURLWithPath:)),
+                status: task.status == .downloading ? .waiting : task.status,
+                receivedBytes: task.status == .downloading ? 0 : task.receivedBytes,
+                addedAt: task.addedAt
+            )
+        }
+        persistTasks()
+    }
+
+    private func persistTasksIfNeeded() {
+        guard Date().timeIntervalSince(lastPersistedAt) >= 0.25 else { return }
+        persistTasks()
+    }
+
+    private func persistTasks() {
+        lastPersistedAt = Date()
+        let saved = items.map {
+            PersistedTask(
+                id: $0.id,
+                handle: $0.handle,
+                filename: $0.filename,
+                fileSize: $0.fileSize,
+                format: $0.format,
+                thumbnailPath: $0.thumbnailURL?.path,
+                status: $0.status,
+                receivedBytes: $0.receivedBytes,
+                addedAt: $0.addedAt
+            )
+        }
+        guard let data = try? JSONEncoder().encode(saved) else { return }
+        try? data.write(to: persistenceURL, options: .atomic)
+    }
+
+    private func saveToPhotos(url: URL) async throws {
+        let auth = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+        guard auth == .authorized || auth == .limited else { throw CocoaError(.fileWriteNoPermission) }
         try await PHPhotoLibrary.shared().performChanges {
             let request = PHAssetCreationRequest.forAsset()
             request.addResource(with: .photo, fileURL: url, options: nil)
         }
+    }
+}
+
+private struct MultiDownloadConfirmationSheet: View {
+    let count: Int
+    let onConfirm: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 14) {
+                Text("保存 \(count) 张图片到相册")
+                    .font(.headline)
+                Spacer()
+                HStack(spacing: 12) {
+                    Button("取消", action: onCancel)
+                        .buttonStyle(.bordered)
+                    Button("确认", action: onConfirm)
+                        .buttonStyle(.borderedProminent)
+                }
+            }
+            .padding(20)
+            .navigationTitle("确认下载")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+}
+
+private struct DownloadTaskDrawer: View {
+    @ObservedObject var store: GalleryDownloadStore
+    @State private var tab: Tab = .waiting
+    @Environment(\.dismiss) private var dismiss
+
+    enum Tab: String, CaseIterable { case waiting = "未下载", completed = "已下载" }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                Picker("任务类型", selection: $tab) {
+                    ForEach(Tab.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+                List {
+                    ForEach(filteredItems) { item in
+                        DownloadTaskRow(item: item, store: store)
+                            .swipeActions(edge: .trailing) { Button(role: .destructive) { store.delete(item.id) } label: { Label("删除", systemImage: "trash") } }
+                    }
+                    if tab == .completed {
+                        Text("已完成的下载任务记录最多保留7天")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .listRowBackground(Color.clear)
+                            .listRowSeparator(.hidden, edges: .all)
+                    }
+                }
+                .listStyle(.plain)
+            }
+            .navigationTitle("任务列表")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("完成") { dismiss() } } }
+        }
+    }
+
+    private var filteredItems: [GalleryDownloadStore.TaskItem] {
+        switch tab {
+        case .waiting:
+            return store.items.filter { $0.status != .completed }.sorted { rank($0.status) < rank($1.status) }
+        case .completed:
+            return store.items.filter { $0.status == .completed }
+        }
+    }
+
+    private func rank(_ status: GalleryDownloadStore.Status) -> Int {
+        switch status { case .downloading: return 0; case .waiting: return 1; case .failed: return 2; case .cancelled: return 3; case .completed: return 4 }
+    }
+}
+
+private struct DownloadTaskRow: View {
+    let item: GalleryDownloadStore.TaskItem
+    @ObservedObject var store: GalleryDownloadStore
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Group {
+                if let url = item.thumbnailURL, let image = UIImage(contentsOfFile: url.path) { Image(uiImage: image).resizable().scaledToFill() }
+                else { Image(systemName: "photo").foregroundStyle(.secondary) }
+            }
+            .frame(width: 58, height: 58)
+            .background(.quaternary)
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            VStack(alignment: .leading, spacing: 5) {
+                Text(item.filename).lineLimit(1).font(.subheadline.weight(.medium))
+                if item.status == .downloading {
+                    ProgressView(value: item.fileSize > 0 ? Double(item.receivedBytes) / Double(item.fileSize) : 0)
+                    HStack {
+                        Spacer()
+                        Text("\(formatSpeed(item.speed))  \(formatBytes(item.receivedBytes))/\(formatBytes(item.fileSize))")
+                    }.font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            Spacer(minLength: 8)
+            if item.status == .waiting || item.status == .downloading {
+                Button { store.cancel(item.id) } label: { Image(systemName: "xmark.circle.fill").symbolRenderingMode(.multicolor).font(.headline) }.buttonStyle(.plain)
+            } else if item.status == .cancelled || item.status == .failed {
+                Button { store.retry(item.id) } label: { Image(systemName: "arrow.clockwise").font(.headline) }.buttonStyle(.plain)
+            }
+        }
+        .padding(.vertical, 5)
+        .contentTransition(.symbolEffect(.replace.magic(fallback: .downUp.byLayer), options: .nonRepeating))
+        .animation(.default, value: item.status)
+    }
+
+    private func formatSpeed(_ speed: Double) -> String { "\(formatBytes(UInt64(speed)))/秒" }
+    private func formatBytes(_ bytes: UInt64) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
     }
 }

@@ -691,6 +691,18 @@ final class CameraConnectionService: ObservableObject {
         }
     }
 
+    /// Reads an object in chunks and reports the number of bytes received after each chunk.
+    func objectData(for handle: UInt32, progress: @escaping @MainActor (UInt64, UInt64) -> Void) async throws -> Data {
+        guard case .connected = state, let commandConnection else {
+            throw CameraConnectionError.connectionCancelled
+        }
+
+        let total = galleryItems.first(where: { $0.handle == handle })?.fileSize ?? 0
+        return try await fetchPartialObject(handle: handle, on: commandConnection) { received in
+            progress(received, total)
+        }
+    }
+
     /// Loads the fastest usable full-screen image. Nikon preview is attempted only when
     /// the connected camera advertises OperationCode 0x9200; invalid preview data falls
     /// back to the complete object read.
@@ -756,7 +768,11 @@ final class CameraConnectionService: ObservableObject {
         }
     }
 
-    private func fetchPartialObject(handle: UInt32, on connection: NWConnection) async throws -> Data {
+    private func fetchPartialObject(
+        handle: UInt32,
+        on connection: NWConnection,
+        progress: (@MainActor (UInt64) -> Void)? = nil
+    ) async throws -> Data {
         let chunkSize: UInt32 = 4 * 1024 * 1024
         var offset: UInt32 = 0
         var collected = Data()
@@ -777,6 +793,7 @@ final class CameraConnectionService: ObservableObject {
             }
 
             collected.append(data)
+            progress?(UInt64(collected.count))
             let returnedBytes = response.parameters.first.map(Int.init) ?? data.count
             if returnedBytes < Int(chunkSize) || data.count < Int(chunkSize) {
                 return collected
