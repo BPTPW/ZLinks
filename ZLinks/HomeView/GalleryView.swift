@@ -110,6 +110,7 @@ struct GalleryView: View {
                 }
             }
             .task(id: connectionTaskID) {
+                downloadStore.cameraStateChanged(camera)
                 await reloadGallery(force: false)
             }
             .onChange(of: camera.selectedGalleryDirectoryID) { _, newValue in
@@ -1604,6 +1605,7 @@ private final class GalleryDownloadStore: ObservableObject {
         var speed: Double = 0
         var task: Task<Void, Never>?
         var addedAt: Date
+        var errorMessage: String?
     }
 
     private struct PersistedTask: Codable {
@@ -1616,6 +1618,45 @@ private final class GalleryDownloadStore: ObservableObject {
         let status: Status
         let receivedBytes: UInt64
         let addedAt: Date
+        let errorMessage: String?
+
+        init(
+            id: String,
+            handle: UInt32,
+            filename: String,
+            fileSize: UInt64,
+            format: GalleryDownloadFormat,
+            thumbnailPath: String?,
+            status: Status,
+            receivedBytes: UInt64,
+            addedAt: Date,
+            errorMessage: String?
+        ) {
+            self.id = id
+            self.handle = handle
+            self.filename = filename
+            self.fileSize = fileSize
+            self.format = format
+            self.thumbnailPath = thumbnailPath
+            self.status = status
+            self.receivedBytes = receivedBytes
+            self.addedAt = addedAt
+            self.errorMessage = errorMessage
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decode(String.self, forKey: .id)
+            handle = try container.decode(UInt32.self, forKey: .handle)
+            filename = try container.decode(String.self, forKey: .filename)
+            fileSize = try container.decode(UInt64.self, forKey: .fileSize)
+            format = try container.decode(GalleryDownloadFormat.self, forKey: .format)
+            thumbnailPath = try container.decodeIfPresent(String.self, forKey: .thumbnailPath)
+            status = try container.decode(Status.self, forKey: .status)
+            receivedBytes = try container.decode(UInt64.self, forKey: .receivedBytes)
+            addedAt = try container.decode(Date.self, forKey: .addedAt)
+            errorMessage = try container.decodeIfPresent(String.self, forKey: .errorMessage)
+        }
     }
 
     @Published private(set) var items: [TaskItem] = []
@@ -1655,7 +1696,8 @@ private final class GalleryDownloadStore: ObservableObject {
                 format: download.format,
                 thumbnailURL: thumbnailURL,
                 status: .waiting,
-                addedAt: Date()
+                addedAt: Date(),
+                errorMessage: nil
             ))
         }
         persistTasks()
@@ -1685,6 +1727,7 @@ private final class GalleryDownloadStore: ObservableObject {
         items[index].status = .waiting
         items[index].receivedBytes = 0
         items[index].speed = 0
+        items[index].errorMessage = nil
         persistTasks()
         startWorkerIfNeeded()
     }
@@ -1731,6 +1774,7 @@ private final class GalleryDownloadStore: ObservableObject {
         guard items.indices.contains(index) else { return }
         items[index].status = .downloading
         items[index].receivedBytes = 0
+        items[index].errorMessage = nil
         let started = Date()
         let id = items[index].id
         do {
@@ -1753,6 +1797,7 @@ private final class GalleryDownloadStore: ObservableObject {
                 items[current].receivedBytes = items[current].fileSize
                 items[current].status = .completed
                 items[current].task = nil
+                items[current].errorMessage = nil
                 persistTasks()
             }
         } catch is CancellationError {
@@ -1764,8 +1809,10 @@ private final class GalleryDownloadStore: ObservableObject {
             if let current = items.firstIndex(where: { $0.id == id }) {
                 if case .connected = camera.state {
                     items[current].status = .failed
+                    items[current].errorMessage = error.localizedDescription
                 } else {
                     items[current].status = .waiting
+                    items[current].errorMessage = nil
                 }
                 items[current].task = nil
                 persistTasks()
@@ -1804,7 +1851,8 @@ private final class GalleryDownloadStore: ObservableObject {
                 thumbnailURL: task.thumbnailPath.map(URL.init(fileURLWithPath:)),
                 status: task.status == .downloading ? .waiting : task.status,
                 receivedBytes: task.status == .downloading ? 0 : task.receivedBytes,
-                addedAt: task.addedAt
+                addedAt: task.addedAt,
+                errorMessage: task.errorMessage
             )
         }
         persistTasks()
@@ -1827,7 +1875,8 @@ private final class GalleryDownloadStore: ObservableObject {
                 thumbnailPath: $0.thumbnailURL?.path,
                 status: $0.status,
                 receivedBytes: $0.receivedBytes,
-                addedAt: $0.addedAt
+                addedAt: $0.addedAt,
+                errorMessage: $0.errorMessage
             )
         }
         guard let data = try? JSONEncoder().encode(saved) else { return }
@@ -1936,6 +1985,12 @@ private struct DownloadTaskRow: View {
             .clipShape(RoundedRectangle(cornerRadius: 6))
             VStack(alignment: .leading, spacing: 5) {
                 Text(item.filename).lineLimit(1).font(.subheadline.weight(.medium))
+                if item.status == .failed, let errorMessage = item.errorMessage, !errorMessage.isEmpty {
+                    Text("错误: \(errorMessage)")
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                        .lineLimit(2)
+                }
                 if item.status == .downloading {
                     ProgressView(value: item.fileSize > 0 ? Double(item.receivedBytes) / Double(item.fileSize) : 0)
                     HStack {
