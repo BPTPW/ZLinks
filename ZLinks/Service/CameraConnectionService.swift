@@ -179,6 +179,10 @@ final class CameraConnectionService: ObservableObject {
     @Published private(set) var activeCaptureWrite: CaptureParameter?
     @Published private(set) var captureControlError: String?
 
+    var isCaptureControlBusy: Bool {
+        activeCaptureWrite != nil || captureWriteTask != nil
+    }
+
     private var commandConnection: NWConnection?
     private var eventConnection: NWConnection?
     private var connectionNumber: UInt32?
@@ -203,6 +207,8 @@ final class CameraConnectionService: ObservableObject {
     private var lastDisplayHost: String?
     private var reconnectTask: Task<Void, Never>?
     private var connectionGeneration = UUID()
+    private var pendingCaptureWrites: [CaptureParameter: UInt64] = [:]
+    private var captureWriteTask: Task<Void, Never>?
     private var foregroundObserver: NSObjectProtocol?
 
     private static let lastConnectedHostKey = "camera.lastConnectedHost"
@@ -360,6 +366,9 @@ final class CameraConnectionService: ObservableObject {
         supportsPreviewImage = false
         supportedOperations = []
         captureParameters = [:]
+        pendingCaptureWrites = [:]
+        captureWriteTask?.cancel()
+        captureWriteTask = nil
         activeCaptureWrite = nil
         isRefreshingCaptureParameters = false
         captureControlError = nil
@@ -791,7 +800,7 @@ final class CameraConnectionService: ObservableObject {
             captureParameters = [:]
             return
         }
-        guard activeCaptureWrite == nil, !isRefreshingCaptureParameters else { return }
+        guard activeCaptureWrite == nil, captureWriteTask == nil, !isRefreshingCaptureParameters else { return }
 
         isRefreshingCaptureParameters = true
         captureControlError = nil
@@ -818,9 +827,41 @@ final class CameraConnectionService: ObservableObject {
         )
     }
 
-    /// Write one camera parameter and immediately read it back to show the value
-    /// the body actually accepted. Standard PTP is preferred; Nikon shutter
-    /// falls back to 0xD100 for bodies that do not allow 0x500D writes.
+    /// Queue a live slider value. Intermediate values are coalesced while a
+    /// PTP transaction is in flight, so dragging never backs up the command
+    /// channel and the camera always converges on the latest position.
+    func queueCaptureParameter(_ parameter: CaptureParameter, rawValue: UInt64) {
+        guard case .connected = state else {
+            captureControlError = "相机未连接。"
+            return
+        }
+
+        pendingCaptureWrites[parameter] = rawValue
+        captureParameters[parameter] = rawValue
+        captureControlError = nil
+
+        guard captureWriteTask == nil else { return }
+        captureWriteTask = Task { [weak self] in
+            await self?.drainPendingCaptureWrites()
+        }
+    }
+
+    private func drainPendingCaptureWrites() async {
+        defer { captureWriteTask = nil }
+
+        while !Task.isCancelled, !pendingCaptureWrites.isEmpty {
+            guard case .connected = state else {
+                pendingCaptureWrites = [:]
+                break
+            }
+            guard let next = pendingCaptureWrites.first else { break }
+            pendingCaptureWrites.removeValue(forKey: next.key)
+            _ = await setCaptureParameter(next.key, rawValue: next.value)
+        }
+    }
+
+    /// Write one camera parameter and immediately read it back to show the
+    /// value the body actually accepted.
     @discardableResult
     func setCaptureParameter(_ parameter: CaptureParameter, rawValue: UInt64) async -> Bool {
         guard case .connected = state, let commandConnection else {
