@@ -174,21 +174,25 @@ struct CaptureView: View {
                 HStack(spacing: 8) {
                     liveViewBadge
                     Spacer()
+                    
+                }
+                Spacer()
+                HStack{
+                    Spacer()
                     Button {
                         isFullscreenPresented = true
                     } label: {
                         Image(systemName: "arrow.up.left.and.arrow.down.right")
                             .font(.subheadline.bold())
                             .frame(width: 34, height: 34)
-                            .foregroundStyle(.white)
+                            .foregroundStyle(.primary)
                     }
                     .buttonStyle(.plain)
                     .glassEffect(.regular.interactive(), in: .circle)
                     .accessibilityLabel("全屏监看")
                 }
-                .padding(12)
-                Spacer()
             }
+            .padding(12)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .aspectRatio(4.0 / 3.0, contentMode: .fit)
@@ -318,6 +322,7 @@ private struct CaptureFullscreenMonitor: View {
     @Binding var editingParameter: CaptureParameter?
     @Binding var sliderIndex: Double
     let onDismiss: () -> Void
+    @State private var showsMoreOptions = false
 
     private let leftRailParameters: [CaptureParameter] = [
         .exposureCompensation,
@@ -334,68 +339,87 @@ private struct CaptureFullscreenMonitor: View {
     ]
 
     var body: some View {
-        GeometryReader { _ in
+        GeometryReader { proxy in
             ZStack {
                 Color.black
                     .ignoresSafeArea()
 
-                HStack(alignment: .center, spacing: 10) {
-                    CaptureSideRail(
-                        title: "曝光",
-                        parameters: leftRailParameters,
-                        showsLocalKeys: false,
-                        showsRefresh: false,
-                        showsGrid: $showsGrid,
-                        mirrorsPreview: $mirrorsPreview,
-                        onSelect: openEditor
-                    )
+                fullscreenCanvas(for: proxy.size)
+                    .frame(width: proxy.size.height, height: proxy.size.width)
+                    .rotationEffect(.degrees(90))
+                    .frame(width: proxy.size.width, height: proxy.size.height)
+            }
+        }
+        .statusBarHidden(true)
+        .persistentSystemOverlays(.hidden)
+    }
 
-                    fullscreenVideoSurface
+    @ViewBuilder
+    private func fullscreenCanvas(for screenSize: CGSize) -> some View {
+        let canvasSize = CGSize(width: screenSize.height, height: screenSize.width)
+        let sideColumnWidth: CGFloat = 144
+        let horizontalPadding: CGFloat = 12
+        let verticalPadding: CGFloat = 10
+        let columnSpacing: CGFloat = 20
+        let availablePreviewWidth = max(
+            0,
+            canvasSize.width - (sideColumnWidth * 2) - (horizontalPadding * 2) - (columnSpacing * 2)
+        )
+        let availablePreviewHeight = max(0, canvasSize.height - (verticalPadding * 2))
+        let previewWidth = min(availablePreviewWidth, availablePreviewHeight * 4 / 3)
 
-                    CaptureSideRail(
-                        title: "对焦 / 监看",
-                        parameters: rightRailParameters,
-                        showsLocalKeys: true,
-                        showsRefresh: true,
-                        showsGrid: $showsGrid,
-                        mirrorsPreview: $mirrorsPreview,
-                        onSelect: openEditor
-                    )
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
-                .allowsHitTesting(editingParameter == nil)
+        ZStack {
+            HStack(alignment: .center, spacing: columnSpacing) {
+                CaptureFullscreenReadouts(
+                    parameters: leftRailParameters,
+                    onSelect: openEditor
+                )
+                .frame(width: sideColumnWidth - 30, alignment: .leading)
 
-                VStack {
-                    ZStack {
-                        HStack {
-                            Spacer()
-                            fullscreenStatusBadge
-                            Spacer()
-                        }
+                fullscreenVideoSurface
+                    .frame(width: previewWidth, height: previewWidth * 3 / 4)
 
-                        HStack {
-                            Spacer()
-                            Button(action: onDismiss) {
-                                Image(systemName: "arrow.down.right.and.arrow.up.left")
-                                    .font(.subheadline.bold())
-                                    .frame(width: 38, height: 38)
-                                    .foregroundStyle(.white)
-                            }
-                            .buttonStyle(.plain)
-                            .glassEffect(.regular.interactive(), in: .circle)
-                            .accessibilityLabel("退出全屏监看")
+                fullscreenRightControls
+                    .frame(width: sideColumnWidth + 30)
+                    .frame(maxHeight: .infinity)
+            }
+            .padding(.horizontal, horizontalPadding)
+            .padding(.vertical, verticalPadding)
+            .allowsHitTesting(editingParameter == nil)
+
+            if showsMoreOptions {
+                Color.black.opacity(0.001)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        withAnimation(.easeInOut(duration: 0.18)) {
+                            showsMoreOptions = false
                         }
                     }
-                    .padding(16)
+                    .zIndex(1)
 
-                    Spacer()
-                }
-                .allowsHitTesting(editingParameter == nil)
+                CaptureFullscreenMoreOptions(
+                    parameters: rightRailParameters,
+                    showsGrid: $showsGrid,
+                    mirrorsPreview: $mirrorsPreview,
+                    onSelect: { parameter in
+                        showsMoreOptions = false
+                        openEditor(parameter)
+                    }
+                )
+                .frame(width: min(160, canvasSize.width * 0.4))
+                .padding(.trailing, sideColumnWidth + horizontalPadding + columnSpacing)
+                .padding(.bottom, verticalPadding)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                .transition(
+                    .scale(scale: 0.08, anchor: .bottomTrailing)
+                        .combined(with: .opacity)
+                )
+                .zIndex(2)
+            }
 
-                if let parameter = editingParameter {
-                    let options = CaptureOptionCatalog.options(for: parameter)
-                    if !options.isEmpty {
+            if let parameter = editingParameter {
+                let options = CaptureOptionCatalog.options(for: parameter)
+                if !options.isEmpty {
                     Color.black.opacity(0.22)
                         .ignoresSafeArea()
                         .onTapGesture {
@@ -418,13 +442,54 @@ private struct CaptureFullscreenMonitor: View {
                             .combined(with: .opacity)
                     )
                     .zIndex(10)
-                    }
                 }
             }
-            .animation(.spring(response: 0.34, dampingFraction: 0.86), value: editingParameter)
         }
-        .statusBarHidden(true)
-        .persistentSystemOverlays(.hidden)
+        .animation(.spring(response: 0.34, dampingFraction: 0.86), value: editingParameter)
+    }
+
+    private var fullscreenRightControls: some View {
+        HStack(spacing: 14) {
+            Button {
+                Task { await camera.initiateCaptureRecInMedia() }
+            } label: {
+                Circle()
+                    .fill(.white)
+                    .frame(width: 56, height: 56)
+            }
+            .buttonStyle(.plain)
+            .disabled(!isConnected || camera.isInitiatingCapture)
+            .opacity(isConnected ? 1 : 0.42)
+            .accessibilityLabel("拍摄")
+
+            VStack {
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .font(.subheadline.bold())
+                        .frame(width: 38, height: 38)
+                        .foregroundStyle(.white)
+                }
+                .buttonStyle(.plain)
+                .background(.black.opacity(0.5),in: .circle)
+                .accessibilityLabel("退出全屏监看")
+
+                Spacer()
+
+                Button {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        showsMoreOptions.toggle()
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.headline.weight(.bold))
+                        .frame(width: 38, height: 38)
+                        .foregroundStyle(.white)
+                }
+                .buttonStyle(.plain)
+                .background(.black.opacity(0.5),in: .circle)
+                .accessibilityLabel("更多")
+            }
+        }
     }
 
     private var fullscreenVideoSurface: some View {
@@ -454,26 +519,6 @@ private struct CaptureFullscreenMonitor: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .strokeBorder(.white.opacity(0.13), lineWidth: 1)
-        }
-    }
-
-    private var fullscreenStatusBadge: some View {
-        let isLive = camera.liveViewImage != nil
-        return HStack(spacing: 7) {
-            Circle()
-                .fill(isLive ? Color.green : Color.yellow)
-                .frame(width: 8, height: 8)
-            Text(isLive ? "全屏实时监看" : "正在启动实时图传")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.white)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .glassEffect(.regular, in: .capsule)
     }
 
     private func openEditor(_ parameter: CaptureParameter) {
@@ -487,7 +532,138 @@ private struct CaptureFullscreenMonitor: View {
         sliderIndex = Double(index)
         editingParameter = parameter
     }
+
+    private var isConnected: Bool {
+        if case .connected = camera.state { return true }
+        return false
+    }
 }
+
+private struct CaptureFullscreenReadouts: View {
+    @EnvironmentObject private var camera: CameraConnectionService
+    let parameters: [CaptureParameter]
+    let onSelect: (CaptureParameter) -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ForEach(parameters) { parameter in
+                Button {
+                    onSelect(parameter)
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: parameter.symbol)
+                            .font(.body.weight(.semibold))
+                            .frame(width: 22, alignment: .leading)
+                            .foregroundStyle(.white.opacity(0.82))
+
+                        Text(
+                            CaptureOptionCatalog.displayedValue(
+                                for: parameter,
+                                rawValue: camera.captureParameters[parameter]
+                            )
+                        )
+                        .font(.headline.monospacedDigit().weight(.semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+                .accessibilityLabel("\(parameter.title)，\(CaptureOptionCatalog.displayedValue(for: parameter, rawValue: camera.captureParameters[parameter]))")
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+private struct CaptureFullscreenMoreOptions: View {
+    @EnvironmentObject private var camera: CameraConnectionService
+    let parameters: [CaptureParameter]
+    @Binding var showsGrid: Bool
+    @Binding var mirrorsPreview: Bool
+    let onSelect: (CaptureParameter) -> Void
+
+    var body: some View {
+        ScrollView(.vertical) {
+            VStack(spacing: 8) {
+                HStack {
+                    Spacer()
+                    Button {
+                        Task { await camera.refreshCaptureParameters() }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.caption.weight(.bold))
+                            .frame(width: 28, height: 28)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.white)
+                    .disabled(!isConnected || camera.isRefreshingCaptureParameters || camera.isCaptureControlBusy)
+                    .accessibilityLabel("刷新相机参数")
+                }
+
+                ForEach(parameters) { parameter in
+                    CaptureGlassKey(
+                        title: parameter.title,
+                        symbol: parameter.symbol,
+                        value: CaptureOptionCatalog.displayedValue(
+                            for: parameter,
+                            rawValue: camera.captureParameters[parameter]
+                        ),
+                        style: .rail,
+                        isOn: false,
+                        isBusy: camera.activeCaptureWrite == parameter,
+                        isEnabled: isConnected,
+                        action: { onSelect(parameter) }
+                    )
+                }
+
+                CaptureGlassKey(
+                    title: "网格",
+                    symbol: "grid",
+                    value: showsGrid ? "开" : "关",
+                    style: .rail,
+                    isOn: showsGrid,
+                    isBusy: false,
+                    isEnabled: true
+                ) {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        showsGrid.toggle()
+                    }
+                }
+
+                CaptureGlassKey(
+                    title: "镜像",
+                    symbol: "arrow.left.and.right",
+                    value: mirrorsPreview ? "开" : "关",
+                    style: .rail,
+                    isOn: mirrorsPreview,
+                    isBusy: false,
+                    isEnabled: true
+                ) {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        mirrorsPreview.toggle()
+                    }
+                }
+            }
+            .padding(12)
+        }
+        .scrollIndicators(.hidden)
+        .background(.black.opacity(0.86), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(.white.opacity(0.18), lineWidth: 1)
+        }
+    }
+
+    private var isConnected: Bool {
+        if case .connected = camera.state { return true }
+        return false
+    }
+}
+
 private struct CaptureSideRail: View {
     @EnvironmentObject private var camera: CameraConnectionService
 
@@ -771,14 +947,10 @@ private struct CaptureSliderEditor: View {
                 Image(systemName: parameter.symbol)
                     .font(.headline)
                     .frame(width: 34, height: 34)
-                    .glassEffect(.regular, in: .circle)
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(parameter.title)
                         .font(.headline)
-                    Text("拖动滑杆实时调节")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                 }
 
                 Spacer()
@@ -790,7 +962,7 @@ private struct CaptureSliderEditor: View {
                 }
                 .buttonStyle(.plain)
                 .glassEffect(.regular.interactive(), in: .circle)
-                .accessibilityLabel("关闭参数滑杆")
+                .accessibilityLabel("关闭")
             }
 
             Text(selectedOption.title)

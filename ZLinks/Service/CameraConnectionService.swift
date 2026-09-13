@@ -178,6 +178,7 @@ final class CameraConnectionService: ObservableObject {
     @Published private(set) var isRefreshingCaptureParameters = false
     @Published private(set) var activeCaptureWrite: CaptureParameter?
     @Published private(set) var captureControlError: String?
+    @Published private(set) var isInitiatingCapture = false
 
     var isCaptureControlBusy: Bool {
         activeCaptureWrite != nil || captureWriteTask != nil
@@ -371,6 +372,7 @@ final class CameraConnectionService: ObservableObject {
         captureWriteTask = nil
         activeCaptureWrite = nil
         isRefreshingCaptureParameters = false
+        isInitiatingCapture = false
         captureControlError = nil
         stopLiveViewInternal(sendEndCommand: false)
         state = .disconnected
@@ -843,6 +845,40 @@ final class CameraConnectionService: ObservableObject {
         guard captureWriteTask == nil else { return }
         captureWriteTask = Task { [weak self] in
             await self?.drainPendingCaptureWrites()
+        }
+    }
+
+    /// Trigger the Nikon capture command that records the image to camera media.
+    @discardableResult
+    func initiateCaptureRecInMedia() async -> Bool {
+        guard case .connected = state, let commandConnection else {
+            captureControlError = "相机未连接。"
+            return false
+        }
+        guard !isInitiatingCapture else { return false }
+
+        isInitiatingCapture = true
+        captureControlError = nil
+        defer { isInitiatingCapture = false }
+
+        do {
+            let response = try await operation(
+                .initiateCaptureRecInMedia,
+                parameters: [],
+                dataPhase: nil,
+                on: commandConnection,
+                logStyle: .compact,
+                timeout: .seconds(8)
+            )
+            guard response.code == PTPResponseCode.ok.rawValue else {
+                throw CameraConnectionError.ptpResponse(response.code)
+            }
+            appendLog("[capture] InitiateCaptureRecInMedia 成功")
+            return true
+        } catch {
+            captureControlError = "拍摄失败：\(error.localizedDescription)"
+            appendLog("[capture] InitiateCaptureRecInMedia 失败 error=\(error.localizedDescription)")
+            return false
         }
     }
 
@@ -2853,6 +2889,7 @@ private enum PTPOperationCode: UInt16 {
     case startLiveView = 0x9201
     case endLiveView = 0x9202
     case getLiveViewImage = 0x9203
+    case initiateCaptureRecInMedia = 0x9207
     case getLiveViewImageEx = 0x9428
     case getObjectsMetadata = 0x9434
     case changeApplicationMode = 0x9435
@@ -2877,6 +2914,7 @@ private enum PTPOperationCode: UInt16 {
         case .startLiveView: return "StartLiveView"
         case .endLiveView: return "EndLiveView"
         case .getLiveViewImage: return "GetLiveViewImg"
+        case .initiateCaptureRecInMedia: return "InitiateCaptureRecInMedia"
         case .getLiveViewImageEx: return "GetLiveViewImageEx"
         case .getObjectsMetadata: return "GetObjectsMetaData"
         case .changeApplicationMode: return "ChangeApplicationMode"
