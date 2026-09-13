@@ -393,8 +393,9 @@ private struct CaptureFullscreenMonitor: View {
                 }
                 .allowsHitTesting(editingParameter == nil)
 
-                if let parameter = editingParameter,
-                   let options = editorOptions(for: parameter) {
+                if let parameter = editingParameter {
+                    let options = CaptureOptionCatalog.options(for: parameter)
+                    if !options.isEmpty {
                     Color.black.opacity(0.22)
                         .ignoresSafeArea()
                         .onTapGesture {
@@ -417,6 +418,7 @@ private struct CaptureFullscreenMonitor: View {
                             .combined(with: .opacity)
                     )
                     .zIndex(10)
+                    }
                 }
             }
             .animation(.spring(response: 0.34, dampingFraction: 0.86), value: editingParameter)
