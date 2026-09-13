@@ -116,7 +116,10 @@ struct CaptureView: View {
                 onSelect: openEditor
             )
 
-            liveViewPanel(showsPortraitCaptureButton: false)
+            VStack(spacing: 8) {
+                CaptureLiveViewStatusBar()
+                liveViewPanel(showsPortraitCaptureButton: false)
+            }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .layoutPriority(1)
 
@@ -137,6 +140,7 @@ struct CaptureView: View {
     private var portraitWorkspace: some View {
         ScrollView {
             VStack(spacing: 14) {
+                CaptureLiveViewStatusBar()
                 liveViewPanel(showsPortraitCaptureButton: true)
 
                 CapturePortraitKeyDeck(
@@ -181,10 +185,6 @@ struct CaptureView: View {
 
             GeometryReader { _ in
                 VStack {
-                    HStack(spacing: 8) {
-                        liveViewBadge
-                        Spacer()
-                    }
                     Spacer()
                     HStack {
                         if showsPortraitCaptureButton {
@@ -277,40 +277,6 @@ struct CaptureView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private var liveViewBadge: some View {
-        let title: String
-        let color: Color
-        switch camera.state {
-        case .connected where camera.liveViewImage != nil:
-            title = "实时"
-            color = .green
-        case .connected where camera.isLiveViewActive:
-            title = "启动中"
-            color = .yellow
-        case .connected:
-            title = camera.liveViewError == nil ? "等待图传" : "不可用"
-            color = camera.liveViewError == nil ? .yellow : .orange
-        case .connecting:
-            title = "连接中"
-            color = .yellow
-        default:
-            title = "未连接"
-            color = .gray
-        }
-
-        return HStack(spacing: 6) {
-            Circle()
-                .fill(color)
-                .frame(width: 8, height: 8)
-            Text(title)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.white)
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(.black.opacity(0.45), in: Capsule())
     }
 
     private var liveViewSessionKey: String {
@@ -1149,6 +1115,93 @@ private struct CaptureGridOverlay: View {
                 with: .color(.white.opacity(0.48)),
                 style: StrokeStyle(lineWidth: 1, dash: [6, 4])
             )
+        }
+    }
+}
+
+private struct CaptureLiveViewStatusBar: View {
+    @EnvironmentObject private var camera: CameraConnectionService
+
+    private var connectionTitle: String {
+        switch camera.state {
+        case .connected where camera.liveViewImage != nil:
+            return "实时"
+        case .connected where camera.isLiveViewActive:
+            return "启动中"
+        case .connected:
+            return camera.liveViewError == nil ? "等待图传" : "不可用"
+        case .connecting:
+            return "连接中"
+        default:
+            return "未连接"
+        }
+    }
+
+    private var connectionColor: Color {
+        switch camera.state {
+        case .connected where camera.liveViewImage != nil:
+            return .green
+        case .connected where camera.isLiveViewActive:
+            return .yellow
+        case .connected:
+            return camera.liveViewError == nil ? .yellow : .orange
+        case .connecting:
+            return .yellow
+        default:
+            return .gray
+        }
+    }
+
+    private var frameRateText: String {
+        guard let frameRate = camera.liveViewFrameRate else { return "--" }
+        return String(format: "%.1f", frameRate)
+    }
+
+    private var batteryText: String {
+        guard case .connected = camera.state,
+              let batteryLevel = camera.cameraStatus.batteryLevel
+        else { return "--%" }
+        return "\(batteryLevel)%"
+    }
+
+    var body: some View {
+        HStack(spacing: 18) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(connectionColor)
+                    .frame(width: 8, height: 8)
+                Text(connectionTitle)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.primary)
+            }
+
+            Spacer(minLength: 12)
+
+            HStack(spacing: 16) {
+                CaptureLiveViewMetric(title: "帧率", value: frameRateText)
+                CaptureLiveViewMetric(title: "电量", value: batteryText)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .frame(maxWidth: .infinity)
+        .glassEffect(.regular, in: .rect(cornerRadius: 22))
+    }
+}
+
+private struct CaptureLiveViewMetric: View {
+    let title: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 1) {
+            Text(title)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.headline.weight(.bold))
+                .fontDesign(.rounded)
+                .foregroundStyle(.primary)
         }
     }
 }

@@ -174,6 +174,7 @@ final class CameraConnectionService: ObservableObject {
     @Published private(set) var liveViewImage: UIImage?
     @Published private(set) var isLiveViewActive = false
     @Published private(set) var liveViewError: String?
+    @Published private(set) var liveViewFrameRate: Double?
     @Published private(set) var captureParameters: [CaptureParameter: UInt64] = [:]
     @Published private(set) var isRefreshingCaptureParameters = false
     @Published private(set) var activeCaptureWrite: CaptureParameter?
@@ -204,6 +205,8 @@ final class CameraConnectionService: ObservableObject {
     private var liveViewTask: Task<Void, Never>?
     private var liveViewGeneration = 0
     private var liveViewConsumers = 0
+    private var liveViewFrameCount = 0
+    private var liveViewFrameWindowStart = Date()
     private var lastEndpoint: NWEndpoint?
     private var lastDisplayHost: String?
     private var reconnectTask: Task<Void, Never>?
@@ -1039,6 +1042,9 @@ final class CameraConnectionService: ObservableObject {
         liveViewTask = nil
         isLiveViewActive = false
         liveViewImage = nil
+        liveViewFrameRate = nil
+        liveViewFrameCount = 0
+        liveViewFrameWindowStart = Date()
         appendLog("[liveview] 开始启动实时图传 generation=\(generation)")
 
         do {
@@ -1068,6 +1074,9 @@ final class CameraConnectionService: ObservableObject {
         liveViewTask = nil
         isLiveViewActive = false
         liveViewImage = nil
+        liveViewFrameRate = nil
+        liveViewFrameCount = 0
+        liveViewFrameWindowStart = Date()
         if !sendEndCommand {
             liveViewError = nil
             return
@@ -1181,6 +1190,14 @@ final class CameraConnectionService: ObservableObject {
                     liveViewImage = frame
                     liveViewError = nil
                     consecutiveFailures = 0
+                    liveViewFrameCount += 1
+                    let now = Date()
+                    let elapsed = now.timeIntervalSince(liveViewFrameWindowStart)
+                    if elapsed >= 1 {
+                        liveViewFrameRate = Double(liveViewFrameCount) / elapsed
+                        liveViewFrameCount = 0
+                        liveViewFrameWindowStart = now
+                    }
                 } else {
                     consecutiveFailures += 1
                 }
