@@ -869,6 +869,10 @@ final class CameraConnectionService: ObservableObject {
     }
 
     /// Trigger the Nikon capture command that records the image to camera media.
+    ///
+    /// Nikon expects at least the no-AF marker in the operation parameters.
+    /// Newer bodies also accept the record target (`0` means card); older
+    /// variants expose only the single marker parameter.
     @discardableResult
     func initiateCaptureRecInMedia() async -> Bool {
         guard case .connected = state, let commandConnection else {
@@ -881,25 +885,55 @@ final class CameraConnectionService: ObservableObject {
         captureControlError = nil
         defer { isInitiatingCapture = false }
 
+        let parameterStrategies: [[UInt32]] = [
+            [0xFFFF_FFFF, 0],
+            [0xFFFF_FFFF]
+        ]
+
         do {
-            let response = try await operation(
-                .initiateCaptureRecInMedia,
-                parameters: [],
-                dataPhase: nil,
-                on: commandConnection,
-                logStyle: .compact,
-                timeout: .seconds(8)
-            )
-            guard response.code == PTPResponseCode.ok.rawValue else {
-                throw CameraConnectionError.ptpResponse(response.code)
+            var lastResponseCode = PTPResponseCode.ok.rawValue
+            for (index, parameters) in parameterStrategies.enumerated() {
+                let response = try await operation(
+                    .initiateCaptureRecInMedia,
+                    parameters: parameters,
+                    dataPhase: nil,
+                    on: commandConnection,
+                    logStyle: .compact,
+                    timeout: .seconds(8)
+                )
+                lastResponseCode = response.code
+
+                if response.code == PTPResponseCode.ok.rawValue {
+                    appendLog(
+                        "[capture] InitiateCaptureRecInMedia 成功 " +
+                            "parameters=\(logParameters(parameters))"
+                    )
+                    try await waitUntilDeviceReady(on: commandConnection, logPrefix: "[capture]")
+                    return true
+                }
+
+                appendLog(
+                    "[capture] InitiateCaptureRecInMedia 拒绝 " +
+                        "code=0x\(String(format: "%04X", response.code)) " +
+                        "parameters=\(logParameters(parameters))"
+                )
+
+                let canRetryWithFewerParameters = index + 1 < parameterStrategies.count
+                    && (response.code == PTPResponseCode.operationNotSupported.rawValue
+                        || response.code == PTPResponseCode.invalidParameter.rawValue)
+                guard canRetryWithFewerParameters else { break }
             }
-            appendLog("[capture] InitiateCaptureRecInMedia 成功")
-            return true
+
+            throw CameraConnectionError.ptpResponse(lastResponseCode)
         } catch {
             captureControlError = "拍摄失败：\(error.localizedDescription)"
             appendLog("[capture] InitiateCaptureRecInMedia 失败 error=\(error.localizedDescription)")
             return false
         }
+    }
+
+    private func logParameters(_ parameters: [UInt32]) -> String {
+        parameters.map { String(format: "0x%08X", $0) }.joined(separator: ",")
     }
 
     private func drainPendingCaptureWrites() async {
@@ -1148,7 +1182,7 @@ final class CameraConnectionService: ObservableObject {
         try await waitUntilDeviceReady(on: connection)
     }
 
-    private func waitUntilDeviceReady(on connection: NWConnection) async throws {
+    private func waitUntilDeviceReady(on connection: NWConnection, logPrefix: String = "[liveview]") async throws {
         guard supportsOperation(.deviceReady) else {
             try await Task.sleep(for: .milliseconds(400))
             return
@@ -1163,18 +1197,18 @@ final class CameraConnectionService: ObservableObject {
                 logStyle: .silent
             )
             if response.code == PTPResponseCode.ok.rawValue {
-                appendLog("[liveview] DeviceReady OK attempt=\(attempt)")
+                appendLog("\(logPrefix) DeviceReady OK attempt=\(attempt)")
                 return
             }
             if response.code == PTPResponseCode.deviceBusy.rawValue {
                 try await Task.sleep(for: .milliseconds(250))
                 continue
             }
-            appendLog("[liveview] DeviceReady code=0x\(String(format: "%04X", response.code)) attempt=\(attempt)")
+            appendLog("\(logPrefix) DeviceReady code=0x\(String(format: "%04X", response.code)) attempt=\(attempt)")
             try await Task.sleep(for: .milliseconds(250))
         }
         // Some bodies keep returning busy briefly; still allow frame polling to proceed.
-        appendLog("[liveview] DeviceReady 超时，继续尝试拉流")
+        appendLog("\(logPrefix) DeviceReady 超时，继续尝试")
     }
 
     private func runLiveViewLoop(generation: Int) async {
@@ -2958,7 +2992,9 @@ private enum PTPOperationCode: UInt16 {
 
 private enum PTPResponseCode: UInt16 {
     case ok = 0x2001
+    case operationNotSupported = 0x2006
     case deviceBusy = 0x2019
+    case invalidParameter = 0x201D
 }
 
 private extension UInt16 {
