@@ -116,7 +116,7 @@ struct CaptureView: View {
                 onSelect: openEditor
             )
 
-            liveViewPanel
+            liveViewPanel(showsPortraitCaptureButton: false)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .layoutPriority(1)
 
@@ -137,7 +137,7 @@ struct CaptureView: View {
     private var portraitWorkspace: some View {
         ScrollView {
             VStack(spacing: 14) {
-                liveViewPanel
+                liveViewPanel(showsPortraitCaptureButton: true)
 
                 CapturePortraitKeyDeck(
                     showsGrid: $showsGrid,
@@ -150,7 +150,7 @@ struct CaptureView: View {
         .scrollIndicators(.hidden)
     }
 
-    private var liveViewPanel: some View {
+    private func liveViewPanel(showsPortraitCaptureButton: Bool) -> some View {
         ZStack {
             Color.black
 
@@ -170,29 +170,56 @@ struct CaptureView: View {
                     .allowsHitTesting(false)
             }
 
-            VStack {
-                HStack(spacing: 8) {
-                    liveViewBadge
-                    Spacer()
-                    
-                }
-                Spacer()
-                HStack{
-                    Spacer()
-                    Button {
-                        isFullscreenPresented = true
-                    } label: {
-                        Image(systemName: "arrow.up.left.and.arrow.down.right")
-                            .font(.subheadline.bold())
-                            .frame(width: 34, height: 34)
-                            .foregroundStyle(.primary)
-                    }
-                    .buttonStyle(.plain)
-                    .glassEffect(.regular.interactive(), in: .circle)
-                    .accessibilityLabel("全屏监看")
-                }
+            GeometryReader { proxy in
+                CaptureExposureScale(
+                    rawValue: camera.captureParameters[.exposureCompensation],
+                    onCommit: { camera.queueCaptureParameter(.exposureCompensation, rawValue: $0) }
+                )
+                .frame(width: 62, height: proxy.size.height / 3 + 42)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
             }
-            .padding(12)
+
+            GeometryReader { _ in
+                VStack {
+                    HStack(spacing: 8) {
+                        liveViewBadge
+                        Spacer()
+                    }
+                    Spacer()
+                    HStack {
+                        if showsPortraitCaptureButton {
+                            Button {
+                                Task { await camera.initiateCaptureRecInMedia() }
+                            } label: {
+                                Circle()
+                                    .fill(.white)
+                                    .frame(width: 34, height: 34)
+                                    .padding(8)
+                            }
+                            .buttonStyle(.plain)
+                            .background(.black.opacity(0.34), in: Circle())
+                            .disabled(!isConnected || camera.isInitiatingCapture)
+                            .opacity(isConnected ? 1 : 0.42)
+                            .accessibilityLabel("拍摄")
+                        }
+
+                        Spacer()
+
+                        Button {
+                            isFullscreenPresented = true
+                        } label: {
+                            Image(systemName: "arrow.up.left.and.arrow.down.right")
+                                .font(.subheadline.bold())
+                                .frame(width: 34, height: 34)
+                                .foregroundStyle(.primary)
+                        }
+                        .buttonStyle(.plain)
+                        .glassEffect(.regular.interactive(), in: .circle)
+                        .accessibilityLabel("全屏监看")
+                    }
+                }
+                .padding(12)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .aspectRatio(4.0 / 3.0, contentMode: .fit)
@@ -202,6 +229,11 @@ struct CaptureView: View {
                 .strokeBorder(.white.opacity(0.13), lineWidth: 1)
         }
         .shadow(color: .black.opacity(0.24), radius: 24, y: 12)
+    }
+
+    private var isConnected: Bool {
+        if case .connected = camera.state { return true }
+        return false
     }
 
     private var liveViewPlaceholder: some View {
@@ -357,19 +389,17 @@ private struct CaptureFullscreenMonitor: View {
     @ViewBuilder
     private func fullscreenCanvas(for screenSize: CGSize) -> some View {
         let canvasSize = CGSize(width: screenSize.height, height: screenSize.width)
-        let sideColumnWidth: CGFloat = 144
-        let horizontalPadding: CGFloat = 12
-        let verticalPadding: CGFloat = 10
-        let columnSpacing: CGFloat = 20
+        let sideColumnMinWidth: CGFloat = 120
         let availablePreviewWidth = max(
             0,
-            canvasSize.width - (sideColumnWidth * 2) - (horizontalPadding * 2) - (columnSpacing * 2)
+            canvasSize.width - (sideColumnMinWidth * 2)
         )
-        let availablePreviewHeight = max(0, canvasSize.height - (verticalPadding * 2))
+        let availablePreviewHeight = max(0, canvasSize.height)
         let previewWidth = min(availablePreviewWidth, availablePreviewHeight * 4 / 3)
+        let sideColumnWidth = max(sideColumnMinWidth, (canvasSize.width - availablePreviewWidth)/2)
 
         ZStack {
-            HStack(alignment: .center, spacing: columnSpacing) {
+            HStack(alignment: .center) {
                 CaptureFullscreenReadouts(
                     parameters: leftRailParameters,
                     onSelect: openEditor
@@ -383,8 +413,6 @@ private struct CaptureFullscreenMonitor: View {
                     .frame(width: sideColumnWidth + 30)
                     .frame(maxHeight: .infinity)
             }
-            .padding(.horizontal, horizontalPadding)
-            .padding(.vertical, verticalPadding)
             .allowsHitTesting(editingParameter == nil)
 
             if showsMoreOptions {
@@ -406,9 +434,8 @@ private struct CaptureFullscreenMonitor: View {
                         openEditor(parameter)
                     }
                 )
-                .frame(width: min(160, canvasSize.width * 0.4))
-                .padding(.trailing, sideColumnWidth + horizontalPadding + columnSpacing)
-                .padding(.bottom, verticalPadding)
+                .frame(width: min(100, canvasSize.width * 0.3))
+                .padding(.trailing, sideColumnWidth)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
                 .transition(
                     .scale(scale: 0.08, anchor: .bottomTrailing)
@@ -516,6 +543,15 @@ private struct CaptureFullscreenMonitor: View {
             if showsGrid {
                 CaptureGridOverlay()
                     .allowsHitTesting(false)
+            }
+
+            GeometryReader { proxy in
+                CaptureExposureScale(
+                    rawValue: camera.captureParameters[.exposureCompensation],
+                    onCommit: { camera.queueCaptureParameter(.exposureCompensation, rawValue: $0) }
+                )
+                .frame(width: 62, height: proxy.size.height / 3 + 42)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -727,7 +763,7 @@ private struct CaptureSideRail: View {
                         style: .rail,
                         isOn: showsGrid,
                         isBusy: false,
-                        isEnabled: true
+                        isEnabled: false
                     ) {
                         withAnimation(.easeInOut(duration: 0.18)) {
                             showsGrid.toggle()
@@ -741,7 +777,7 @@ private struct CaptureSideRail: View {
                         style: .rail,
                         isOn: mirrorsPreview,
                         isBusy: false,
-                        isEnabled: true
+                        isEnabled: false
                     ) {
                         withAnimation(.easeInOut(duration: 0.18)) {
                             mirrorsPreview.toggle()
@@ -845,21 +881,7 @@ private enum CaptureKeyStyle {
     var minHeight: CGFloat {
         switch self {
         case .rail: return 40
-        case .tile: return 76
-        }
-    }
-
-    var padding: CGFloat {
-        switch self {
-        case .rail: return 6
-        case .tile: return 11
-        }
-    }
-
-    var valueFont: Font {
-        switch self {
-        case .rail: return .headline.monospacedDigit().weight(.bold)
-        case .tile: return .title3.monospacedDigit().weight(.bold)
+        case .tile: return 56
         }
     }
 }
@@ -878,35 +900,27 @@ private struct CaptureGlassKey: View {
         Button(action: action) {
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 4) {
-                    Image(systemName: symbol)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(isOn ? Color.orange : Color.primary)
+                    Text(title)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
 
                     Spacer(minLength: 0)
 
                     if isBusy {
                         ProgressView()
                             .controlSize(.mini)
-                    } else {
-                        Image(systemName: "chevron.up.chevron.down")
-                            .font(.system(size: 9, weight: .bold))
-                            .foregroundStyle(.tertiary)
                     }
                 }
 
                 Text(value)
-                    .font(style.valueFont)
+                    .font(.headline.monospacedDigit().weight(.bold))
                     .lineLimit(1)
                     .minimumScaleFactor(0.52)
-
-                Text(title)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.7)
             }
             .frame(maxWidth: .infinity, minHeight: style.minHeight, alignment: .leading)
-            .padding(style.padding)
+            .padding(10)
             .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         }
         .buttonStyle(.plain)
@@ -1136,6 +1150,112 @@ private struct CaptureGridOverlay: View {
                 style: StrokeStyle(lineWidth: 1, dash: [6, 4])
             )
         }
+    }
+}
+
+private struct CaptureExposureScale: View {
+    let rawValue: UInt64?
+    let onCommit: (UInt64) -> Void
+
+    @State private var selectedIndex = 6.0
+    @State private var isDragging = false
+
+    private let options = CaptureOptionCatalog.options(for: .exposureCompensation)
+
+    private var currentIndex: Double {
+        guard let rawValue,
+              let index = options.firstIndex(where: { $0.rawValue == rawValue }) else {
+            return selectedIndex
+        }
+        return Double(index)
+    }
+
+    private var selectedOption: CaptureOption {
+        let index = min(max(Int(selectedIndex.rounded()), 0), options.count - 1)
+        return options[index]
+    }
+
+    var body: some View {
+        GeometryReader { proxy in
+            let trackTop: CGFloat = 4
+            let trackBottom = trackTop + max(1, proxy.size.height - 42)
+            let trackHeight = trackBottom - trackTop
+            let knobY = trackTop + CGFloat(1 - selectedIndex / Double(max(options.count - 1, 1))) * trackHeight
+
+            ZStack(alignment: .topLeading) {
+                Path { path in
+                    path.move(to: CGPoint(x: 45, y: trackTop))
+                    path.addLine(to: CGPoint(x: 45, y: trackBottom))
+                }
+                .stroke(.white.opacity(0.86), style: StrokeStyle(lineWidth: 2, lineCap: .round))
+
+                ForEach(-4...4, id: \.self) { halfStep in
+                    let ev = Double(halfStep) / 2
+                    let y = trackTop + CGFloat(1 - (ev + 2) / 4) * trackHeight
+                    let isMajor = halfStep.isMultiple(of: 2)
+                    Capsule()
+                        .fill(.white.opacity(isMajor ? 0.9 : 0.58))
+                        .frame(width: isMajor ? 13.5 : 6.75, height: isMajor ? 2 : 1)
+                        .position(x: isMajor ? 38 : 41.5, y: y)
+
+                    if isMajor {
+                        Text(String(format: "%+.0f", ev))
+                            .font(.caption2.monospacedDigit().weight(.medium))
+                            .foregroundStyle(.white.opacity(0.92))
+                            .frame(width: 32, alignment: .trailing)
+                            .position(x: 8, y: y)
+                    }
+                }
+
+                Circle()
+                    .fill(.orange)
+                    .frame(width: 10, height: 10)
+                    .position(x: 45, y: knobY)
+
+                Text(selectedOption.title)
+                    .font(.caption.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 64)
+                    .position(x: 31, y: trackBottom + 18)
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        isDragging = true
+                        let fraction = min(max((value.location.y - trackTop) / trackHeight, 0), 1)
+                        selectedIndex = Double(options.count - 1) * Double(1 - fraction)
+                    }
+                    .onEnded { _ in
+                        selectedIndex = selectedIndex.rounded()
+                        isDragging = false
+                        onCommit(selectedOption.rawValue)
+                    }
+            )
+            .onAppear {
+                selectedIndex = currentIndex
+            }
+            .onChange(of: rawValue) { _, _ in
+                if !isDragging {
+                    selectedIndex = currentIndex
+                }
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("曝光补偿")
+            .accessibilityValue(selectedOption.title)
+            .accessibilityAdjustableAction { direction in
+                switch direction {
+                case .increment:
+                    selectedIndex = min(selectedIndex.rounded() + 1, Double(options.count - 1))
+                case .decrement:
+                    selectedIndex = max(selectedIndex.rounded() - 1, 0)
+                @unknown default:
+                    break
+                }
+                onCommit(selectedOption.rawValue)
+            }
+        }
+        .frame(minHeight: 80)
     }
 }
 

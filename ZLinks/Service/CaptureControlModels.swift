@@ -24,7 +24,7 @@ enum CaptureParameter: UInt16, CaseIterable, Hashable, Identifiable, Sendable {
         case .focusMode: return "对焦模式"
         case .meteringMode: return "测光模式"
         case .shutterSpeed: return "快门"
-        case .exposureMode: return "曝光模式"
+        case .exposureMode: return "模式"
         case .iso: return "ISO"
         case .exposureCompensation: return "曝光补偿"
         }
@@ -173,7 +173,7 @@ enum CaptureOptionCatalog {
     }
 
     private static let exposureCompensationOptions: [CaptureOption] = {
-        (-15 ... 15).map { step in
+        (-6 ... 6).map { step in
             let raw = Int16(clamping: Int64((Double(step) * 1_000 / 3).rounded()))
             let stored = UInt64(UInt16(bitPattern: raw))
             let value = Double(raw) / 1_000
@@ -232,7 +232,10 @@ enum CaptureOptionCatalog {
         CaptureOption(rawValue: 0x0002, title: "P"),
         CaptureOption(rawValue: 0x0003, title: "A"),
         CaptureOption(rawValue: 0x0004, title: "S"),
-        CaptureOption(rawValue: 0x8010, title: "AUTO")
+        CaptureOption(rawValue: 0x8010, title: "AUTO"),
+        CaptureOption(rawValue: 0x8050, title: "U1"),
+        CaptureOption(rawValue: 0x8051, title: "U2"),
+        CaptureOption(rawValue: 0x8052, title: "U3")
     ]
 }
 
