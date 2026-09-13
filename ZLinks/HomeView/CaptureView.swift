@@ -1183,9 +1183,8 @@ private struct CaptureLiveViewStatusBar: View {
             }
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 9)
+        .padding(.vertical, 4)
         .frame(maxWidth: .infinity)
-        .glassEffect(.regular, in: .rect(cornerRadius: 22))
     }
 }
 
