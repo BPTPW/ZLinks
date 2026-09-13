@@ -328,6 +328,8 @@ final class CameraConnectionService: ObservableObject {
 
             cameraInfo = try parseDeviceInfo(deviceInfo)
             appendLog("DeviceInfo 解析成功 manufacturer=\(cameraInfo?.manufacturer ?? ""), model=\(cameraInfo?.model ?? ""), serial=\(cameraInfo?.serialNumber ?? "")")
+            await logFocusModePropertyDescription(propertyCode: 0xD061, on: command)
+            await logFocusModePropertyDescription(propertyCode: 0x500A, on: command)
             cameraStatus = await readCameraStatus(on: command)
             lensInfo = await readLensInfo(on: command)
             connectedHost = displayHost
@@ -969,8 +971,8 @@ final class CameraConnectionService: ObservableObject {
         do {
             var response = try await operation(
                 .setDevicePropValue,
-                parameters: [UInt32(parameter.rawValue)],
-                dataPhase: .send(parameter.standardData(for: rawValue)),
+                parameters: [UInt32(parameter.writePropertyCode(for: rawValue))],
+                dataPhase: .send(parameter.writeData(for: rawValue)),
                 on: commandConnection,
                 logStyle: .compact,
                 timeout: .seconds(5)
@@ -978,6 +980,7 @@ final class CameraConnectionService: ObservableObject {
 
             var usedFallback = false
             if response.code != PTPResponseCode.ok.rawValue,
+               !(parameter == .focusMode && rawValue == 5),
                let fallbackCode = parameter.fallbackPropertyCode,
                let fallbackData = parameter.fallbackData(for: rawValue) {
                 appendLog(
@@ -1009,7 +1012,8 @@ final class CameraConnectionService: ObservableObject {
             // Let the body settle before refreshing the real value. This keeps
             // the UI truthful when the camera clamps a value to its own steps.
             try? await Task.sleep(for: .milliseconds(180))
-            if let actualValue = await readCaptureParameter(parameter, on: commandConnection) {
+            let actualValue = await readCaptureParameter(parameter, on: commandConnection)
+            if let actualValue {
                 captureParameters[parameter] = actualValue
                 appendLog("[capture] 参数回读 name=\(parameter.title) raw=\(actualValue)")
             }
@@ -2646,6 +2650,124 @@ final class CameraConnectionService: ObservableObject {
         }
         return readIntegerValue(from: data)
     }
+
+    private func logFocusModePropertyDescription(propertyCode: UInt16, on connection: NWConnection) async {
+        guard let response = try? await operation(
+            .getDevicePropDesc,
+            parameters: [UInt32(propertyCode)],
+            dataPhase: .receive,
+            on: connection,
+            logStyle: .compact,
+            timeout: .seconds(4)
+        ) else {
+            appendLog("[对焦模式] property=0x\(String(format: "%04X", propertyCode)) GetDevicePropDesc 请求异常")
+            return
+        }
+
+        guard response.code == PTPResponseCode.ok.rawValue, let data = response.data else {
+            appendLog("[对焦模式] property=0x\(String(format: "%04X", propertyCode)) GetDevicePropDesc 失败 code=0x\(String(format: "%04X", response.code))")
+            return
+        }
+
+        guard let description = parseFocusModePropertyDescription(data, expectedPropertyCode: propertyCode) else {
+            appendLog("[对焦模式] property=0x\(String(format: "%04X", propertyCode)) GetDevicePropDesc 无法解析 bytes=\(data.count) hex=\(data.hexDump)")
+            return
+        }
+
+        appendLog(
+            "[对焦模式] property code=0x\(String(format: "%04X", description.propertyCode)) " +
+                "data type=\(description.dataTypeName) Get/Set=\(description.getSet) " +
+                "当前值=0x\(String(format: "%04X", description.currentValue)) " +
+                "FormFlag=0x\(String(format: "%02X", description.formFlag)) " +
+                "所有允许值=\(description.allowedValues)"
+        )
+    }
+
+    private func parseFocusModePropertyDescription(
+        _ data: Data,
+        expectedPropertyCode: UInt16
+    ) -> FocusModePropertyDescription? {
+        guard data.count >= 7, data.uint16(at: 0) == expectedPropertyCode else { return nil }
+
+        let dataType = data.uint16(at: 2)
+        let valueWidth: Int
+        let dataTypeName: String
+        switch dataType {
+        case 0x0002:
+            valueWidth = 1
+            dataTypeName = "UINT8"
+        case 0x0004:
+            valueWidth = 2
+            dataTypeName = "UINT16"
+        case 0x0006:
+            valueWidth = 4
+            dataTypeName = "UINT32"
+        default:
+            return nil
+        }
+
+        let formFlagOffset = 5 + valueWidth * 2
+        guard data.count > formFlagOffset else { return nil }
+        let currentValue = readUnsignedInteger(data, at: 5 + valueWidth, width: valueWidth)
+        let getSet = data[4] == 0 ? "只读" : "可写"
+        let formFlag = data[formFlagOffset]
+        let allowedValues: String
+        switch formFlag {
+        case 0x00:
+            allowedValues = "无（FormFlag=0x00）"
+        case 0x01:
+            let valueStart = formFlagOffset + 1
+            guard data.count >= valueStart + valueWidth * 3 else { return nil }
+            let minimum = readUnsignedInteger(data, at: valueStart, width: valueWidth)
+            let maximum = readUnsignedInteger(data, at: valueStart + valueWidth, width: valueWidth)
+            let step = readUnsignedInteger(data, at: valueStart + valueWidth * 2, width: valueWidth)
+            allowedValues = "范围[min=0x\(String(format: "%04X", minimum)), max=0x\(String(format: "%04X", maximum)), step=0x\(String(format: "%04X", step))]"
+        case 0x02:
+            let countOffset = formFlagOffset + 1
+            guard data.count >= countOffset + 2 else { return nil }
+            let count = Int(data.uint16(at: countOffset))
+            var offset = countOffset + 2
+            var values: [String] = []
+            for _ in 0..<count {
+                guard offset + valueWidth <= data.count else { return nil }
+                let value = readUnsignedInteger(data, at: offset, width: valueWidth)
+                values.append("0x\(String(format: "%04X", value))=\(focusModeTitle(value))")
+                offset += valueWidth
+            }
+            allowedValues = "[\(values.joined(separator: ", "))]"
+        default:
+            allowedValues = "未知FormFlag，原始值=0x\(String(format: "%02X", formFlag))"
+        }
+        return FocusModePropertyDescription(
+            propertyCode: data.uint16(at: 0),
+            dataTypeName: dataTypeName,
+            getSet: getSet,
+            currentValue: currentValue,
+            formFlag: formFlag,
+            allowedValues: allowedValues
+        )
+    }
+
+    private func readUnsignedInteger(_ data: Data, at offset: Int, width: Int) -> UInt64 {
+        switch width {
+        case 1: return UInt64(data[offset])
+        case 2: return UInt64(data.uint16(at: offset))
+        case 4: return UInt64(data.uint32(at: offset))
+        default: return 0
+        }
+    }
+
+    private func focusModeTitle(_ value: UInt64) -> String {
+        switch value {
+        case 0: return "AF-S"
+        case 1: return "AF-C"
+        case 2: return "AF-F"
+        case 5: return "AF-A"
+        case 4: return "MF"
+        default: return "未知(0x\(String(format: "%02X", value)))"
+        }
+    }
+
     private func readIntegerValue(from data: Data) -> UInt64? {
         switch data.count {
         case 0:
@@ -2899,6 +3021,15 @@ private struct PTPResponse {
     }
 }
 
+private struct FocusModePropertyDescription {
+    let propertyCode: UInt16
+    let dataTypeName: String
+    let getSet: String
+    let currentValue: UInt64
+    let formFlag: UInt8
+    let allowedValues: String
+}
+
 private struct PTPIPPacket {
     let type: UInt32
     let payload: Data
@@ -2951,6 +3082,7 @@ private enum PTPOperationCode: UInt16 {
     case getThumb = 0x100a
     case getPartialObject = 0x101b
     case getDevicePropValue = 0x1015
+    case getDevicePropDesc = 0x1014
     case setDevicePropValue = 0x1016
     case getObjectPropValue = 0x9803
     case deviceReady = 0x90c8
@@ -2976,6 +3108,7 @@ private enum PTPOperationCode: UInt16 {
         case .getThumb: return "GetThumb"
         case .getPartialObject: return "GetPartialObject"
         case .getDevicePropValue: return "GetDevicePropValue"
+        case .getDevicePropDesc: return "GetDevicePropDesc"
         case .setDevicePropValue: return "SetDevicePropValue"
         case .getObjectPropValue: return "GetObjectPropValue"
         case .deviceReady: return "DeviceReady"

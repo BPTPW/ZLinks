@@ -72,6 +72,7 @@ enum CaptureParameter: UInt16, CaseIterable, Hashable, Identifiable, Sendable {
             let scaled = UInt32(max(1, min(Double(UInt32.max), (seconds * 10_000).rounded())))
             return captureUInt32Data(scaled)
         case .focusMode:
+            // Nikon's D061 live-view focus mode uses a single-byte value.
             return captureUInt8Data(UInt8(clamping: value))
         case .iso:
             return captureUInt16Data(UInt16(clamping: value))
@@ -80,6 +81,14 @@ enum CaptureParameter: UInt16, CaseIterable, Hashable, Identifiable, Sendable {
         case .whiteBalance, .aperture, .meteringMode, .exposureMode:
             return captureUInt16Data(UInt16(clamping: value))
         }
+    }
+
+    func writePropertyCode(for value: UInt64) -> UInt16 {
+        return rawValue
+    }
+
+    func writeData(for value: UInt64) -> Data {
+        return standardData(for: value)
     }
 
     func fallbackData(for value: UInt64) -> Data? {
@@ -124,6 +133,7 @@ enum CaptureParameter: UInt16, CaseIterable, Hashable, Identifiable, Sendable {
         case 0: return 0x8010 // AF-S
         case 1: return 0x8011 // AF-C
         case 2: return 0x8013 // AF-F
+        case 5: return 0x8012 // AF-A
         case 4: return 0x0001 // MF
         default: return UInt16(clamping: liveViewValue)
         }
@@ -134,7 +144,9 @@ enum CaptureParameter: UInt16, CaseIterable, Hashable, Identifiable, Sendable {
         case 0x8010: return 0
         case 0x8011: return 1
         case 0x8013: return 2
+        case 0x8012: return 5
         case 0x0001: return 4
+        case 0x0005: return 5 // AF-A on some standard FocusMode implementations
         default: return value
         }
     }
@@ -254,6 +266,7 @@ enum CaptureOptionCatalog {
     private static let focusModeOptions: [CaptureOption] = [
         CaptureOption(rawValue: 0, title: "AF-S"),
         CaptureOption(rawValue: 1, title: "AF-C"),
+        CaptureOption(rawValue: 5, title: "AF-A"),
         CaptureOption(rawValue: 4, title: "MF")
     ]
 
