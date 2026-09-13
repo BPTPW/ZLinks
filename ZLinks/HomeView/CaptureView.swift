@@ -925,8 +925,6 @@ private struct CaptureGlassKey: View {
 }
 
 private struct CaptureSliderEditor: View {
-    @EnvironmentObject private var camera: CameraConnectionService
-
     let parameter: CaptureParameter
     let options: [CaptureOption]
     @Binding var selectedIndex: Double
@@ -972,30 +970,34 @@ private struct CaptureSliderEditor: View {
                 .minimumScaleFactor(0.55)
                 .contentTransition(.numericText())
 
-            VStack(spacing: 8) {
-                Slider(value: sliderBinding, in: 0...Double(max(options.count - 1, 1)), step: 1)
+            if parameter.usesPresetSelection {
+                ScrollView(.vertical) {
+                    presetOptionsView
+                    .padding(2)
+                }
+                .frame(maxHeight: 220)
+            } else {
+                VStack(spacing: 8) {
+                    Slider(
+                        value: sliderBinding,
+                        in: 0...Double(max(options.count - 1, 1)),
+                        step: 1,
+                        onEditingChanged: { isEditing in
+                            if !isEditing {
+                                onValueChanged(selectedOption.rawValue)
+                            }
+                        }
+                    )
                     .tint(.orange)
 
-                HStack {
-                    Text(options.first?.title ?? "--")
-                    Spacer()
-                    Text("\(safeIndex + 1) / \(options.count)")
-                    Spacer()
-                    Text(options.last?.title ?? "--")
+                    HStack {
+                        Text(options.first?.title ?? "--")
+                        Spacer()
+                        Text(options.last?.title ?? "--")
+                    }
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
                 }
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
-            }
-
-            if camera.isCaptureControlBusy {
-                HStack(spacing: 8) {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text("正在同步到相机…")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
-                .transition(.opacity)
             }
         }
         .padding(22)
@@ -1008,10 +1010,109 @@ private struct CaptureSliderEditor: View {
             get: { selectedIndex },
             set: { newValue in
                 selectedIndex = newValue
-                let index = min(max(Int(newValue.rounded()), 0), options.count - 1)
-                onValueChanged(options[index].rawValue)
             }
         )
+    }
+
+    private func isSelected(_ option: CaptureOption) -> Bool {
+        option.rawValue == selectedOption.rawValue
+    }
+
+    @ViewBuilder
+    private var presetOptionsView: some View {
+        if parameter == .focusMode {
+            LazyVGrid(
+                columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 3),
+                spacing: 10
+            ) {
+                ForEach(options) { option in
+                    presetOptionButton(option)
+                }
+            }
+        } else if parameter == .exposureMode {
+            Grid(horizontalSpacing: 10, verticalSpacing: 10) {
+                GridRow {
+                    ForEach(options.prefix(2)) { option in
+                        presetOptionButton(option, isCircular: true)
+                    }
+                }
+
+                GridRow {
+                    ForEach(options.dropFirst(2).prefix(2)) { option in
+                        presetOptionButton(option, isCircular: true)
+                    }
+                }
+
+                if options.count > 4 {
+                    GridRow {
+                        presetOptionButton(options[4], isCircular: true)
+                    }
+                }
+            }
+        } else {
+            LazyVGrid(
+                columns: [GridItem(.adaptive(minimum: 120), spacing: 10)],
+                spacing: 10
+            ) {
+                ForEach(options) { option in
+                    presetOptionButton(option)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func presetOptionButton(
+        _ option: CaptureOption,
+        isCircular: Bool = false
+    ) -> some View {
+        if isSelected(option) {
+            presetOptionButtonBase(option, isCircular: isCircular)
+                .buttonStyle(.glassProminent)
+        } else {
+            presetOptionButtonBase(option, isCircular: isCircular)
+                .buttonStyle(.glass)
+        }
+    }
+
+    private func presetOptionButtonBase(
+        _ option: CaptureOption,
+        isCircular: Bool
+    ) -> some View {
+        Button {
+            selectedIndex = Double(options.firstIndex(of: option) ?? 0)
+            onValueChanged(option.rawValue)
+        } label: {
+            Text(option.title)
+                .font(.body.weight(.semibold))
+                .foregroundStyle(optionTextColor(for: option))
+                .frame(
+                    maxWidth: isCircular ? nil : .infinity,
+                    minHeight: isCircular ? 52 : 42
+                )
+                .frame(width: isCircular ? 52 : nil)
+        }
+        .clipShape(
+            isCircular
+                ? AnyShape(Circle())
+                : AnyShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        )
+        .contentShape(
+            isCircular
+                ? AnyShape(Circle())
+                : AnyShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        )
+        .accessibilityLabel(option.title)
+    }
+
+    private func optionTextColor(for option: CaptureOption) -> Color {
+        if isSelected(option) {
+            return .white
+        }
+        if parameter == .exposureMode, option.title == "AUTO" {
+            return .green
+        }
+        return .primary
     }
 }
 

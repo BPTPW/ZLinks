@@ -829,9 +829,9 @@ final class CameraConnectionService: ObservableObject {
         )
     }
 
-    /// Queue a live slider value. Intermediate values are coalesced while a
-    /// PTP transaction is in flight, so dragging never backs up the command
-    /// channel and the camera always converges on the latest position.
+    /// Queue a capture parameter write. Values are coalesced while a PTP
+    /// transaction is in flight, and the accepted value is read back after
+    /// the write so the UI reflects the camera's actual state.
     func queueCaptureParameter(_ parameter: CaptureParameter, rawValue: UInt64) {
         guard case .connected = state else {
             captureControlError = "相机未连接。"

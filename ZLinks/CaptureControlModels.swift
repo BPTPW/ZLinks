@@ -43,6 +43,15 @@ enum CaptureParameter: UInt16, CaseIterable, Hashable, Identifiable, Sendable {
         }
     }
 
+    var usesPresetSelection: Bool {
+        switch self {
+        case .whiteBalance, .focusMode, .meteringMode, .exposureMode:
+            return true
+        case .aperture, .shutterSpeed, .iso, .exposureCompensation:
+            return false
+        }
+    }
+
     /// Nikon Z bodies expose the same shutter value through 0xD100 when
     /// the standard 0x500D property cannot be written.
     var nikonFallbackCode: UInt16? {
