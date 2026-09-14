@@ -70,7 +70,9 @@ struct CaptureView: View {
 
             await withTaskCancellationHandler {
                 while !Task.isCancelled {
-                    try? await Task.sleep(for: .seconds(3600))
+                    try? await Task.sleep(for: .seconds(1))
+                    if Task.isCancelled { break }
+                    await camera.refreshCaptureParameters()
                 }
             } onCancel: {
                 Task { @MainActor in
@@ -109,7 +111,6 @@ struct CaptureView: View {
                 title: "曝光",
                 parameters: leftRailParameters,
                 showsLocalKeys: false,
-                showsRefresh: false,
                 showsGrid: $showsGrid,
                 mirrorsPreview: $mirrorsPreview,
                 onSelect: openEditor
@@ -126,7 +127,6 @@ struct CaptureView: View {
                 title: "对焦 / 监看",
                 parameters: rightRailParameters,
                 showsLocalKeys: true,
-                showsRefresh: true,
                 showsGrid: $showsGrid,
                 mirrorsPreview: $mirrorsPreview,
                 onSelect: openEditor
@@ -359,16 +359,12 @@ private struct CaptureFullscreenMonitor: View {
             0,
             canvasSize.width - (sideColumnMinWidth * 2)
         )
-        let statusBarReservedHeight: CGFloat = 52
-        let availablePreviewHeight = max(0, canvasSize.height - statusBarReservedHeight)
+        let availablePreviewHeight = max(0, canvasSize.height)
         let previewWidth = min(availablePreviewWidth, availablePreviewHeight * 4 / 3)
         let sideColumnWidth = max(sideColumnMinWidth, (canvasSize.width - availablePreviewWidth)/2)
 
         ZStack {
             VStack(spacing: 8) {
-                CaptureLiveViewStatusBar()
-                    .environment(\.colorScheme, .dark)
-
                 HStack(alignment: .center) {
                     CaptureFullscreenReadouts(
                         parameters: leftRailParameters,
@@ -506,7 +502,7 @@ private struct CaptureFullscreenMonitor: View {
                 VStack(spacing: 10) {
                     ProgressView()
                         .tint(.white)
-                    Text(camera.liveViewError ?? "等待实时画面…")
+                    Text(camera.liveViewError ?? "等待图传…")
                         .font(.subheadline)
                         .foregroundStyle(.white.opacity(0.82))
                 }
@@ -525,6 +521,9 @@ private struct CaptureFullscreenMonitor: View {
                 .frame(width: 62, height: proxy.size.height / 3 + 42)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
             }
+
+            CaptureFullscreenVideoStatusOverlay()
+                .allowsHitTesting(false)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -545,6 +544,172 @@ private struct CaptureFullscreenMonitor: View {
     private var isConnected: Bool {
         if case .connected = camera.state { return true }
         return false
+    }
+}
+
+private struct CaptureFullscreenVideoStatusOverlay: View {
+    @EnvironmentObject private var camera: CameraConnectionService
+
+    private var connectionTitle: String {
+        switch camera.state {
+        case .connected where camera.liveViewImage != nil:
+            return "实时"
+        case .connected where camera.isLiveViewActive:
+            return "启动中"
+        case .connected:
+            return camera.liveViewError == nil ? "等待图传" : "不可用"
+        case .connecting:
+            return "连接中"
+        default:
+            return "未连接"
+        }
+    }
+
+    private var connectionColor: Color {
+        switch camera.state {
+        case .connected where camera.liveViewImage != nil:
+            return .green
+        case .connected where camera.isLiveViewActive:
+            return .yellow
+        case .connected:
+            return camera.liveViewError == nil ? .yellow : .orange
+        case .connecting:
+            return .yellow
+        default:
+            return .gray
+        }
+    }
+
+    private var exposureModeText: String {
+        CaptureOptionCatalog.displayedValue(
+            for: .exposureMode,
+            rawValue: camera.captureParameters[.exposureMode]
+        )
+    }
+
+    private var frameRateText: String {
+        guard let frameRate = camera.liveViewFrameRate else { return "-- fps" }
+        return String(format: "%.1f fps", frameRate)
+    }
+
+    private var batteryText: String {
+        guard case .connected = camera.state,
+              let batteryLevel = camera.cameraStatus.batteryLevel
+        else { return "--%" }
+        return "\(batteryLevel)%"
+    }
+
+    private var storageUsedRatio: Double {
+        guard let free = camera.cameraStatus.storageFreeBytes,
+              let total = camera.cameraStatus.storageTotalBytes,
+              total > 0
+        else { return 0 }
+        let used = total > free ? total - free : 0
+        return min(max(Double(used) / Double(total), 0), 1)
+    }
+
+    private var storageUsedText: String {
+        guard let free = camera.cameraStatus.storageFreeBytes,
+              let total = camera.cameraStatus.storageTotalBytes
+        else { return "-- /" }
+        let used = total > free ? total - free : 0
+        return "\(formatBytes(used)) /"
+    }
+
+    private var storageTotalText: String {
+        guard let total = camera.cameraStatus.storageTotalBytes else { return "--" }
+        return formatBytes(total)
+    }
+
+    var body: some View {
+        ZStack {
+            VStack {
+                HStack(alignment: .top) {
+                    connectionReadout
+                    Spacer()
+                    HStack(spacing: 6) {
+                        statusValue(exposureModeText, color: exposureModeText == "AUTO" ? .green : .white)
+                            .frame(width: 36)
+                        statusValue(frameRateText)
+                            .frame(width: 66)
+                        statusValue(batteryText)
+                            .frame(width: 44)
+                    }
+                }
+                Spacer()
+            }
+
+            VStack {
+                Spacer()
+                HStack {
+                    storageReadout
+                    Spacer()
+                }
+            }
+        }
+        .padding(12)
+    }
+
+    private var connectionReadout: some View {
+        HStack(spacing: 7) {
+            Circle()
+                .fill(connectionColor)
+                .frame(width: 8, height: 8)
+            Text(connectionTitle)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(.black.opacity(0.52), in: Capsule())
+    }
+
+    private var storageReadout: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "sdcard.fill")
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(.white)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(storageUsedText)
+                    .font(.caption.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+
+                Text(storageTotalText)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.white.opacity(0.8))
+                    .lineLimit(1)
+
+                GeometryReader { proxy in
+                    ZStack(alignment: .leading) {
+                        Capsule()
+                            .fill(.white.opacity(0.32))
+                        Capsule()
+                            .fill(.white)
+                            .frame(width: proxy.size.width * storageUsedRatio)
+                    }
+                }
+                .frame(height: 4)
+            }
+            .frame(width: 76)
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 8)
+        .background(.black.opacity(0.52), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private func statusValue(_ value: String, color: Color = .white) -> some View {
+        Text(value)
+            .font(.caption.weight(.bold).monospacedDigit())
+            .foregroundStyle(color)
+            .lineLimit(1)
+            .minimumScaleFactor(0.7)
+            .shadow(color: .black.opacity(0.9), radius: 3, x: 0, y: 1)
+    }
+
+    private func formatBytes(_ bytes: UInt64) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
     }
 }
 
@@ -598,21 +763,6 @@ private struct CaptureFullscreenMoreOptions: View {
     var body: some View {
         ScrollView(.vertical) {
             VStack(spacing: 8) {
-                HStack {
-                    Spacer()
-                    Button {
-                        Task { await camera.refreshCaptureParameters() }
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                            .font(.caption.weight(.bold))
-                            .frame(width: 28, height: 28)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.white)
-                    .disabled(!isConnected || camera.isRefreshingCaptureParameters || camera.isCaptureControlBusy)
-                    .accessibilityLabel("刷新相机参数")
-                }
-
                 ForEach(parameters) { parameter in
                     CaptureGlassKey(
                         title: parameter.title,
@@ -679,7 +829,6 @@ private struct CaptureSideRail: View {
     let title: String
     let parameters: [CaptureParameter]
     let showsLocalKeys: Bool
-    let showsRefresh: Bool
     @Binding var showsGrid: Bool
     @Binding var mirrorsPreview: Bool
     let onSelect: (CaptureParameter) -> Void
@@ -695,20 +844,6 @@ private struct CaptureSideRail: View {
                         .minimumScaleFactor(0.75)
 
                     Spacer(minLength: 0)
-
-                    if showsRefresh {
-                        Button {
-                            Task { await camera.refreshCaptureParameters() }
-                        } label: {
-                            Image(systemName: "arrow.clockwise")
-                                .font(.caption.weight(.bold))
-                                .frame(width: 26, height: 26)
-                        }
-                        .buttonStyle(.plain)
-                        .glassEffect(.regular.interactive(), in: .circle)
-                        .disabled(!isConnected || camera.isRefreshingCaptureParameters || camera.isCaptureControlBusy)
-                        .accessibilityLabel("刷新相机参数")
-                    }
                 }
                 .padding(.horizontal, 4)
 

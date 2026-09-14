@@ -53,6 +53,15 @@ struct MyCameraView: View {
             .fullScreenCover(isPresented: $isDebugLogPresented) {
                 CameraDebugLogView(camera: camera)
             }
+            .task(id: camera.state) {
+                guard case .connected = camera.state else { return }
+
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(3))
+                    if Task.isCancelled { break }
+                    await camera.refreshCameraStatus()
+                }
+            }
         }
     }
 
