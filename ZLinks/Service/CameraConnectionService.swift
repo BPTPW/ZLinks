@@ -11,6 +11,7 @@ import UIKit
 @MainActor
 final class CameraConnectionService: ObservableObject {
     static let autoConnectOnLaunchKey = "camera.autoConnectOnLaunch"
+    static let liveViewRefreshIntervalSeconds: TimeInterval = 3
 
     enum State: Equatable {
         case disconnected
@@ -175,6 +176,7 @@ final class CameraConnectionService: ObservableObject {
     @Published private(set) var isLiveViewActive = false
     @Published private(set) var liveViewError: String?
     @Published private(set) var liveViewFrameRate: Double?
+    @Published private(set) var isRefreshingLiveViewFrame = false
     @Published private(set) var captureParameters: [CaptureParameter: UInt64] = [:]
     @Published private(set) var isRefreshingCaptureParameters = false
     @Published private(set) var activeCaptureWrite: CaptureParameter?
@@ -207,6 +209,7 @@ final class CameraConnectionService: ObservableObject {
     private var liveViewConsumers = 0
     private var liveViewFrameCount = 0
     private var liveViewFrameWindowStart = Date()
+    private var liveViewFetchInFlight = false
     private var lastEndpoint: NWEndpoint?
     private var lastDisplayHost: String?
     private var reconnectTask: Task<Void, Never>?
@@ -1103,6 +1106,46 @@ final class CameraConnectionService: ObservableObject {
         await endLiveViewSession()
     }
 
+    /// Immediately fetch one live-view frame without waiting for the automatic refresh cycle.
+    func refreshLiveViewFrame() async {
+        guard liveViewConsumers > 0,
+              isLiveViewActive,
+              case .connected = state
+        else { return }
+
+        isRefreshingLiveViewFrame = true
+        defer { isRefreshingLiveViewFrame = false }
+
+        // Join an automatic/manual fetch already in progress instead of issuing a duplicate PTP request.
+        while liveViewFetchInFlight, !Task.isCancelled {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+
+        guard !Task.isCancelled,
+              liveViewConsumers > 0,
+              isLiveViewActive,
+              case .connected = state,
+              let commandConnection
+        else { return }
+
+        let generation = liveViewGeneration
+        do {
+            _ = try await fetchAndApplyLiveViewFrame(
+                on: commandConnection,
+                generation: generation
+            )
+        } catch is CancellationError {
+            return
+        } catch {
+            guard generation == liveViewGeneration,
+                  liveViewConsumers > 0,
+                  isLiveViewActive
+            else { return }
+            liveViewError = error.localizedDescription
+            appendLog("[liveview] 手动刷新失败 error=\(error.localizedDescription)")
+        }
+    }
+
     private func beginLiveViewSession() async {
         guard case .connected = state, let commandConnection else {
             liveViewError = "相机未连接"
@@ -1124,6 +1167,7 @@ final class CameraConnectionService: ObservableObject {
         isLiveViewActive = false
         liveViewImage = nil
         liveViewFrameRate = nil
+        isRefreshingLiveViewFrame = false
         liveViewFrameCount = 0
         liveViewFrameWindowStart = Date()
         appendLog("[liveview] 开始启动实时图传 generation=\(generation)")
@@ -1156,6 +1200,7 @@ final class CameraConnectionService: ObservableObject {
         isLiveViewActive = false
         liveViewImage = nil
         liveViewFrameRate = nil
+        isRefreshingLiveViewFrame = false
         liveViewFrameCount = 0
         liveViewFrameWindowStart = Date()
         if !sendEndCommand {
@@ -1266,10 +1311,9 @@ final class CameraConnectionService: ObservableObject {
               liveViewConsumers > 0,
               case .connected = state,
               let commandConnection {
+            let refreshStartedAt = Date()
             do {
-                if let frame = try await fetchLiveViewFrame(on: commandConnection) {
-                    liveViewImage = frame
-                    liveViewError = nil
+                if try await fetchAndApplyLiveViewFrame(on: commandConnection, generation: generation) {
                     consecutiveFailures = 0
                     liveViewFrameCount += 1
                     let now = Date()
@@ -1297,13 +1341,41 @@ final class CameraConnectionService: ObservableObject {
                 try? await Task.sleep(for: .milliseconds(120))
                 continue
             }
-            // Yield the command channel so gallery/status requests can interleave.
-            try? await Task.sleep(for: .milliseconds(33))
+            // Keep a fixed refresh cadence and leave bandwidth for status/gallery requests.
+            let elapsed = Date().timeIntervalSince(refreshStartedAt)
+            let remaining = max(0, Self.liveViewRefreshIntervalSeconds - elapsed)
+            try? await Task.sleep(for: .seconds(remaining))
         }
         if generation == liveViewGeneration {
             isLiveViewActive = false
         }
         appendLog("[liveview] 拉流循环结束 generation=\(generation)")
+    }
+
+    private func fetchAndApplyLiveViewFrame(
+        on connection: NWConnection,
+        generation: Int
+    ) async throws -> Bool {
+        guard generation == liveViewGeneration,
+              liveViewConsumers > 0,
+              isLiveViewActive,
+              case .connected = state,
+              !liveViewFetchInFlight
+        else { return false }
+
+        liveViewFetchInFlight = true
+        defer { liveViewFetchInFlight = false }
+
+        guard let frame = try await fetchLiveViewFrame(on: connection),
+              generation == liveViewGeneration,
+              liveViewConsumers > 0,
+              isLiveViewActive,
+              case .connected = state
+        else { return false }
+
+        liveViewImage = frame
+        liveViewError = nil
+        return true
     }
 
     private func fetchLiveViewFrame(on connection: NWConnection) async throws -> UIImage? {

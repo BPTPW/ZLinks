@@ -524,6 +524,10 @@ private struct CaptureFullscreenMonitor: View {
 
             CaptureFullscreenVideoStatusOverlay()
                 .allowsHitTesting(false)
+
+            CaptureLiveViewRefreshButton(foregroundStyle: .white, size: 34)
+                .padding(12)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -587,9 +591,8 @@ private struct CaptureFullscreenVideoStatusOverlay: View {
         )
     }
 
-    private var frameRateText: String {
-        guard let frameRate = camera.liveViewFrameRate else { return "-- fps" }
-        return String(format: "%.1f fps", frameRate)
+    private var refreshIntervalText: String {
+        "\(Int(CameraConnectionService.liveViewRefreshIntervalSeconds)) 秒"
     }
 
     private var batteryText: String {
@@ -630,7 +633,7 @@ private struct CaptureFullscreenVideoStatusOverlay: View {
                     HStack(spacing: 6) {
                         statusValue(exposureModeText, color: exposureModeText == "AUTO" ? .green : .white)
                             .frame(width: 36)
-                        statusValue(frameRateText)
+                        statusValue(refreshIntervalText)
                             .frame(width: 66)
                         statusValue(batteryText)
                             .frame(width: 44)
@@ -1293,9 +1296,8 @@ private struct CaptureLiveViewStatusBar: View {
         }
     }
 
-    private var frameRateText: String {
-        guard let frameRate = camera.liveViewFrameRate else { return "--" }
-        return String(format: "%.1f", frameRate)
+    private var refreshIntervalText: String {
+        "\(Int(CameraConnectionService.liveViewRefreshIntervalSeconds)) 秒"
     }
 
     private var batteryText: String {
@@ -1327,13 +1329,46 @@ private struct CaptureLiveViewStatusBar: View {
 
             HStack(spacing: 16) {
                 CaptureLiveViewMetric(title: "模式", value: exposureModeText)
-                CaptureLiveViewMetric(title: "帧率", value: frameRateText)
+                CaptureLiveViewMetric(title: "刷新", value: refreshIntervalText)
                 CaptureLiveViewMetric(title: "电量", value: batteryText)
             }
+
+            CaptureLiveViewRefreshButton()
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 4)
         .frame(maxWidth: .infinity)
+    }
+}
+
+private struct CaptureLiveViewRefreshButton: View {
+    @EnvironmentObject private var camera: CameraConnectionService
+
+    var foregroundStyle: Color = .primary
+    var size: CGFloat = 30
+
+    var body: some View {
+        Button {
+            Task { await camera.refreshLiveViewFrame() }
+        } label: {
+            Group {
+                if camera.isRefreshingLiveViewFrame {
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(foregroundStyle)
+                } else {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.subheadline.bold())
+                        .foregroundStyle(foregroundStyle)
+                }
+            }
+            .frame(width: size, height: size)
+        }
+        .buttonStyle(.plain)
+        .glassEffect(.regular.interactive(), in: .circle)
+        .disabled(!camera.isLiveViewActive || camera.isRefreshingLiveViewFrame)
+        .opacity(camera.isLiveViewActive ? 1 : 0.42)
+        .accessibilityLabel("刷新监看画面")
     }
 }
 
