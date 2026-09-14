@@ -29,6 +29,10 @@ struct GalleryView: View {
     @State private var isDownloadDrawerPresented = false
     @State private var pendingMultiDownloads: [GalleryDownload] = []
     @State private var isMultiDownloadConfirmationPresented = false
+    @State private var pendingDeletions: [CameraConnectionService.GalleryItem] = []
+    @State private var isDeleteConfirmationPresented = false
+    @State private var isDeletingGallery = false
+    @State private var deleteError: String?
     @State private var selectedItem: CameraConnectionService.GalleryItem?
     @State private var timeGrouping: GalleryTimeGrouping = .all
     @Namespace private var galleryTransition
@@ -87,7 +91,7 @@ struct GalleryView: View {
                             } label: {
                                 Image(systemName: "arrow.clockwise")
                             }
-                            .disabled(!isConnected || isRefreshing || isDirectorySwitching)
+                            .disabled(!isConnected || isRefreshing || isDirectorySwitching || isDeletingGallery)
                         }
                         .padding(.horizontal, 5)
                     }
@@ -153,6 +157,21 @@ struct GalleryView: View {
                 .presentationDetents([.height(250)])
                 .presentationDragIndicator(.visible)
             }
+            .alert("从相机删除\(pendingDeletions.count)张照片", isPresented: $isDeleteConfirmationPresented) {
+                Button("删除", role: .destructive) {
+                    let items = pendingDeletions
+                    pendingDeletions = []
+                    Task { await deleteGalleryItems(items, dismissPreview: false) }
+                }
+                Button("取消", role: .cancel) {
+                    pendingDeletions = []
+                }
+            }
+            .alert("删除失败", isPresented: deleteErrorPresented) {
+                Button("好", role: .cancel) { deleteError = nil }
+            } message: {
+                Text(deleteError ?? "相机未能删除照片。")
+            }
             .navigationDestination(item: $selectedItem) { item in
                 GalleryPreviewView(
                     item: item,
@@ -163,6 +182,9 @@ struct GalleryView: View {
                     },
                     isDownloadQueued: { format in
                         downloadStore.contains(handle: item.handle, format: format)
+                    },
+                    onDelete: {
+                        await deleteGalleryItems([item], dismissPreview: true)
                     }
                 )
                 .toolbar(.hidden, for: .navigationBar)
@@ -194,7 +216,7 @@ struct GalleryView: View {
             }
             .pickerStyle(.menu)
             .tint(.primary)
-            .disabled(isRefreshing || isDirectorySwitching)
+            .disabled(isRefreshing || isDirectorySwitching || isDeletingGallery)
             .accessibilityLabel("选择图库目录")
         } else if isConnected, isRefreshing {
             ProgressView()
@@ -407,6 +429,13 @@ struct GalleryView: View {
                     }
                 }
             }
+            if !item.isVideo {
+                Button(role: .destructive) {
+                    requestDelete([item])
+                } label: {
+                    Label("删除", systemImage: "trash")
+                }
+            }
         }
         .onAppear {
             handleCellAppear(item)
@@ -435,6 +464,17 @@ struct GalleryView: View {
             .glassEffect(.regular.interactive(), in: .circle)
             .disabled(multiDownloadOptions.isEmpty)
             Spacer()
+            Button {
+                requestDelete(selectedPhotoItems)
+            } label: {
+                Image(systemName: "trash")
+                    .foregroundStyle(.red)
+            }
+            .buttonStyle(.plain)
+            .frame(width: 42, height: 42)
+            .glassEffect(.regular.interactive(), in: .circle)
+            .disabled(selectedPhotoItems.isEmpty || isDeletingGallery)
+            .accessibilityLabel("删除选中的照片")
         }
         .padding(.horizontal, 20).frame(maxWidth: .infinity).frame(height: 49)
         .background(.bar)
@@ -588,6 +628,42 @@ struct GalleryView: View {
         exitSelectionMode()
     }
 
+    private var deleteErrorPresented: Binding<Bool> {
+        Binding(
+            get: { deleteError != nil },
+            set: { if !$0 { deleteError = nil } }
+        )
+    }
+
+    private func requestDelete(_ items: [CameraConnectionService.GalleryItem]) {
+        guard !items.isEmpty, !isDeletingGallery else { return }
+        pendingDeletions = items
+        isDeleteConfirmationPresented = true
+    }
+
+    @MainActor
+    private func deleteGalleryItems(
+        _ items: [CameraConnectionService.GalleryItem],
+        dismissPreview: Bool
+    ) async -> Bool {
+        guard !items.isEmpty, !isDeletingGallery else { return false }
+        isDeletingGallery = true
+
+        do {
+            try await camera.deleteGalleryItems(items)
+            isDeletingGallery = false
+            await reloadGallery(force: true)
+            selectedHandles = selectedHandles.intersection(Set(camera.galleryItems.map(\.handle)))
+            if dismissPreview { selectedItem = nil }
+            exitSelectionMode()
+            return true
+        } catch {
+            isDeletingGallery = false
+            deleteError = error.localizedDescription
+            return false
+        }
+    }
+
     private func statusPlaceholder(title: String, systemImage: String, message: String) -> some View {
         VStack(spacing: 14) {
             Image(systemName: systemImage)
@@ -622,19 +698,22 @@ struct GalleryView: View {
 
         isRefreshing = true
         loadError = nil
-        defer { isRefreshing = false }
-
         thumbnailImages = [:]
         failedThumbnails = []
-        visibleHandles = []
 
         await camera.refreshGallery(selectingDirectoryID: selectedDirectoryID)
         selectedDirectoryID = camera.selectedGalleryDirectoryID
+
+        let validHandles = Set(camera.galleryItems.flatMap { item in
+            [item.handle, item.rawHandle, item.jpegHandle].compactMap { $0 }
+        })
+        visibleHandles = visibleHandles.filter { validHandles.contains($0) }
 
         if camera.galleryDirectories.isEmpty {
             loadError = nil
         }
 
+        isRefreshing = false
         await pumpVisibleThumbnails()
     }
 
@@ -671,12 +750,23 @@ struct GalleryView: View {
     @MainActor
     private func pumpVisibleThumbnails() async {
         guard isConnected else { return }
+        guard !isRefreshing, !isDeletingGallery else { return }
         guard !isThumbnailPumpRunning else { return }
 
         isThumbnailPumpRunning = true
-        defer { isThumbnailPumpRunning = false }
+        defer {
+            isThumbnailPumpRunning = false
+            if isConnected,
+               !isRefreshing,
+               !isDeletingGallery,
+               nextVisibleItemNeedingWork() != nil
+            {
+                Task { await pumpVisibleThumbnails() }
+            }
+        }
 
         while isConnected {
+            guard !isRefreshing, !isDeletingGallery else { break }
             guard let item = nextVisibleItemNeedingWork() else {
                 await Task.yield()
                 if nextVisibleItemNeedingWork() == nil {
@@ -692,9 +782,11 @@ struct GalleryView: View {
             guard visibleHandles.contains(item.handle) else { continue }
 
             if let image = await camera.thumbnailImage(for: item.thumbnailHandle) {
+                guard !isRefreshing, !isDeletingGallery else { break }
                 withAnimation(.easeIn(duration: 0.28)) {
                     thumbnailImages[item.handle] = image
                 }
+                await Task.yield()
             } else if visibleHandles.contains(item.handle) {
                 failedThumbnails.insert(item.handle)
             }
@@ -806,6 +898,7 @@ private struct GalleryPreviewView: View {
     let camera: CameraConnectionService
     let onDownload: (GalleryDownloadFormat) -> Void
     let isDownloadQueued: (GalleryDownloadFormat) -> Bool
+    let onDelete: () async -> Bool
 
     @Environment(\.dismiss) private var dismiss
     @State private var image: UIImage?
@@ -822,6 +915,8 @@ private struct GalleryPreviewView: View {
     @State private var isMetadataPresented = false
     @State private var metadata: GalleryMetadata?
     @State private var isMetadataLoading = false
+    @State private var isDeleteConfirmationPresented = false
+    @State private var isDeleting = false
 
     var body: some View {
         GeometryReader { proxy in
@@ -936,6 +1031,22 @@ private struct GalleryPreviewView: View {
                                 .frame(width: 42, height: 42)
                                 .glassEffect(.regular.interactive(), in: .circle)
                                 .accessibilityLabel("照片信息")
+                                Button {
+                                    isDeleteConfirmationPresented = true
+                                } label: {
+                                    if isDeleting {
+                                        ProgressView()
+                                            .tint(.primary)
+                                    } else {
+                                        Image(systemName: "trash")
+                                            .foregroundStyle(.red)
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                                .frame(width: 42, height: 42)
+                                .glassEffect(.regular.interactive(), in: .circle)
+                                .disabled(isDeleting)
+                                .accessibilityLabel("删除照片")
                             }
                         }
                         .padding(.horizontal, 16)
@@ -970,6 +1081,17 @@ private struct GalleryPreviewView: View {
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
                 .task { await loadMetadata() }
+            }
+            .alert("从相机删除1张照片", isPresented: $isDeleteConfirmationPresented) {
+                Button("删除", role: .destructive) {
+                    isDeleteConfirmationPresented = false
+                    isDeleting = true
+                    Task {
+                        _ = await onDelete()
+                        await MainActor.run { isDeleting = false }
+                    }
+                }
+                Button("取消", role: .cancel) { }
             }
         }
     }

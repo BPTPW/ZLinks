@@ -605,6 +605,8 @@ final class CameraConnectionService: ObservableObject {
                         generation: generation
                     )
                 }
+                await galleryEnrichmentTask?.value
+                galleryEnrichmentTask = nil
                 return
             } catch {
                 guard isMatchingGalleryLoad(generation, directoryID: directoryID) else { return }
@@ -705,6 +707,46 @@ final class CameraConnectionService: ObservableObject {
         let total = galleryItems.first(where: { $0.handle == handle })?.fileSize ?? 0
         return try await fetchPartialObject(handle: handle, on: commandConnection) { received in
             progress(received, total)
+        }
+    }
+
+    /// Deletes every object belonging to each selected photo. A RAW+JPEG item
+    /// contributes both object handles, so the camera never retains its pair.
+    func deleteGalleryItems(_ items: [GalleryItem]) async throws {
+        guard case .connected = state, let commandConnection else {
+            throw CameraConnectionError.connectionCancelled
+        }
+
+        var handles = Set<UInt32>()
+        for item in items where !item.isVideo {
+            if let rawHandle = item.rawHandle {
+                handles.insert(rawHandle)
+            }
+            if let jpegHandle = item.jpegHandle {
+                handles.insert(jpegHandle)
+            }
+            if item.rawHandle == nil && item.jpegHandle == nil {
+                handles.insert(item.handle)
+            }
+        }
+
+        for handle in handles.sorted() {
+            let response = try await operation(
+                .deleteObject,
+                parameters: [handle],
+                dataPhase: nil,
+                on: commandConnection,
+                logStyle: .compact,
+                priority: .foreground
+            )
+            guard response.code == PTPResponseCode.ok.rawValue else {
+                appendLog(
+                    "[图库] 删除失败 handle=0x\(String(format: "%08X", handle)) " +
+                        "code=0x\(String(format: "%04X", response.code))"
+                )
+                throw CameraConnectionError.ptpResponse(response.code)
+            }
+            appendLog("[图库] 删除成功 handle=0x\(String(format: "%08X", handle))")
         }
     }
 
@@ -3080,6 +3122,7 @@ private enum PTPOperationCode: UInt16 {
     case getObjectInfo = 0x1008
     case getObject = 0x1009
     case getThumb = 0x100a
+    case deleteObject = 0x100b
     case getPartialObject = 0x101b
     case getDevicePropValue = 0x1015
     case getDevicePropDesc = 0x1014
@@ -3106,6 +3149,7 @@ private enum PTPOperationCode: UInt16 {
         case .getObjectInfo: return "GetObjectInfo"
         case .getObject: return "GetObject"
         case .getThumb: return "GetThumb"
+        case .deleteObject: return "DeleteObject"
         case .getPartialObject: return "GetPartialObject"
         case .getDevicePropValue: return "GetDevicePropValue"
         case .getDevicePropDesc: return "GetDevicePropDesc"
