@@ -860,6 +860,14 @@ final class CameraConnectionService: ObservableObject {
         captureControlError = nil
     }
 
+    var captureExposureMode: CaptureExposureMode? {
+        captureParameters[.exposureMode].flatMap { CaptureExposureMode(rawValue: $0) }
+    }
+
+    func canAdjustCaptureParameter(_ parameter: CaptureParameter) -> Bool {
+        parameter.isAdjustable(in: captureExposureMode)
+    }
+
     /// Read the exposure-related PTP properties shown in the Capture tab.
     func refreshCaptureParameters() async {
         guard case .connected = state, let commandConnection else {
@@ -899,6 +907,14 @@ final class CameraConnectionService: ObservableObject {
     func queueCaptureParameter(_ parameter: CaptureParameter, rawValue: UInt64) {
         guard case .connected = state else {
             captureControlError = "相机未连接。"
+            return
+        }
+        guard canAdjustCaptureParameter(parameter) else {
+            let mode = CaptureOptionCatalog.displayedValue(
+                for: .exposureMode,
+                rawValue: captureParameters[.exposureMode]
+            )
+            captureControlError = "\(parameter.title)在\(mode)模式下不可调整。"
             return
         }
 
