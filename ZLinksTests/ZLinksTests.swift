@@ -10,10 +10,18 @@ import Testing
 
 struct ZLinksTests {
 
-    @Test func example() async throws {
-        // Write your test here and use APIs like `#expect(...)` to check expected conditions.
-        // Swift Testing Documentation
-        // https://developer.apple.com/documentation/testing
+    @Test func captureParameterLocksFollowExposureMode() {
+        #expect(!CaptureParameter.shutterSpeed.isAdjustable(in: CaptureExposureMode.aperturePriority))
+        #expect(CaptureParameter.aperture.isAdjustable(in: CaptureExposureMode.aperturePriority))
+
+        #expect(CaptureParameter.shutterSpeed.isAdjustable(in: CaptureExposureMode.shutterPriority))
+        #expect(!CaptureParameter.aperture.isAdjustable(in: CaptureExposureMode.shutterPriority))
+
+        #expect(!CaptureParameter.shutterSpeed.isAdjustable(in: CaptureExposureMode.program))
+        #expect(!CaptureParameter.aperture.isAdjustable(in: CaptureExposureMode.program))
+
+        #expect(CaptureParameter.shutterSpeed.isAdjustable(in: CaptureExposureMode.manual))
+        #expect(CaptureParameter.aperture.isAdjustable(in: CaptureExposureMode.manual))
     }
 
 }

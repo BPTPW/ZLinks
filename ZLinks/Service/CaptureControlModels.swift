@@ -159,6 +159,31 @@ enum CaptureParameter: UInt16, CaseIterable, Hashable, Identifiable, Sendable {
     }
 }
 
+enum CaptureExposureMode: UInt64, Sendable {
+    case manual = 0x0001
+    case program = 0x0002
+    case aperturePriority = 0x0003
+    case shutterPriority = 0x0004
+}
+
+extension CaptureParameter {
+    func isAdjustable(in exposureMode: CaptureExposureMode?) -> Bool {
+        guard self == .shutterSpeed || self == .aperture else { return true }
+        guard let exposureMode else { return true }
+
+        switch exposureMode {
+        case .manual:
+            return true
+        case .program:
+            return false
+        case .aperturePriority:
+            return self != .shutterSpeed
+        case .shutterPriority:
+            return self != .aperture
+        }
+    }
+}
+
 struct CaptureOption: Identifiable, Hashable, Sendable {
     let rawValue: UInt64
     let title: String

@@ -64,6 +64,9 @@ struct CaptureView: View {
             }
         }
         .animation(.spring(response: 0.34, dampingFraction: 0.86), value: editingParameter)
+        .onChange(of: camera.captureParameters[.exposureMode]) { _, _ in
+            closeEditorIfLocked()
+        }
         .task(id: liveViewSessionKey) {
             await camera.startLiveView()
             await camera.refreshCaptureParameters()
@@ -292,6 +295,7 @@ struct CaptureView: View {
     }
 
     private func openEditor(_ parameter: CaptureParameter) {
+        guard camera.canAdjustCaptureParameter(parameter) else { return }
         guard let options = editorOptions(for: parameter) else { return }
         let current = camera.captureParameters[parameter]
         let index = current.flatMap { value in
@@ -303,6 +307,13 @@ struct CaptureView: View {
     }
 
     private func closeEditor() {
+        editingParameter = nil
+    }
+
+    private func closeEditorIfLocked() {
+        guard let parameter = editingParameter,
+              !camera.canAdjustCaptureParameter(parameter)
+        else { return }
         editingParameter = nil
     }
 
@@ -349,6 +360,9 @@ private struct CaptureFullscreenMonitor: View {
         }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
+        .onChange(of: camera.captureParameters[.exposureMode]) { _, _ in
+            closeEditorIfLocked()
+        }
     }
 
     @ViewBuilder
@@ -529,6 +543,7 @@ private struct CaptureFullscreenMonitor: View {
     }
 
     private func openEditor(_ parameter: CaptureParameter) {
+        guard camera.canAdjustCaptureParameter(parameter) else { return }
         guard parameter != .exposureMode else { return }
         let options = CaptureOptionCatalog.options(for: parameter)
         guard !options.isEmpty else { return }
@@ -539,6 +554,13 @@ private struct CaptureFullscreenMonitor: View {
 
         sliderIndex = Double(index)
         editingParameter = parameter
+    }
+
+    private func closeEditorIfLocked() {
+        guard let editingParameter,
+              !camera.canAdjustCaptureParameter(editingParameter)
+        else { return }
+        self.editingParameter = nil
     }
 
     private var isConnected: Bool {
@@ -721,6 +743,7 @@ private struct CaptureFullscreenReadouts: View {
     var body: some View {
         VStack(spacing: 0) {
             ForEach(parameters) { parameter in
+                let isEnabled = isConnected && camera.canAdjustCaptureParameter(parameter)
                 Button {
                     onSelect(parameter)
                 } label: {
@@ -744,12 +767,19 @@ private struct CaptureFullscreenReadouts: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .buttonStyle(.plain)
+                .disabled(!isEnabled)
+                .opacity(isEnabled ? 1 : 0.42)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
                 .accessibilityLabel("\(parameter.title)，\(CaptureOptionCatalog.displayedValue(for: parameter, rawValue: camera.captureParameters[parameter]))")
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var isConnected: Bool {
+        if case .connected = camera.state { return true }
+        return false
     }
 }
 
@@ -774,7 +804,7 @@ private struct CaptureFullscreenMoreOptions: View {
                         style: .rail,
                         isOn: false,
                         isBusy: camera.activeCaptureWrite == parameter,
-                        isEnabled: isConnected,
+                        isEnabled: isConnected && camera.canAdjustCaptureParameter(parameter),
                         action: { onSelect(parameter) }
                     )
                 }
@@ -858,7 +888,7 @@ private struct CaptureSideRail: View {
                         style: .rail,
                         isOn: false,
                         isBusy: camera.activeCaptureWrite == parameter,
-                        isEnabled: isConnected,
+                        isEnabled: isConnected && camera.canAdjustCaptureParameter(parameter),
                         action: { onSelect(parameter) }
                     )
                 }
@@ -939,7 +969,7 @@ private struct CapturePortraitKeyDeck: View {
                     style: .tile,
                     isOn: false,
                     isBusy: camera.activeCaptureWrite == parameter,
-                    isEnabled: isConnected
+                    isEnabled: isConnected && camera.canAdjustCaptureParameter(parameter)
                 ) {
                     onSelect(parameter)
                 }
