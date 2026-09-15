@@ -6,10 +6,27 @@
 import SwiftUI
 import UIKit
 
+private enum CapturePreferenceKey {
+    static let showsGrid = "capture.showsGrid"
+    static let mirrorsPreview = "capture.mirrorsPreview"
+}
+
+private extension CameraConnectionService {
+    func isCaptureParameterAutoLocked(_ parameter: CaptureParameter) -> Bool {
+        !parameter.isAdjustable(in: captureExposureMode)
+    }
+
+    func canOpenCaptureParameterEditor(_ parameter: CaptureParameter) -> Bool {
+        !captureOptions(for: parameter).isEmpty && (
+            canAdjustCaptureParameter(parameter) || isCaptureParameterAutoLocked(parameter)
+        )
+    }
+}
+
 struct CaptureView: View {
     @EnvironmentObject private var camera: CameraConnectionService
-    @State private var showsGrid = true
-    @State private var mirrorsPreview = false
+    @AppStorage(CapturePreferenceKey.showsGrid) private var showsGrid = false
+    @AppStorage(CapturePreferenceKey.mirrorsPreview) private var mirrorsPreview = false
     @State private var editingParameter: CaptureParameter?
     @State private var sliderIndex = 0.0
     @State private var isFullscreenPresented = false
@@ -48,6 +65,7 @@ struct CaptureView: View {
                         parameter: parameter,
                         options: options,
                         selectedIndex: $sliderIndex,
+                        isAutoLocked: camera.isCaptureParameterAutoLocked(parameter),
                         onClose: closeEditor,
                         onValueChanged: { rawValue in
                             camera.queueCaptureParameter(parameter, rawValue: rawValue)
@@ -64,9 +82,6 @@ struct CaptureView: View {
             }
         }
         .animation(.spring(response: 0.34, dampingFraction: 0.86), value: editingParameter)
-        .onChange(of: camera.captureParameters[.exposureMode]) { _, _ in
-            closeEditorIfLocked()
-        }
         .task(id: liveViewSessionKey) {
             await camera.startLiveView()
             await camera.refreshCaptureParameterCapabilities()
@@ -300,7 +315,7 @@ struct CaptureView: View {
     }
 
     private func openEditor(_ parameter: CaptureParameter) {
-        guard camera.canAdjustCaptureParameter(parameter) else { return }
+        guard camera.canOpenCaptureParameterEditor(parameter) else { return }
         guard let options = editorOptions(for: parameter) else { return }
         let current = camera.captureParameters[parameter]
         let index = current.flatMap { value in
@@ -312,13 +327,6 @@ struct CaptureView: View {
     }
 
     private func closeEditor() {
-        editingParameter = nil
-    }
-
-    private func closeEditorIfLocked() {
-        guard let parameter = editingParameter,
-              !camera.canAdjustCaptureParameter(parameter)
-        else { return }
         editingParameter = nil
     }
 
@@ -365,9 +373,6 @@ private struct CaptureFullscreenMonitor: View {
         }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
-        .onChange(of: camera.captureParameters[.exposureMode]) { _, _ in
-            closeEditorIfLocked()
-        }
     }
 
     @ViewBuilder
@@ -444,6 +449,7 @@ private struct CaptureFullscreenMonitor: View {
                         parameter: parameter,
                         options: options,
                         selectedIndex: $sliderIndex,
+                        isAutoLocked: camera.isCaptureParameterAutoLocked(parameter),
                         onClose: { editingParameter = nil },
                         onValueChanged: { rawValue in
                             camera.queueCaptureParameter(parameter, rawValue: rawValue)
@@ -549,7 +555,7 @@ private struct CaptureFullscreenMonitor: View {
     }
 
     private func openEditor(_ parameter: CaptureParameter) {
-        guard camera.canAdjustCaptureParameter(parameter) else { return }
+        guard camera.canOpenCaptureParameterEditor(parameter) else { return }
         guard parameter != .exposureMode else { return }
         let options = camera.captureOptions(for: parameter)
         guard !options.isEmpty else { return }
@@ -560,13 +566,6 @@ private struct CaptureFullscreenMonitor: View {
 
         sliderIndex = Double(index)
         editingParameter = parameter
-    }
-
-    private func closeEditorIfLocked() {
-        guard let editingParameter,
-              !camera.canAdjustCaptureParameter(editingParameter)
-        else { return }
-        self.editingParameter = nil
     }
 
     private var isConnected: Bool {
@@ -771,7 +770,8 @@ private struct CaptureFullscreenReadouts: View {
     var body: some View {
         VStack(spacing: 0) {
             ForEach(parameters) { parameter in
-                let isEnabled = isConnected && camera.canAdjustCaptureParameter(parameter)
+                let isAutoLocked = camera.isCaptureParameterAutoLocked(parameter)
+                let isEnabled = isConnected && camera.canOpenCaptureParameterEditor(parameter)
                 Button {
                     onSelect(parameter)
                 } label: {
@@ -791,6 +791,10 @@ private struct CaptureFullscreenReadouts: View {
                         .foregroundStyle(.white)
                         .lineLimit(1)
                         .minimumScaleFactor(0.7)
+
+                        if isAutoLocked {
+                            CaptureAutoBadge()
+                        }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -799,7 +803,10 @@ private struct CaptureFullscreenReadouts: View {
                 .opacity(isEnabled ? 1 : 0.42)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
-                .accessibilityLabel("\(parameter.title)，\(CaptureOptionCatalog.displayedValue(for: parameter, rawValue: camera.captureParameters[parameter]))")
+                .accessibilityLabel(
+                    "\(parameter.title)，\(CaptureOptionCatalog.displayedValue(for: parameter, rawValue: camera.captureParameters[parameter]))" +
+                        (isAutoLocked ? "，自动" : "")
+                )
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -832,7 +839,8 @@ private struct CaptureFullscreenMoreOptions: View {
                         style: .rail,
                         isOn: false,
                         isBusy: camera.activeCaptureWrite == parameter,
-                        isEnabled: isConnected && camera.canAdjustCaptureParameter(parameter),
+                        isAutoLocked: camera.isCaptureParameterAutoLocked(parameter),
+                        isEnabled: isConnected && camera.canOpenCaptureParameterEditor(parameter),
                         action: { onSelect(parameter) }
                     )
                 }
@@ -916,7 +924,8 @@ private struct CaptureSideRail: View {
                         style: .rail,
                         isOn: false,
                         isBusy: camera.activeCaptureWrite == parameter,
-                        isEnabled: isConnected && camera.canAdjustCaptureParameter(parameter),
+                        isAutoLocked: camera.isCaptureParameterAutoLocked(parameter),
+                        isEnabled: isConnected && camera.canOpenCaptureParameterEditor(parameter),
                         action: { onSelect(parameter) }
                     )
                 }
@@ -929,7 +938,7 @@ private struct CaptureSideRail: View {
                         style: .rail,
                         isOn: showsGrid,
                         isBusy: false,
-                        isEnabled: false
+                        isEnabled: true
                     ) {
                         withAnimation(.easeInOut(duration: 0.18)) {
                             showsGrid.toggle()
@@ -943,7 +952,7 @@ private struct CaptureSideRail: View {
                         style: .rail,
                         isOn: mirrorsPreview,
                         isBusy: false,
-                        isEnabled: false
+                        isEnabled: true
                     ) {
                         withAnimation(.easeInOut(duration: 0.18)) {
                             mirrorsPreview.toggle()
@@ -997,7 +1006,8 @@ private struct CapturePortraitKeyDeck: View {
                     style: .tile,
                     isOn: false,
                     isBusy: camera.activeCaptureWrite == parameter,
-                    isEnabled: isConnected && camera.canAdjustCaptureParameter(parameter)
+                    isAutoLocked: camera.isCaptureParameterAutoLocked(parameter),
+                    isEnabled: isConnected && camera.canOpenCaptureParameterEditor(parameter)
                 ) {
                     onSelect(parameter)
                 }
@@ -1058,6 +1068,7 @@ private struct CaptureGlassKey: View {
     let style: CaptureKeyStyle
     let isOn: Bool
     let isBusy: Bool
+    var isAutoLocked = false
     let isEnabled: Bool
     let action: () -> Void
 
@@ -1076,6 +1087,10 @@ private struct CaptureGlassKey: View {
                     if isBusy {
                         ProgressView()
                             .controlSize(.mini)
+                    }
+
+                    if isAutoLocked {
+                        CaptureAutoBadge()
                     }
                 }
 
@@ -1099,7 +1114,7 @@ private struct CaptureGlassKey: View {
         }
         .disabled(!isEnabled)
         .opacity(isEnabled ? 1 : 0.46)
-        .accessibilityLabel("\(title)，\(value)")
+        .accessibilityLabel("\(title)，\(value)" + (isAutoLocked ? "，自动" : ""))
     }
 }
 
@@ -1107,6 +1122,7 @@ private struct CaptureSliderEditor: View {
     let parameter: CaptureParameter
     let options: [CaptureOption]
     @Binding var selectedIndex: Double
+    let isAutoLocked: Bool
     let onClose: () -> Void
     let onValueChanged: (UInt64) -> Void
 
@@ -1142,12 +1158,19 @@ private struct CaptureSliderEditor: View {
                 .accessibilityLabel("关闭")
             }
 
-            Text(selectedOption.title)
-                .font(.system(size: 42, weight: .bold, design: .rounded))
-                .monospacedDigit()
-                .lineLimit(1)
-                .minimumScaleFactor(0.55)
-                .contentTransition(.numericText())
+            HStack(spacing: 10) {
+                Text(selectedOption.title)
+                    .font(.system(size: 42, weight: .bold, design: .rounded))
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.55)
+                    .contentTransition(.numericText(value: selectedIndex))
+
+                if isAutoLocked {
+                    CaptureAutoBadge()
+                }
+            }
+            .animation(.snappy(duration: 0.2), value: safeIndex)
 
             if parameter.usesPresetSelection {
                 ScrollView(.vertical) {
@@ -1155,6 +1178,7 @@ private struct CaptureSliderEditor: View {
                     .padding(2)
                 }
                 .frame(maxHeight: 220)
+                .disabled(isAutoLocked)
             } else {
                 VStack(spacing: 8) {
                     Slider(
@@ -1168,6 +1192,7 @@ private struct CaptureSliderEditor: View {
                         }
                     )
                     .tint(.orange)
+                    .disabled(isAutoLocked)
 
                     HStack {
                         Text(options.first?.title ?? "--")
@@ -1292,6 +1317,19 @@ private struct CaptureSliderEditor: View {
             return .green
         }
         return .primary
+    }
+}
+
+private struct CaptureAutoBadge: View {
+    var body: some View {
+        Text("AUTO")
+            .font(.system(size: 9, weight: .bold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(.blue, in: Capsule())
+            .fixedSize()
+            .accessibilityLabel("自动")
     }
 }
 
@@ -1473,7 +1511,7 @@ private struct CaptureExposureScale: View {
 
                     Circle()
                         .fill(.orange)
-                        .frame(width: 10, height: 10)
+                        .frame(width: 6, height: 6)
                         .position(x: 45, y: knobY)
 
                     Text(selectedOption.title)

@@ -541,31 +541,46 @@ private struct ShutterValue {
     }
 
     var title: String {
-        if denominator == 1 {
-            return "\(numerator)s"
-        }
-        if numerator == 1 {
-            return "1/\(denominator)"
-        }
-        if seconds >= 1 {
-            return String(format: "%.1fs", seconds)
-        }
-        return "1/\(String(format: "%.1f", 1 / seconds))"
+        Self.title(numerator: numerator, denominator: denominator)
     }
 
     static func title(forPacked value: UInt64) -> String {
         if value == 0xFFFF_FFFF { return "Bulb" }
         if value == 0xFFFF_FFFE { return "x 200" }
         if value == 0xFFFF_FFFD { return "TIME" }
-        if let match = supported.first(where: { $0.packedValue == value }) {
-            return match.title
-        }
         let numerator = UInt16((value >> 16) & 0xFFFF)
         let denominator = UInt16(value & 0xFFFF)
         guard numerator > 0, denominator > 0 else { return "--" }
-        if denominator == 1 { return "\(numerator)s" }
-        if numerator == 1 { return "1/\(denominator)" }
-        return String(format: "%.2fs", Double(numerator) / Double(denominator))
+        return title(numerator: numerator, denominator: denominator)
+    }
+
+    private static func title(numerator: UInt16, denominator: UInt16) -> String {
+        let seconds = Double(numerator) / Double(denominator)
+        if seconds < 1 {
+            let divisor = greatestCommonDivisor(numerator, denominator)
+            return "\(numerator / divisor)/\(denominator / divisor)"
+        }
+        return "\(decimalText(seconds))s"
+    }
+
+    private static func greatestCommonDivisor(_ lhs: UInt16, _ rhs: UInt16) -> UInt16 {
+        var first = lhs
+        var second = rhs
+        while second != 0 {
+            (first, second) = (second, first % second)
+        }
+        return first
+    }
+
+    private static func decimalText(_ value: Double) -> String {
+        var text = String(format: "%.2f", value)
+        while text.last == "0" {
+            text.removeLast()
+        }
+        if text.last == "." {
+            text.removeLast()
+        }
+        return text
     }
 
     static func matchesPackedValue(_ value: UInt64) -> Bool {
