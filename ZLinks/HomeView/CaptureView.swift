@@ -69,6 +69,7 @@ struct CaptureView: View {
         }
         .task(id: liveViewSessionKey) {
             await camera.startLiveView()
+            await camera.refreshCaptureParameterCapabilities()
             await camera.refreshCaptureParameters()
 
             await withTaskCancellationHandler {
@@ -179,6 +180,7 @@ struct CaptureView: View {
             GeometryReader { proxy in
                 CaptureExposureScale(
                     rawValue: camera.captureParameters[.exposureCompensation],
+                    options: camera.captureOptions(for: .exposureCompensation),
                     onCommit: { camera.queueCaptureParameter(.exposureCompensation, rawValue: $0) }
                 )
                 .frame(width: 62, height: proxy.size.height / 3 + 42)
@@ -319,7 +321,7 @@ struct CaptureView: View {
 
     private func editorOptions(for parameter: CaptureParameter) -> [CaptureOption]? {
         guard parameter != .exposureMode else { return nil }
-        let options = CaptureOptionCatalog.options(for: parameter)
+        let options = camera.captureOptions(for: parameter)
         return options.isEmpty ? nil : options
     }
 }
@@ -427,7 +429,7 @@ private struct CaptureFullscreenMonitor: View {
             }
 
             if let parameter = editingParameter {
-                let options = CaptureOptionCatalog.options(for: parameter)
+                let options = camera.captureOptions(for: parameter)
                 if !options.isEmpty {
                     Color.black.opacity(0.22)
                         .ignoresSafeArea()
@@ -530,6 +532,7 @@ private struct CaptureFullscreenMonitor: View {
             GeometryReader { proxy in
                 CaptureExposureScale(
                     rawValue: camera.captureParameters[.exposureCompensation],
+                    options: camera.captureOptions(for: .exposureCompensation),
                     onCommit: { camera.queueCaptureParameter(.exposureCompensation, rawValue: $0) }
                 )
                 .frame(width: 62, height: proxy.size.height / 3 + 42)
@@ -545,7 +548,7 @@ private struct CaptureFullscreenMonitor: View {
     private func openEditor(_ parameter: CaptureParameter) {
         guard camera.canAdjustCaptureParameter(parameter) else { return }
         guard parameter != .exposureMode else { return }
-        let options = CaptureOptionCatalog.options(for: parameter)
+        let options = camera.captureOptions(for: parameter)
         guard !options.isEmpty else { return }
         let current = camera.captureParameters[parameter]
         let index = current.flatMap { value in
@@ -1386,12 +1389,11 @@ private struct CaptureLiveViewMetric: View {
 
 private struct CaptureExposureScale: View {
     let rawValue: UInt64?
+    let options: [CaptureOption]
     let onCommit: (UInt64) -> Void
 
-    @State private var selectedIndex = 6.0
+    @State private var selectedIndex = 0.0
     @State private var isDragging = false
-
-    private let options = CaptureOptionCatalog.options(for: .exposureCompensation)
 
     private var currentIndex: Double {
         guard let rawValue,
@@ -1407,86 +1409,98 @@ private struct CaptureExposureScale: View {
     }
 
     var body: some View {
-        GeometryReader { proxy in
-            let trackTop: CGFloat = 4
-            let trackBottom = trackTop + max(1, proxy.size.height - 42)
-            let trackHeight = trackBottom - trackTop
-            let knobY = trackTop + CGFloat(1 - selectedIndex / Double(max(options.count - 1, 1))) * trackHeight
+        if !options.isEmpty {
+            GeometryReader { proxy in
+                let trackTop: CGFloat = 4
+                let trackBottom = trackTop + max(1, proxy.size.height - 42)
+                let trackHeight = trackBottom - trackTop
+                let knobY = trackTop + CGFloat(1 - selectedIndex / Double(max(options.count - 1, 1))) * trackHeight
 
-            ZStack(alignment: .topLeading) {
-                Path { path in
-                    path.move(to: CGPoint(x: 45, y: trackTop))
-                    path.addLine(to: CGPoint(x: 45, y: trackBottom))
+                ZStack(alignment: .topLeading) {
+                    Path { path in
+                        path.move(to: CGPoint(x: 45, y: trackTop))
+                        path.addLine(to: CGPoint(x: 45, y: trackBottom))
+                    }
+                    .stroke(.white.opacity(0.86), style: StrokeStyle(lineWidth: 2, lineCap: .round))
+
+                    ForEach(0..<9, id: \.self) { tick in
+                        let fraction = Double(tick) / 8
+                        let optionIndex = Int(
+                            (Double(options.count - 1) * (1 - fraction)).rounded()
+                        )
+                        let y = trackTop + CGFloat(fraction) * trackHeight
+                        let isMajor = tick.isMultiple(of: 2)
+                        Capsule()
+                            .fill(.white.opacity(isMajor ? 0.9 : 0.58))
+                            .frame(width: isMajor ? 13.5 : 6.75, height: isMajor ? 2 : 1)
+                            .position(x: isMajor ? 38 : 41.5, y: y)
+
+                        if isMajor {
+                            Text(options[optionIndex].title)
+                                .font(.caption2.monospacedDigit().weight(.medium))
+                                .foregroundStyle(.white.opacity(0.92))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.65)
+                                .frame(width: 36, alignment: .trailing)
+                                .position(x: 9, y: y)
+                        }
+                    }
+
+                    Circle()
+                        .fill(.orange)
+                        .frame(width: 10, height: 10)
+                        .position(x: 45, y: knobY)
+
+                    Text(selectedOption.title)
+                        .font(.caption.monospacedDigit().weight(.semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 64)
+                        .position(x: 31, y: trackBottom + 18)
                 }
-                .stroke(.white.opacity(0.86), style: StrokeStyle(lineWidth: 2, lineCap: .round))
-
-                ForEach(-4...4, id: \.self) { halfStep in
-                    let ev = Double(halfStep) / 2
-                    let y = trackTop + CGFloat(1 - (ev + 2) / 4) * trackHeight
-                    let isMajor = halfStep.isMultiple(of: 2)
-                    Capsule()
-                        .fill(.white.opacity(isMajor ? 0.9 : 0.58))
-                        .frame(width: isMajor ? 13.5 : 6.75, height: isMajor ? 2 : 1)
-                        .position(x: isMajor ? 38 : 41.5, y: y)
-
-                    if isMajor {
-                        Text(String(format: "%+.0f", ev))
-                            .font(.caption2.monospacedDigit().weight(.medium))
-                            .foregroundStyle(.white.opacity(0.92))
-                            .frame(width: 32, alignment: .trailing)
-                            .position(x: 8, y: y)
-                    }
-                }
-
-                Circle()
-                    .fill(.orange)
-                    .frame(width: 10, height: 10)
-                    .position(x: 45, y: knobY)
-
-                Text(selectedOption.title)
-                    .font(.caption.monospacedDigit().weight(.semibold))
-                    .foregroundStyle(.white)
-                    .frame(width: 64)
-                    .position(x: 31, y: trackBottom + 18)
-            }
-            .contentShape(Rectangle())
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { value in
-                        isDragging = true
-                        let fraction = min(max((value.location.y - trackTop) / trackHeight, 0), 1)
-                        selectedIndex = Double(options.count - 1) * Double(1 - fraction)
-                    }
-                    .onEnded { _ in
-                        selectedIndex = selectedIndex.rounded()
-                        isDragging = false
-                        onCommit(selectedOption.rawValue)
-                    }
-            )
-            .onAppear {
-                selectedIndex = currentIndex
-            }
-            .onChange(of: rawValue) { _, _ in
-                if !isDragging {
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { value in
+                            isDragging = true
+                            let fraction = min(max((value.location.y - trackTop) / trackHeight, 0), 1)
+                            selectedIndex = Double(options.count - 1) * Double(1 - fraction)
+                        }
+                        .onEnded { _ in
+                            selectedIndex = selectedIndex.rounded()
+                            isDragging = false
+                            onCommit(selectedOption.rawValue)
+                        }
+                )
+                .onAppear {
                     selectedIndex = currentIndex
                 }
-            }
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel("曝光补偿")
-            .accessibilityValue(selectedOption.title)
-            .accessibilityAdjustableAction { direction in
-                switch direction {
-                case .increment:
-                    selectedIndex = min(selectedIndex.rounded() + 1, Double(options.count - 1))
-                case .decrement:
-                    selectedIndex = max(selectedIndex.rounded() - 1, 0)
-                @unknown default:
-                    break
+                .onChange(of: rawValue) { _, _ in
+                    if !isDragging {
+                        selectedIndex = currentIndex
+                    }
                 }
-                onCommit(selectedOption.rawValue)
+                .onChange(of: options) { _, _ in
+                    if !isDragging {
+                        selectedIndex = currentIndex
+                    }
+                }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("曝光补偿")
+                .accessibilityValue(selectedOption.title)
+                .accessibilityAdjustableAction { direction in
+                    switch direction {
+                    case .increment:
+                        selectedIndex = min(selectedIndex.rounded() + 1, Double(options.count - 1))
+                    case .decrement:
+                        selectedIndex = max(selectedIndex.rounded() - 1, 0)
+                    @unknown default:
+                        break
+                    }
+                    onCommit(selectedOption.rawValue)
+                }
             }
+            .frame(minHeight: 80)
         }
-        .frame(minHeight: 80)
     }
 }
 

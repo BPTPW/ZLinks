@@ -52,6 +52,16 @@ enum CaptureParameter: UInt16, CaseIterable, Hashable, Identifiable, Sendable {
         }
     }
 
+    static let capabilityCases: [CaptureParameter] = [
+        .exposureCompensation,
+        .shutterSpeed,
+        .aperture,
+        .focusMode,
+        .iso,
+        .whiteBalance,
+        .meteringMode
+    ]
+
     /// Alternate property used when the preferred code is not writable.
     /// Nikon Z live-view focus uses 0xD061, while older bodies use 0x500A.
     var fallbackPropertyCode: UInt16? {
@@ -113,8 +123,7 @@ enum CaptureParameter: UInt16, CaseIterable, Hashable, Identifiable, Sendable {
         if ShutterValue.matchesPackedValue(value) {
             return value
         }
-        let seconds = Double(value) / 10_000
-        return ShutterValue.nearestPackedValue(for: seconds)
+        return Self.packedShutterValue(fromTenThousandths: UInt32(truncatingIfNeeded: value))
     }
 
     func normalizeFallbackRead(_ value: UInt64) -> UInt64 {
@@ -126,6 +135,12 @@ enum CaptureParameter: UInt16, CaseIterable, Hashable, Identifiable, Sendable {
         default:
             return normalizeStandardRead(value)
         }
+    }
+
+    func normalizeRead(_ value: UInt64, from propertyCode: UInt16) -> UInt64 {
+        propertyCode == fallbackPropertyCode
+            ? normalizeFallbackRead(value)
+            : normalizeStandardRead(value)
     }
 
     private static func legacyFocusModeValue(for liveViewValue: UInt64) -> UInt16 {
@@ -156,6 +171,26 @@ enum CaptureParameter: UInt16, CaseIterable, Hashable, Identifiable, Sendable {
         let denominator = UInt16(value & 0xFFFF)
         guard numerator > 0, denominator > 0 else { return 1 }
         return Double(numerator) / Double(denominator)
+    }
+
+    private static func packedShutterValue(fromTenThousandths value: UInt32) -> UInt64 {
+        guard value > 0 else { return 0 }
+        let divisor = greatestCommonDivisor(value, 10_000)
+        let numerator = value / divisor
+        let denominator = 10_000 / divisor
+        guard numerator <= UInt16.max, denominator <= UInt16.max else {
+            return ShutterValue.nearestPackedValue(for: Double(value) / 10_000)
+        }
+        return UInt64(numerator) << 16 | UInt64(denominator)
+    }
+
+    private static func greatestCommonDivisor(_ lhs: UInt32, _ rhs: UInt32) -> UInt32 {
+        var first = lhs
+        var second = rhs
+        while second != 0 {
+            (first, second) = (second, first % second)
+        }
+        return first
     }
 }
 
@@ -189,6 +224,173 @@ struct CaptureOption: Identifiable, Hashable, Sendable {
     let title: String
 
     var id: UInt64 { rawValue }
+}
+
+enum CapturePropertyDataType: UInt16, Equatable, Sendable {
+    case int8 = 0x0001
+    case uint8 = 0x0002
+    case int16 = 0x0003
+    case uint16 = 0x0004
+    case int32 = 0x0005
+    case uint32 = 0x0006
+    case int64 = 0x0007
+    case uint64 = 0x0008
+
+    var byteWidth: Int {
+        switch self {
+        case .int8, .uint8: return 1
+        case .int16, .uint16: return 2
+        case .int32, .uint32: return 4
+        case .int64, .uint64: return 8
+        }
+    }
+
+    var isSigned: Bool {
+        switch self {
+        case .int8, .int16, .int32, .int64: return true
+        case .uint8, .uint16, .uint32, .uint64: return false
+        }
+    }
+
+    func signedValue(from rawValue: UInt64) -> Int64 {
+        switch self {
+        case .int8: return Int64(Int8(bitPattern: UInt8(truncatingIfNeeded: rawValue)))
+        case .int16: return Int64(Int16(bitPattern: UInt16(truncatingIfNeeded: rawValue)))
+        case .int32: return Int64(Int32(bitPattern: UInt32(truncatingIfNeeded: rawValue)))
+        case .int64: return Int64(bitPattern: rawValue)
+        case .uint8, .uint16, .uint32, .uint64: return Int64(clamping: rawValue)
+        }
+    }
+
+    func rawValue(from signedValue: Int64) -> UInt64 {
+        switch self {
+        case .int8: return UInt64(UInt8(bitPattern: Int8(truncatingIfNeeded: signedValue)))
+        case .int16: return UInt64(UInt16(bitPattern: Int16(truncatingIfNeeded: signedValue)))
+        case .int32: return UInt64(UInt32(bitPattern: Int32(truncatingIfNeeded: signedValue)))
+        case .int64: return UInt64(bitPattern: signedValue)
+        case .uint8, .uint16, .uint32, .uint64: return UInt64(clamping: signedValue)
+        }
+    }
+}
+
+enum CapturePropertyForm: Equatable, Sendable {
+    case none
+    case range(minimum: UInt64, maximum: UInt64, step: UInt64)
+    case enumeration([UInt64])
+}
+
+struct CapturePropertyDescription: Equatable, Sendable {
+    let propertyCode: UInt16
+    let dataType: CapturePropertyDataType
+    let isWritable: Bool
+    let factoryDefaultValue: UInt64
+    let currentValue: UInt64
+    let form: CapturePropertyForm
+
+    var allowedValues: [UInt64] {
+        switch form {
+        case .none:
+            return []
+        case .enumeration(let values):
+            return values
+        case .range(let minimum, let maximum, let step):
+            return rangeValues(minimum: minimum, maximum: maximum, step: step)
+        }
+    }
+
+    private func rangeValues(minimum: UInt64, maximum: UInt64, step: UInt64) -> [UInt64] {
+        let maximumValueCount = 100_000
+
+        if dataType.isSigned {
+            let lowerBound = dataType.signedValue(from: minimum)
+            let upperBound = dataType.signedValue(from: maximum)
+            let stride = dataType.signedValue(from: step)
+            guard stride > 0, lowerBound <= upperBound else { return [] }
+
+            var result: [UInt64] = []
+            var value = lowerBound
+            while value <= upperBound, result.count < maximumValueCount {
+                result.append(dataType.rawValue(from: value))
+                let (nextValue, overflow) = value.addingReportingOverflow(stride)
+                guard !overflow, nextValue <= upperBound else { break }
+                value = nextValue
+            }
+            return result
+        }
+
+        guard step > 0, minimum <= maximum else { return [] }
+        var result: [UInt64] = []
+        var value = minimum
+        while value <= maximum, result.count < maximumValueCount {
+            result.append(value)
+            let (nextValue, overflow) = value.addingReportingOverflow(step)
+            guard !overflow, nextValue <= maximum else { break }
+            value = nextValue
+        }
+        return result
+    }
+}
+
+enum CapturePropertyDescriptionParser {
+    static func parse(_ data: Data, expectedPropertyCode: UInt16) -> CapturePropertyDescription? {
+        guard data.count >= 7,
+              readUInt16(data, at: 0) == expectedPropertyCode,
+              let dataType = CapturePropertyDataType(rawValue: readUInt16(data, at: 2))
+        else { return nil }
+
+        let width = dataType.byteWidth
+        let defaultOffset = 5
+        let currentOffset = defaultOffset + width
+        let formFlagOffset = currentOffset + width
+        guard data.count > formFlagOffset else { return nil }
+
+        let form: CapturePropertyForm
+        switch data[formFlagOffset] {
+        case 0x00:
+            form = .none
+        case 0x01:
+            let valuesOffset = formFlagOffset + 1
+            guard data.count >= valuesOffset + width * 3 else { return nil }
+            form = .range(
+                minimum: readInteger(data, at: valuesOffset, width: width),
+                maximum: readInteger(data, at: valuesOffset + width, width: width),
+                step: readInteger(data, at: valuesOffset + width * 2, width: width)
+            )
+        case 0x02:
+            let countOffset = formFlagOffset + 1
+            guard data.count >= countOffset + 2 else { return nil }
+            let count = Int(readUInt16(data, at: countOffset))
+            let valuesOffset = countOffset + 2
+            guard count <= (data.count - valuesOffset) / width else { return nil }
+            let values = (0..<count).map {
+                readInteger(data, at: valuesOffset + $0 * width, width: width)
+            }
+            form = .enumeration(values)
+        default:
+            return nil
+        }
+
+        return CapturePropertyDescription(
+            propertyCode: expectedPropertyCode,
+            dataType: dataType,
+            isWritable: data[4] != 0,
+            factoryDefaultValue: readInteger(data, at: defaultOffset, width: width),
+            currentValue: readInteger(data, at: currentOffset, width: width),
+            form: form
+        )
+    }
+
+    private static func readUInt16(_ data: Data, at offset: Int) -> UInt16 {
+        UInt16(data[offset]) | UInt16(data[offset + 1]) << 8
+    }
+
+    private static func readInteger(_ data: Data, at offset: Int, width: Int) -> UInt64 {
+        var result: UInt64 = 0
+        for byteIndex in 0..<width {
+            result |= UInt64(data[offset + byteIndex]) << UInt64(byteIndex * 8)
+        }
+        return result
+    }
 }
 
 enum CaptureOptionCatalog {
@@ -237,6 +439,17 @@ enum CaptureOptionCatalog {
             return title(for: rawValue, in: meteringModeOptions)
         case .exposureMode:
             return title(for: rawValue, in: exposureModeOptions)
+        }
+    }
+
+    static func options(for parameter: CaptureParameter, rawValues: [UInt64]) -> [CaptureOption] {
+        var seen: Set<UInt64> = []
+        return rawValues.compactMap { rawValue in
+            guard seen.insert(rawValue).inserted else { return nil }
+            return CaptureOption(
+                rawValue: rawValue,
+                title: displayedValue(for: parameter, rawValue: rawValue)
+            )
         }
     }
 
@@ -291,6 +504,7 @@ enum CaptureOptionCatalog {
     private static let focusModeOptions: [CaptureOption] = [
         CaptureOption(rawValue: 0, title: "AF-S"),
         CaptureOption(rawValue: 1, title: "AF-C"),
+        CaptureOption(rawValue: 2, title: "AF-F"),
         CaptureOption(rawValue: 5, title: "AF-A"),
         CaptureOption(rawValue: 4, title: "MF")
     ]

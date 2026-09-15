@@ -176,7 +176,9 @@ final class CameraConnectionService: ObservableObject {
     @Published private(set) var liveViewError: String?
     @Published private(set) var liveViewFrameRate: Double?
     @Published private(set) var captureParameters: [CaptureParameter: UInt64] = [:]
+    @Published private(set) var captureParameterOptions: [CaptureParameter: [CaptureOption]] = [:]
     @Published private(set) var isRefreshingCaptureParameters = false
+    @Published private(set) var isRefreshingCaptureParameterCapabilities = false
     @Published private(set) var activeCaptureWrite: CaptureParameter?
     @Published private(set) var captureControlError: String?
     @Published private(set) var isInitiatingCapture = false
@@ -213,6 +215,7 @@ final class CameraConnectionService: ObservableObject {
     private var connectionGeneration = UUID()
     private var pendingCaptureWrites: [CaptureParameter: UInt64] = [:]
     private var captureWriteTask: Task<Void, Never>?
+    private var capturePropertyDescriptions: [CaptureParameter: CapturePropertyDescription] = [:]
     private var foregroundObserver: NSObjectProtocol?
 
     private static let lastConnectedHostKey = "camera.lastConnectedHost"
@@ -328,8 +331,6 @@ final class CameraConnectionService: ObservableObject {
 
             cameraInfo = try parseDeviceInfo(deviceInfo)
             appendLog("DeviceInfo 解析成功 manufacturer=\(cameraInfo?.manufacturer ?? ""), model=\(cameraInfo?.model ?? ""), serial=\(cameraInfo?.serialNumber ?? "")")
-            await logFocusModePropertyDescription(propertyCode: 0xD061, on: command)
-            await logFocusModePropertyDescription(propertyCode: 0x500A, on: command)
             cameraStatus = await readCameraStatus(on: command)
             lensInfo = await readLensInfo(on: command)
             connectedHost = displayHost
@@ -372,11 +373,14 @@ final class CameraConnectionService: ObservableObject {
         supportsPreviewImage = false
         supportedOperations = []
         captureParameters = [:]
+        captureParameterOptions = [:]
+        capturePropertyDescriptions = [:]
         pendingCaptureWrites = [:]
         captureWriteTask?.cancel()
         captureWriteTask = nil
         activeCaptureWrite = nil
         isRefreshingCaptureParameters = false
+        isRefreshingCaptureParameterCapabilities = false
         isInitiatingCapture = false
         captureControlError = nil
         stopLiveViewInternal(sendEndCommand: false)
@@ -865,7 +869,81 @@ final class CameraConnectionService: ObservableObject {
     }
 
     func canAdjustCaptureParameter(_ parameter: CaptureParameter) -> Bool {
-        parameter.isAdjustable(in: captureExposureMode)
+        if CaptureParameter.capabilityCases.contains(parameter) {
+            guard capturePropertyDescriptions[parameter]?.isWritable == true,
+                  captureParameterOptions[parameter]?.isEmpty == false
+            else { return false }
+        }
+        return parameter.isAdjustable(in: captureExposureMode)
+    }
+
+    func captureOptions(for parameter: CaptureParameter) -> [CaptureOption] {
+        captureParameterOptions[parameter] ?? []
+    }
+
+    /// Query the camera's DevicePropDesc datasets when the Capture tab opens.
+    /// The returned range or enum forms are the sole source for editable values.
+    func refreshCaptureParameterCapabilities() async {
+        guard case .connected = state, let commandConnection else {
+            captureParameterOptions = [:]
+            capturePropertyDescriptions = [:]
+            return
+        }
+        guard activeCaptureWrite == nil,
+              captureWriteTask == nil,
+              !isRefreshingCaptureParameterCapabilities
+        else { return }
+
+        isRefreshingCaptureParameterCapabilities = true
+        captureControlError = nil
+        defer { isRefreshingCaptureParameterCapabilities = false }
+
+        var descriptions: [CaptureParameter: CapturePropertyDescription] = [:]
+        var optionsByParameter: [CaptureParameter: [CaptureOption]] = [:]
+        var currentValues = captureParameters
+
+        for parameter in CaptureParameter.capabilityCases {
+            if Task.isCancelled { break }
+            guard let description = await readCapturePropertyDescription(
+                for: parameter,
+                on: commandConnection
+            ) else { continue }
+
+            let normalizedValues = description.allowedValues.map {
+                parameter.normalizeRead($0, from: description.propertyCode)
+            }
+            let options = CaptureOptionCatalog.options(
+                for: parameter,
+                rawValues: normalizedValues
+            )
+            let currentValue = parameter.normalizeRead(
+                description.currentValue,
+                from: description.propertyCode
+            )
+
+            descriptions[parameter] = description
+            optionsByParameter[parameter] = options
+            currentValues[parameter] = currentValue
+            appendCapturePropertyDescriptionLog(
+                parameter: parameter,
+                description: description,
+                optionCount: options.count
+            )
+        }
+
+        capturePropertyDescriptions = descriptions
+        captureParameterOptions = optionsByParameter
+        captureParameters = currentValues
+
+        if descriptions.isEmpty {
+            captureControlError = "相机未返回可设置的拍摄参数。"
+            appendLog("[capture] 可设置值读取失败：没有可用的属性描述")
+        } else {
+            appendLog(
+                "[capture] 可设置值读取完成 names=" +
+                    descriptions.keys.map(\.title).sorted().joined(separator: ",")
+            )
+        }
     }
 
     /// Read the exposure-related PTP properties shown in the Capture tab.
@@ -2709,7 +2787,33 @@ final class CameraConnectionService: ObservableObject {
         return readIntegerValue(from: data)
     }
 
-    private func logFocusModePropertyDescription(propertyCode: UInt16, on connection: NWConnection) async {
+    private func readCapturePropertyDescription(
+        for parameter: CaptureParameter,
+        on connection: NWConnection
+    ) async -> CapturePropertyDescription? {
+        let propertyCodes = [parameter.rawValue, parameter.fallbackPropertyCode]
+            .compactMap { $0 }
+        var firstDescription: CapturePropertyDescription?
+
+        for propertyCode in propertyCodes {
+            guard let description = await readDevicePropertyDescription(
+                propertyCode,
+                on: connection
+            ) else { continue }
+            if firstDescription == nil {
+                firstDescription = description
+            }
+            if description.isWritable, !description.allowedValues.isEmpty {
+                return description
+            }
+        }
+        return firstDescription
+    }
+
+    private func readDevicePropertyDescription(
+        _ propertyCode: UInt16,
+        on connection: NWConnection
+    ) async -> CapturePropertyDescription? {
         guard let response = try? await operation(
             .getDevicePropDesc,
             parameters: [UInt32(propertyCode)],
@@ -2718,112 +2822,61 @@ final class CameraConnectionService: ObservableObject {
             logStyle: .compact,
             timeout: .seconds(4)
         ) else {
-            appendLog("[对焦模式] property=0x\(String(format: "%04X", propertyCode)) GetDevicePropDesc 请求异常")
-            return
-        }
-
-        guard response.code == PTPResponseCode.ok.rawValue, let data = response.data else {
-            appendLog("[对焦模式] property=0x\(String(format: "%04X", propertyCode)) GetDevicePropDesc 失败 code=0x\(String(format: "%04X", response.code))")
-            return
-        }
-
-        guard let description = parseFocusModePropertyDescription(data, expectedPropertyCode: propertyCode) else {
-            appendLog("[对焦模式] property=0x\(String(format: "%04X", propertyCode)) GetDevicePropDesc 无法解析 bytes=\(data.count) hex=\(data.hexDump)")
-            return
-        }
-
-        appendLog(
-            "[对焦模式] property code=0x\(String(format: "%04X", description.propertyCode)) " +
-                "data type=\(description.dataTypeName) Get/Set=\(description.getSet) " +
-                "当前值=0x\(String(format: "%04X", description.currentValue)) " +
-                "FormFlag=0x\(String(format: "%02X", description.formFlag)) " +
-                "所有允许值=\(description.allowedValues)"
-        )
-    }
-
-    private func parseFocusModePropertyDescription(
-        _ data: Data,
-        expectedPropertyCode: UInt16
-    ) -> FocusModePropertyDescription? {
-        guard data.count >= 7, data.uint16(at: 0) == expectedPropertyCode else { return nil }
-
-        let dataType = data.uint16(at: 2)
-        let valueWidth: Int
-        let dataTypeName: String
-        switch dataType {
-        case 0x0002:
-            valueWidth = 1
-            dataTypeName = "UINT8"
-        case 0x0004:
-            valueWidth = 2
-            dataTypeName = "UINT16"
-        case 0x0006:
-            valueWidth = 4
-            dataTypeName = "UINT32"
-        default:
+            appendLog(
+                "[capture] GetDevicePropDesc 请求异常 property=0x" +
+                    String(format: "%04X", propertyCode)
+            )
             return nil
         }
 
-        let formFlagOffset = 5 + valueWidth * 2
-        guard data.count > formFlagOffset else { return nil }
-        let currentValue = readUnsignedInteger(data, at: 5 + valueWidth, width: valueWidth)
-        let getSet = data[4] == 0 ? "只读" : "可写"
-        let formFlag = data[formFlagOffset]
-        let allowedValues: String
-        switch formFlag {
-        case 0x00:
-            allowedValues = "无（FormFlag=0x00）"
-        case 0x01:
-            let valueStart = formFlagOffset + 1
-            guard data.count >= valueStart + valueWidth * 3 else { return nil }
-            let minimum = readUnsignedInteger(data, at: valueStart, width: valueWidth)
-            let maximum = readUnsignedInteger(data, at: valueStart + valueWidth, width: valueWidth)
-            let step = readUnsignedInteger(data, at: valueStart + valueWidth * 2, width: valueWidth)
-            allowedValues = "范围[min=0x\(String(format: "%04X", minimum)), max=0x\(String(format: "%04X", maximum)), step=0x\(String(format: "%04X", step))]"
-        case 0x02:
-            let countOffset = formFlagOffset + 1
-            guard data.count >= countOffset + 2 else { return nil }
-            let count = Int(data.uint16(at: countOffset))
-            var offset = countOffset + 2
-            var values: [String] = []
-            for _ in 0..<count {
-                guard offset + valueWidth <= data.count else { return nil }
-                let value = readUnsignedInteger(data, at: offset, width: valueWidth)
-                values.append("0x\(String(format: "%04X", value))=\(focusModeTitle(value))")
-                offset += valueWidth
-            }
-            allowedValues = "[\(values.joined(separator: ", "))]"
-        default:
-            allowedValues = "未知FormFlag，原始值=0x\(String(format: "%02X", formFlag))"
+        guard response.code == PTPResponseCode.ok.rawValue, let data = response.data else {
+            appendLog(
+                "[capture] GetDevicePropDesc 失败 property=0x" +
+                    String(format: "%04X", propertyCode) +
+                    " code=0x" + String(format: "%04X", response.code)
+            )
+            return nil
         }
-        return FocusModePropertyDescription(
-            propertyCode: data.uint16(at: 0),
-            dataTypeName: dataTypeName,
-            getSet: getSet,
-            currentValue: currentValue,
-            formFlag: formFlag,
-            allowedValues: allowedValues
+
+        guard let description = CapturePropertyDescriptionParser.parse(
+            data,
+            expectedPropertyCode: propertyCode
+        ) else {
+            appendLog(
+                "[capture] GetDevicePropDesc 无法解析 property=0x" +
+                    String(format: "%04X", propertyCode) +
+                    " bytes=\(data.count) hex=\(data.hexDump)"
+            )
+            return nil
+        }
+        return description
+    }
+
+    private func appendCapturePropertyDescriptionLog(
+        parameter: CaptureParameter,
+        description: CapturePropertyDescription,
+        optionCount: Int
+    ) {
+        let formDescription: String
+        switch description.form {
+        case .none:
+            formDescription = "none"
+        case .range(let minimum, let maximum, let step):
+            formDescription = "range min=\(captureHex(minimum)) max=\(captureHex(maximum)) step=\(captureHex(step))"
+        case .enumeration(let values):
+            formDescription = "enum values=[\(values.map(captureHex).joined(separator: ","))]"
+        }
+        appendLog(
+            "[capture] 可设置值 name=\(parameter.title) property=0x" +
+                String(format: "%04X", description.propertyCode) +
+                " type=0x" + String(format: "%04X", description.dataType.rawValue) +
+                " writable=\(description.isWritable) current=\(captureHex(description.currentValue)) " +
+                "form=\(formDescription) options=\(optionCount)"
         )
     }
 
-    private func readUnsignedInteger(_ data: Data, at offset: Int, width: Int) -> UInt64 {
-        switch width {
-        case 1: return UInt64(data[offset])
-        case 2: return UInt64(data.uint16(at: offset))
-        case 4: return UInt64(data.uint32(at: offset))
-        default: return 0
-        }
-    }
-
-    private func focusModeTitle(_ value: UInt64) -> String {
-        switch value {
-        case 0: return "AF-S"
-        case 1: return "AF-C"
-        case 2: return "AF-F"
-        case 5: return "AF-A"
-        case 4: return "MF"
-        default: return "未知(0x\(String(format: "%02X", value)))"
-        }
+    private func captureHex(_ value: UInt64) -> String {
+        String(format: "0x%04llX", value)
     }
 
     private func readIntegerValue(from data: Data) -> UInt64? {
@@ -3077,15 +3130,6 @@ private struct PTPResponse {
         self.data = data
         self.parameters = parameters
     }
-}
-
-private struct FocusModePropertyDescription {
-    let propertyCode: UInt16
-    let dataTypeName: String
-    let getSet: String
-    let currentValue: UInt64
-    let formFlag: UInt8
-    let allowedValues: String
 }
 
 private struct PTPIPPacket {
