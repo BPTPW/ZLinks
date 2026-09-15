@@ -589,7 +589,7 @@ struct MyCameraView: View {
     }
 
     private func formatBytes(_ bytes: UInt64) -> String {
-        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .binary)
     }
 }
 

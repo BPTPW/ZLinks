@@ -2135,6 +2135,6 @@ private struct DownloadTaskRow: View {
 
     private func formatSpeed(_ speed: Double) -> String { "\(formatBytes(UInt64(speed)))/秒" }
     private func formatBytes(_ bytes: UInt64) -> String {
-        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .binary)
     }
 }
