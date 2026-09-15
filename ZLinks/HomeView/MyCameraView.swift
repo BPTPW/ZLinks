@@ -16,6 +16,7 @@ struct MyCameraView: View {
             ScrollView {
                 VStack(spacing: 20) {
                     cameraStatusCard
+                    storageInfoCard
                     lensInfoCard
                 }
                 .padding(.horizontal, 20)
@@ -54,13 +55,7 @@ struct MyCameraView: View {
                 CameraDebugLogView(camera: camera)
             }
             .task(id: camera.state) {
-                guard case .connected = camera.state else { return }
-
-                while !Task.isCancelled {
-                    try? await Task.sleep(for: .seconds(3))
-                    if Task.isCancelled { break }
-                    await camera.refreshCameraStatus()
-                }
+                await camera.refreshCameraStatusPeriodically()
             }
         }
     }
@@ -91,8 +86,6 @@ struct MyCameraView: View {
             }
 
             if case .connected = camera.state {
-                storageSection
-
                 detailRow("相机地址", value: camera.connectedHost ?? "--")
             }
 
@@ -129,7 +122,7 @@ struct MyCameraView: View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .firstTextBaseline) {
                 Text("镜头信息")
-                    .font(.headline)
+                    .font(.title3.bold())
                 Text(lensIDText)
                     .font(.subheadline.monospacedDigit())
                     .foregroundStyle(.secondary)
@@ -317,36 +310,106 @@ struct MyCameraView: View {
         .accessibilityLabel("电量 \(batteryText)")
     }
 
-    private var storageSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
+    private var storageInfoCard: some View {
+        VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 8) {
-                Image(systemName: "externaldrive.fill")
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.blue)
                 Text("存储空间")
-                    .font(.subheadline.weight(.semibold))
-                Spacer(minLength: 8)
-                if let storageName = camera.cameraStatus.storageName, !storageName.isEmpty {
-                    Text(storageName)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-            }
-
-            ProgressView(value: storageUsedRatio)
-                .tint(.blue)
-                .scaleEffect(x: 1, y: 1.35, anchor: .center)
-
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(storageUsageText)
-                    .font(.subheadline.monospacedDigit().weight(.medium))
+                    .font(.title3.bold())
                 Spacer(minLength: 0)
             }
+
+            storageSummary(
+                used: totalStorageUsedBytes,
+                total: totalStorageBytes,
+                free: totalStorageFreeBytes,
+                isLow: isTotalStorageLow
+            )
+
+            ProgressView(value: totalStorageUsedRatio)
+                .tint(isTotalStorageLow ? .red : .blue)
+                .scaleEffect(x: 1, y: 1.35, anchor: .center)
+
+            if camera.cameraStatus.storages.isEmpty {
+                Text(camera.state == .connected ? "未检测到存储卡" : "连接相机后显示存储信息")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 72, alignment: .center)
+                    .background(.primary.opacity(0.02), in: RoundedRectangle(cornerRadius: 16))
+            } else {
+                ForEach(camera.cameraStatus.storages) { storage in
+                    storageCard(storage)
+                }
+            }
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(.clear)
+                .glassEffect(.regular, in: .rect(cornerRadius: 24))
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .strokeBorder(.primary.opacity(0.12), lineWidth: 1)
+        }
+    }
+
+    private func storageCard(_ storage: CameraConnectionService.StorageInfo) -> some View {
+        let used = usedBytes(total: storage.totalBytes, free: storage.freeBytes)
+        let isLow = isStorageLow(total: storage.totalBytes, free: storage.freeBytes)
+
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "sdcard.fill")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.blue)
+                Text(storage.name)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+            }
+
+            ProgressView(value: storageUsedRatio(total: storage.totalBytes, free: storage.freeBytes))
+                .tint(isLow ? .red : .blue)
+                .scaleEffect(x: 1, y: 1.35, anchor: .center)
+
+            storageUsageLine(used: used, total: storage.totalBytes, free: storage.freeBytes, isLow: isLow)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(14)
         .background(.primary.opacity(0.02), in: RoundedRectangle(cornerRadius: 16))
+    }
+
+    private func storageSummary(used: UInt64?, total: UInt64?, free: UInt64?, isLow: Bool) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 5) {
+            Text(used.map(formatBytes) ?? "--")
+                .font(.title2.bold())
+                .fontDesign(.rounded)
+                .foregroundStyle(isLow ? .red : .primary)
+            Text("/ \(total.map(formatBytes) ?? "--") · 可用 \(free.map(formatBytes) ?? "--")")
+                .font(.subheadline)
+                .fontDesign(.rounded)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private func storageUsageLine(used: UInt64, total: UInt64, free: UInt64, isLow: Bool) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 4) {
+            Text(formatBytes(used))
+                .font(.subheadline.weight(.semibold))
+                .fontDesign(.rounded)
+                .foregroundStyle(isLow ? .red : .primary)
+            Text("/ \(formatBytes(total)) · 可用 \(formatBytes(free))")
+                .font(.caption)
+                .fontDesign(.rounded)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+            Spacer(minLength: 0)
+        }
     }
 
     private var statusLabel: some View {
@@ -447,9 +510,9 @@ struct MyCameraView: View {
             return .secondary
         }
         switch level {
-        case 0..<20:
+        case 0..<10:
             return .red
-        case 20..<40:
+        case 10..<20:
             return .orange
         default:
             return .green
@@ -476,25 +539,41 @@ struct MyCameraView: View {
         }
     }
 
-    private var storageUsedRatio: Double {
-        guard let free = camera.cameraStatus.storageFreeBytes,
-              let total = camera.cameraStatus.storageTotalBytes,
-              total > 0
-        else {
-            return 0
-        }
-        let used = total > free ? total - free : 0
-        return min(max(Double(used) / Double(total), 0), 1)
+    private var totalStorageBytes: UInt64? {
+        camera.cameraStatus.storageTotalBytes
     }
 
-    private var storageUsageText: String {
-        guard let free = camera.cameraStatus.storageFreeBytes,
-              let total = camera.cameraStatus.storageTotalBytes
-        else {
-            return "-- / --"
-        }
-        let used = total > free ? total - free : 0
-        return "\(formatBytes(used)) / \(formatBytes(total))"
+    private var totalStorageFreeBytes: UInt64? {
+        camera.cameraStatus.storageFreeBytes
+    }
+
+    private var totalStorageUsedBytes: UInt64? {
+        guard let total = totalStorageBytes, let free = totalStorageFreeBytes else { return nil }
+        return usedBytes(total: total, free: free)
+    }
+
+    private var totalStorageUsedRatio: Double {
+        guard let total = totalStorageBytes, let free = totalStorageFreeBytes else { return 0 }
+        return storageUsedRatio(total: total, free: free)
+    }
+
+    private var isTotalStorageLow: Bool {
+        guard let total = totalStorageBytes, let free = totalStorageFreeBytes else { return false }
+        return isStorageLow(total: total, free: free)
+    }
+
+    private func usedBytes(total: UInt64, free: UInt64) -> UInt64 {
+        total > free ? total - free : 0
+    }
+
+    private func storageUsedRatio(total: UInt64, free: UInt64) -> Double {
+        guard total > 0 else { return 0 }
+        return min(max(Double(usedBytes(total: total, free: free)) / Double(total), 0), 1)
+    }
+
+    private func isStorageLow(total: UInt64, free: UInt64) -> Bool {
+        guard total > 0 else { return false }
+        return Double(free) / Double(total) < 0.1
     }
 
     private func detailRow(_ title: String, value: String) -> some View {

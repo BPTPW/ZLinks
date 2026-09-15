@@ -33,10 +33,40 @@ final class CameraConnectionService: ObservableObject {
 
     struct CameraStatus: Equatable {
         var batteryLevel: Int?
-        var storageName: String?
-        var storageTotalBytes: UInt64?
-        var storageFreeBytes: UInt64?
+        var storages: [StorageInfo] = []
         var mediaObjectCount: Int?
+
+        var storageName: String? {
+            switch storages.count {
+            case 0: return nil
+            case 1: return storages[0].name
+            default: return "\(storages.count) 张存储卡"
+            }
+        }
+
+        var storageTotalBytes: UInt64? {
+            aggregateStorageValue(\.totalBytes)
+        }
+
+        var storageFreeBytes: UInt64? {
+            aggregateStorageValue(\.freeBytes)
+        }
+
+        private func aggregateStorageValue(_ keyPath: KeyPath<StorageInfo, UInt64>) -> UInt64? {
+            guard !storages.isEmpty else { return nil }
+            return storages.reduce(0) { partialResult, storage in
+                let (sum, overflow) = partialResult.addingReportingOverflow(storage[keyPath: keyPath])
+                return overflow ? UInt64.max : sum
+            }
+        }
+    }
+
+    struct StorageInfo: Identifiable, Equatable {
+        let id: UInt32
+        var name: String
+        var totalBytes: UInt64
+        var freeBytes: UInt64
+        var freeImageCount: UInt32?
     }
 
     enum LensConnectionState: Equatable {
@@ -465,6 +495,16 @@ final class CameraConnectionService: ObservableObject {
         appendLog("开始刷新相机状态")
         cameraStatus = await readCameraStatus(on: commandConnection)
         lensInfo = await readLensInfo(on: commandConnection)
+    }
+
+    func refreshCameraStatusPeriodically(every interval: Duration = .seconds(3)) async {
+        guard case .connected = state else { return }
+
+        while !Task.isCancelled {
+            try? await Task.sleep(for: interval)
+            if Task.isCancelled { break }
+            await refreshCameraStatus()
+        }
     }
 
     private func beginGalleryLoad() -> Int {
@@ -2624,23 +2664,23 @@ final class CameraConnectionService: ObservableObject {
             status.batteryLevel = min(Int(value), 100)
         }
 
-        if let storageIDs = try? await operation(.getStorageIDs, parameters: [], dataPhase: .receive, on: connection),
-           storageIDs.code == PTPResponseCode.ok.rawValue,
-           let data = storageIDs.data,
-           data.count >= 4
-        {
-            let count = Int(data.uint32(at: 0))
-            if count > 0, data.count >= 8 {
-                let storageID = data.uint32(at: 4)
-                if let storageInfo = try? await operation(.getStorageInfo, parameters: [storageID], dataPhase: .receive, on: connection),
-                   storageInfo.code == PTPResponseCode.ok.rawValue,
-                   let storageData = storageInfo.data,
-                   storageData.count >= 27
-                {
-                    status.storageTotalBytes = storageData.uint64(at: 6)
-                    status.storageFreeBytes = storageData.uint64(at: 14)
-                    status.storageName = try? readPTPString(from: storageData, offset: 26).value
+        if let storageIDs = try? await fetchStorageIDs(on: connection) {
+            var totalObjectCount = 0
+            var didReadObjectCount = false
+
+            for (index, storageID) in storageIDs.enumerated() {
+                if let response = try? await operation(
+                    .getStorageInfo,
+                    parameters: [storageID],
+                    dataPhase: .receive,
+                    on: connection,
+                    logStyle: .silent
+                ), response.code == PTPResponseCode.ok.rawValue,
+                let data = response.data,
+                let storage = parseStorageInfo(data, storageID: storageID, index: index) {
+                    status.storages.append(storage)
                 }
+
                 if let numberOfObjects = try? await operation(
                     .getNumObjects,
                     parameters: [storageID, 0, 0],
@@ -2649,12 +2689,47 @@ final class CameraConnectionService: ObservableObject {
                 ), numberOfObjects.code == PTPResponseCode.ok.rawValue,
                 let objectData = numberOfObjects.data,
                 objectData.count >= 4 {
-                    status.mediaObjectCount = Int(objectData.uint32(at: 0))
+                    totalObjectCount += Int(objectData.uint32(at: 0))
+                    didReadObjectCount = true
                 }
+            }
+
+            if didReadObjectCount {
+                status.mediaObjectCount = totalObjectCount
             }
         }
 
         return status
+    }
+
+    private func parseStorageInfo(_ data: Data, storageID: UInt32, index: Int) -> StorageInfo? {
+        // PTP StorageInfo dataset: 3 UInt16 fields, 2 UInt64 fields,
+        // FreeSpaceInImages (UInt32), StorageDescription and VolumeLabel.
+        guard data.count >= 26 else { return nil }
+
+        let totalBytes = data.uint64(at: 6)
+        let freeBytes = min(data.uint64(at: 14), totalBytes)
+        let freeImageCount = data.uint32(at: 22)
+        var description = ""
+        var volumeLabel = ""
+
+        if data.count > 26,
+           let parsedDescription = try? readPTPString(from: data, offset: 26) {
+            description = parsedDescription.value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if parsedDescription.nextOffset < data.count,
+               let parsedVolumeLabel = try? readPTPString(from: data, offset: parsedDescription.nextOffset) {
+                volumeLabel = parsedVolumeLabel.value.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+
+        let name = !description.isEmpty ? description : (!volumeLabel.isEmpty ? volumeLabel : "卡槽\(index + 1)")
+        return StorageInfo(
+            id: storageID,
+            name: name,
+            totalBytes: totalBytes,
+            freeBytes: freeBytes,
+            freeImageCount: freeImageCount == UInt32.max ? nil : freeImageCount
+        )
     }
 
     private func readLensInfo(on connection: NWConnection) async -> LensInfo {

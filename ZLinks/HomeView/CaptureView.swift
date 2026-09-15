@@ -85,6 +85,9 @@ struct CaptureView: View {
             }
             await camera.stopLiveView()
         }
+        .task(id: camera.state) {
+            await camera.refreshCameraStatusPeriodically()
+        }
         .fullScreenCover(isPresented: $isFullscreenPresented) {
             CaptureFullscreenMonitor(
                 showsGrid: $showsGrid,
@@ -624,6 +627,20 @@ private struct CaptureFullscreenVideoStatusOverlay: View {
         return "\(batteryLevel)%"
     }
 
+    private var batteryColor: Color {
+        guard case .connected = camera.state,
+              let batteryLevel = camera.cameraStatus.batteryLevel
+        else { return .white }
+        switch batteryLevel {
+        case 0..<10:
+            return .red
+        case 10..<20:
+            return .orange
+        default:
+            return .white
+        }
+    }
+
     private var storageUsedRatio: Double {
         guard let free = camera.cameraStatus.storageFreeBytes,
               let total = camera.cameraStatus.storageTotalBytes,
@@ -639,6 +656,14 @@ private struct CaptureFullscreenVideoStatusOverlay: View {
         else { return "-- /" }
         let used = total > free ? total - free : 0
         return "\(formatBytes(used)) /"
+    }
+
+    private var isStorageLow: Bool {
+        guard let free = camera.cameraStatus.storageFreeBytes,
+              let total = camera.cameraStatus.storageTotalBytes,
+              total > 0
+        else { return false }
+        return Double(free) / Double(total) < 0.1
     }
 
     private var storageTotalText: String {
@@ -657,7 +682,7 @@ private struct CaptureFullscreenVideoStatusOverlay: View {
                             .frame(width: 36)
                         statusValue(frameRateText)
                             .frame(width: 66)
-                        statusValue(batteryText)
+                        statusValue(batteryText, color: batteryColor)
                             .frame(width: 44)
                     }
                 }
@@ -698,7 +723,7 @@ private struct CaptureFullscreenVideoStatusOverlay: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(storageUsedText)
                     .font(.caption.monospacedDigit().weight(.semibold))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(isStorageLow ? .orange : .white)
                     .lineLimit(1)
 
                 Text(storageTotalText)
@@ -711,7 +736,7 @@ private struct CaptureFullscreenVideoStatusOverlay: View {
                         Capsule()
                             .fill(.white.opacity(0.32))
                         Capsule()
-                            .fill(.white)
+                            .fill(isStorageLow ? .orange : .white)
                             .frame(width: proxy.size.width * storageUsedRatio)
                     }
                 }
@@ -762,7 +787,7 @@ private struct CaptureFullscreenReadouts: View {
                                 rawValue: camera.captureParameters[parameter]
                             )
                         )
-                        .font(.headline.monospacedDigit().weight(.semibold))
+                        .font(.caption.monospacedDigit().weight(.semibold))
                         .foregroundStyle(.white)
                         .lineLimit(1)
                         .minimumScaleFactor(0.7)
