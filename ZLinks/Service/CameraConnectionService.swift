@@ -280,6 +280,7 @@ final class CameraConnectionService: ObservableObject {
                 self?.handleAppDidBecomeActive()
             }
         }
+        observeUSBCameraLink()
     }
 
     deinit {
@@ -383,11 +384,17 @@ final class CameraConnectionService: ObservableObject {
 
     /// USB 有线连接：先打开 ImageCaptureCore 会话，再按相机能力启用 PTP 直通。
     func connectUSBCamera(_ descriptor: USBCameraDescriptor) async {
+        if case .connecting = state, linkKind == .usb {
+            appendLog("[usb] 忽略重复连接请求 device=\(descriptor.title)")
+            return
+        }
         reconnectTask?.cancel()
         reconnectTask = nil
         lastEndpoint = nil
         lastDisplayHost = nil
         disconnect(clearRememberedDevice: false)
+        let generation = UUID()
+        connectionGeneration = generation
         state = .connecting
         linkKind = .usb
         isUSBPTPReady = false
@@ -396,6 +403,7 @@ final class CameraConnectionService: ObservableObject {
 
         do {
             try await usbLink.open(descriptor)
+            guard connectionGeneration == generation else { return }
             usbCatalog = usbLink.catalogSnapshot()
             connectedHost = "\(descriptor.title)（USB）"
 
@@ -404,6 +412,7 @@ final class CameraConnectionService: ObservableObject {
                 commandChannel = channel
                 do {
                     try await establishSession(on: channel)
+                    guard connectionGeneration == generation else { return }
                     isUSBPTPReady = true
                     appendLog("[usb] PTP 直通会话已建立")
                 } catch {
@@ -423,6 +432,7 @@ final class CameraConnectionService: ObservableObject {
             isReconnecting = false
             appendLog("USB 连接成功")
         } catch {
+            guard connectionGeneration == generation else { return }
             appendLog("USB 连接失败 error=\(error.localizedDescription)")
             usbLink.closeSession()
             disconnectConnections()
@@ -456,7 +466,14 @@ final class CameraConnectionService: ObservableObject {
     }
 
     private func handleUSBDisconnect(reason: String) {
-        guard case .connected = state, linkKind == .usb else { return }
+        guard linkKind == .usb else { return }
+        switch state {
+        case .connecting, .connected:
+            break
+        case .disconnected, .failed:
+            return
+        }
+        connectionGeneration = UUID()
         appendLog("检测到 USB 连接断开 reason=\(reason)")
         disconnect(clearRememberedDevice: false)
         state = .failed("USB 连接已断开，请重新插拔数据线后重试")

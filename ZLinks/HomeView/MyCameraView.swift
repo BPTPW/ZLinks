@@ -88,10 +88,7 @@ struct MyCameraView: View {
             if case .connected = camera.state {
                 detailRow("连接方式", value: camera.linkKind.title)
                 detailRow("相机地址", value: camera.connectedHost ?? "--")
-            } else {
-                detailRow("可用连接", value: "WI-FI（AP / STA）· USB 有线")
             }
-
             Divider()
 
             Button {
@@ -642,7 +639,7 @@ private struct CameraConnectionSheet: View {
                         if isConnecting {
                             HStack(spacing: 10) {
                                 ProgressView()
-                                Text("正在连接相机…")
+                                Text(selectedMode == .usb ? camera.usbLink.statusMessage : "正在连接相机…")
                                     .font(.subheadline)
                                     .foregroundStyle(.secondary)
                             }
@@ -950,7 +947,7 @@ private struct CameraDebugLogView: View {
                     ContentUnavailableView(
                         "暂无连接日志",
                         systemImage: "doc.text.magnifyingglass",
-                        description: Text("连接相机后，TCP、PTP/IP 报文、解析偏移和失败原因会显示在这里。")
+                        description: Text("WI-FI 与 USB 的设备发现、权限、会话、协议报文和失败原因会显示在这里。")
                     )
                 } else {
                     ScrollView([.vertical, .horizontal]) {

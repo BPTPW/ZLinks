@@ -104,6 +104,13 @@ struct USBPTPTransactionResult {
     let transactionID: UInt32
     let parameters: [UInt32]
     let data: Data
+    let dataMode: USBPTPDataMode
+}
+
+enum USBPTPDataMode: String {
+    case none
+    case container
+    case raw
 }
 
 @MainActor
@@ -128,31 +135,83 @@ final class USBCameraLink: ObservableObject {
     private var filesByHandle: [UInt32: ICCameraFile] = [:]
     private var catalog = USBCameraCatalog.empty
     private var catalogDidComplete = false
-    private var isClosingSession = false
+    private var intentionallyClosingDevices: Set<ObjectIdentifier> = []
     private var framing: USBPTPFraming = .standard
+    private var discoveryTask: Task<Void, Never>?
 
     // MARK: - 设备发现
 
     func startDiscovery() {
         guard !browser.isBrowsing else {
             isBrowsing = true
+            log("[usb][discovery] 扫描已在运行 devices=\(browser.devices?.count ?? 0)")
             return
         }
-        browser.delegate = proxy
-        browser.browsedDeviceTypeMask = ICDeviceTypeMask(
-            rawValue: ICDeviceTypeMask.camera.rawValue | ICDeviceLocationTypeMask.local.rawValue
-        )
-        browser.start()
+        guard discoveryTask == nil else {
+            log("[usb][discovery] 正在等待内容访问授权")
+            return
+        }
         isBrowsing = true
-        refreshStatusMessage()
-        for device in browser.devices ?? [] {
-            if let camera = device as? ICCameraDevice {
-                register(camera)
+        statusMessage = "正在检查 USB 相机访问权限"
+        log(
+            "[usb][discovery] 开始扫描前检查 contentsAuth=\(Self.authorizationDescription(browser.contentsAuthorizationStatus)) " +
+                "controlAuth=\(Self.authorizationDescription(browser.controlAuthorizationStatus))"
+        )
+        discoveryTask = Task { [weak self] in
+            guard let self else { return }
+            let authorization = await self.browser.requestContentsAuthorization()
+            guard !Task.isCancelled else { return }
+            self.log("[usb][discovery] 内容授权结果 status=\(Self.authorizationDescription(authorization)) raw=\(authorization.rawValue)")
+            guard authorization == .authorized else {
+                self.isBrowsing = false
+                self.statusMessage = "未获得读取 USB 相机内容的权限"
+                self.log("[usb][discovery] 扫描终止 stage=authorization")
+                self.discoveryTask = nil
+                return
+            }
+
+            self.browser.delegate = self.proxy
+            self.browser.browsedDeviceTypeMask = ICDeviceTypeMask(
+                rawValue: ICDeviceTypeMask.camera.rawValue | ICDeviceLocationTypeMask.local.rawValue
+            ) ?? .camera
+            self.log(
+                "[usb][discovery] 启动 ICDeviceBrowser mask=0x" +
+                    String(format: "%08X", self.browser.browsedDeviceTypeMask.rawValue)
+            )
+            self.browser.start()
+            self.log("[usb][discovery] browser.start 完成 isBrowsing=\(self.browser.isBrowsing)")
+            for device in self.browser.devices ?? [] {
+                self.forwardDeviceAdded(device, source: "initial", moreComing: false)
+            }
+            self.log("[usb][discovery] 初始设备快照 count=\(self.browser.devices?.count ?? 0)")
+            self.discoveryTask = nil
+            self.refreshStatusMessage()
+            Task { [weak self] in
+                try? await Task.sleep(for: .seconds(3))
+                guard let self, self.browser.isBrowsing, self.cameras.isEmpty else { return }
+                self.log(
+                    "[usb][discovery] 3 秒内未收到设备回调；故障位于系统 USB 枚举层，" +
+                        "尚未进入 MTP/PTP 会话。请检查相机 USB=MTP/PTP、数据线、转接器与供电"
+                )
             }
         }
     }
 
     func stopDiscovery() {
+        discoveryTask?.cancel()
+        discoveryTask = nil
+        if activeDevice != nil || connectedDeviceID != nil {
+            isBrowsing = false
+            log(
+                "[usb][discovery] 连接页关闭，保留活动 browser/session " +
+                    "device=\(connectedDeviceTitle ?? activeDevice?.name ?? "--")"
+            )
+            return
+        }
+        log(
+            "[usb][discovery] 停止扫描 browserActive=\(browser.isBrowsing) " +
+                "browserDevices=\(browser.devices?.count ?? 0) cameras=\(cameras.count)"
+        )
         if browser.isBrowsing {
             browser.stop()
         }
@@ -172,11 +231,17 @@ final class USBCameraLink: ObservableObject {
             cameras.append(descriptor)
         }
         cameras.sort { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
+        log(
+            "[usb][discovery] 相机已登记 id=\(descriptor.id) title=\(descriptor.title) " +
+                "vid=0x\(String(format: "%04X", UInt32(bitPattern: descriptor.vendorID))) " +
+                "pid=0x\(String(format: "%04X", UInt32(bitPattern: descriptor.productID))) cameras=\(cameras.count)"
+        )
         refreshStatusMessage()
     }
 
     func unregister(_ device: ICDevice) {
         let identifier = Self.identifier(for: device)
+        log("[usb][discovery] 设备移除 id=\(identifier) name=\(device.name ?? "--")")
         devicesByID[identifier] = nil
         cameras.removeAll { $0.id == identifier }
         refreshStatusMessage()
@@ -198,29 +263,42 @@ final class USBCameraLink: ObservableObject {
         connectedDeviceID = descriptor.id
         connectedDeviceTitle = descriptor.title
         device.delegate = proxy
-        log("[usb] 打开会话 device=\(descriptor.title) \(descriptor.subtitle)")
+        log("[usb][session] 准备打开 device=\(descriptor.title) \(descriptor.subtitle)")
+        log("[usb][session] \(Self.deviceDiagnosticDescription(device))")
 
-        let authorization = await browser.requestControlAuthorization()
-        log("[usb] 控制授权 status=\(authorization.rawValue)")
+        let contentsAuthorization = await browser.requestContentsAuthorization()
+        log("[usb][session] 内容授权 status=\(Self.authorizationDescription(contentsAuthorization)) raw=\(contentsAuthorization.rawValue)")
+        guard contentsAuthorization == .authorized else {
+            throw CameraConnectionError.usbUnavailable("未获得读取相机内容的权限，请在系统设置中允许后重试")
+        }
+
+        let controlAuthorization = await browser.requestControlAuthorization()
+        log("[usb][session] 控制授权 status=\(Self.authorizationDescription(controlAuthorization)) raw=\(controlAuthorization.rawValue)")
+        guard controlAuthorization == .authorized else {
+            throw CameraConnectionError.usbUnavailable("未获得控制相机的权限，请在系统设置中允许后重试")
+        }
 
         if !device.hasOpenSession {
-            device.requestOpenSession()
+            log("[usb][session] 请求打开 ImageCaptureCore 会话")
+            try await device.requestOpenSession()
+        } else {
+            log("[usb][session] 复用已打开的 ImageCaptureCore 会话")
         }
         try await waitForSession(device)
         isSessionOpen = true
-        log("[usb] 会话已建立 hasOpenSession=\(device.hasOpenSession)")
+        log("[usb][session] 会话已建立 hasOpenSession=\(device.hasOpenSession)")
 
         catalogDidComplete = false
-        await waitForCatalog(device)
+        try await waitForCatalog(device)
         catalog = makeCatalogSnapshot(device)
-        log("[usb] 内容目录完成 folders=\(catalog.folders.count) objects=\(catalog.objectCount)")
+        log("[usb][session] 内容目录完成 folders=\(catalog.folders.count) objects=\(catalog.objectCount)")
 
         do {
             try await negotiateFraming(device)
             isPTPReady = true
         } catch {
             isPTPReady = false
-            log("[usb] PTP 直通不可用：\(error.localizedDescription)")
+            log("[usb][ptp] 直通不可用 error=\(String(reflecting: error)) description=\(error.localizedDescription)")
         }
     }
 
@@ -229,12 +307,17 @@ final class USBCameraLink: ObservableObject {
             resetSessionState()
             return
         }
-        isClosingSession = true
+        log("[usb][session] 关闭会话 hasOpenSession=\(device.hasOpenSession) device=\(device.name ?? "--")")
         if device.hasOpenSession {
+            let identifier = ObjectIdentifier(device)
+            intentionallyClosingDevices.insert(identifier)
             device.requestCloseSession()
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(5))
+                self?.intentionallyClosingDevices.remove(identifier)
+            }
         }
         device.delegate = nil
-        isClosingSession = false
         resetSessionState()
     }
 
@@ -260,34 +343,68 @@ final class USBCameraLink: ObservableObject {
         }
     }
 
-    private func handleSessionClosed(reason: String) {
-        guard !isClosingSession else { return }
+    private func handleSessionClosed(device: ICDevice, reason: String) {
+        let identifier = ObjectIdentifier(device)
+        if intentionallyClosingDevices.remove(identifier) != nil {
+            log("[usb][session] 忽略主动关闭完成回调 device=\(device.name ?? "--")")
+            return
+        }
+        guard activeDevice === device else {
+            log("[usb][session] 忽略非活动设备的会话关闭回调 device=\(device.name ?? "--")")
+            return
+        }
         guard connectedDeviceID != nil else { return }
         resetSession(reason: reason)
     }
 
     private func waitForSession(_ device: ICCameraDevice) async throws {
         let deadline = Date().addingTimeInterval(20)
+        log("[usb][session] 等待会话就绪 timeout=20s")
         while Date() < deadline {
             if device.hasOpenSession { return }
             if Task.isCancelled { throw CameraConnectionError.connectionCancelled }
             try? await Task.sleep(for: .milliseconds(120))
         }
+        log("[usb][session] 会话等待超时 hasOpenSession=\(device.hasOpenSession)")
         throw CameraConnectionError.usbUnavailable("相机未响应 USB 会话请求，请重新插拔数据线后重试")
     }
 
-    private func waitForCatalog(_ device: ICCameraDevice) async {
+    private func waitForCatalog(_ device: ICCameraDevice) async throws {
         let deadline = Date().addingTimeInterval(12)
+        var reachedCompletion = false
+        let initialProgress = max(0, min(device.contentCatalogPercentCompleted, 100))
+        statusMessage = "正在读取相机内容（\(initialProgress)%）"
+        log("[usb][session] 等待内容目录 timeout=12s initialProgress=\(initialProgress)%")
         while Date() < deadline {
-            if catalogDidComplete { break }
+            guard activeDevice === device, device.hasOpenSession else {
+                log("[usb][session] 内容目录等待中止 reason=会话已关闭")
+                throw CameraConnectionError.connectionCancelled
+            }
+            if catalogDidComplete {
+                reachedCompletion = true
+                break
+            }
             let progress = Double(max(0, min(device.contentCatalogPercentCompleted, 100))) / 100
-            if progress != catalogProgress { catalogProgress = progress }
-            if progress >= 1 { break }
-            if Task.isCancelled { break }
-            try? await Task.sleep(for: .milliseconds(150))
+            if progress != catalogProgress {
+                catalogProgress = progress
+                statusMessage = "正在读取相机内容（\(Int(progress * 100))%）"
+            }
+            if progress >= 1 {
+                reachedCompletion = true
+                break
+            }
+            if Task.isCancelled { throw CameraConnectionError.connectionCancelled }
+            try await Task.sleep(for: .milliseconds(150))
+        }
+        if !reachedCompletion {
+            log(
+                "[usb][session] 内容目录等待结束但未收到完成信号 progress=" +
+                    "\(device.contentCatalogPercentCompleted)% cancelled=\(Task.isCancelled)"
+            )
         }
         catalogDidComplete = true
         catalogProgress = 1
+        statusMessage = reachedCompletion ? "相机内容读取完成" : "相机内容仍在后台读取"
     }
 
     // MARK: - PTP 直通
@@ -297,6 +414,7 @@ final class USBCameraLink: ObservableObject {
         var failures: [String] = []
         for candidate in [USBPTPFraming.standard, .lengthLess] {
             framing = candidate
+            log("[usb][ptp] 探测 framing=\(candidate.rawValue)")
             do {
                 let session = try await sendRaw(
                     on: device,
@@ -308,6 +426,10 @@ final class USBCameraLink: ObservableObject {
                 guard session.code == PTPResponseCode.ok.rawValue
                     || session.code == PTPResponseCode.sessionAlreadyOpen.rawValue
                 else {
+                    log(
+                        "[usb][ptp] 探测 OpenSession 被拒绝 framing=\(candidate.rawValue) " +
+                            "code=0x\(String(format: "%04X", session.code))"
+                    )
                     failures.append("\(candidate.rawValue) OpenSession 0x\(String(format: "%04X", session.code))")
                     continue
                 }
@@ -320,6 +442,10 @@ final class USBCameraLink: ObservableObject {
                     outgoingData: nil
                 )
                 guard info.code == PTPResponseCode.ok.rawValue, info.data.count > 20 else {
+                    log(
+                        "[usb][ptp] 探测 GetDeviceInfo 失败 framing=\(candidate.rawValue) " +
+                            "code=0x\(String(format: "%04X", info.code)) bytes=\(info.data.count)"
+                    )
                     failures.append(
                         "\(candidate.rawValue) GetDeviceInfo 0x\(String(format: "%04X", info.code)) bytes=\(info.data.count)"
                     )
@@ -328,6 +454,10 @@ final class USBCameraLink: ObservableObject {
                 log("[usb] PTP 直通就绪 framing=\(candidate.rawValue) deviceInfoBytes=\(info.data.count)")
                 return
             } catch {
+                log(
+                    "[usb][ptp] 探测传输异常 framing=\(candidate.rawValue) " +
+                        "error=\(String(reflecting: error))"
+                )
                 failures.append("\(candidate.rawValue) \(error.localizedDescription)")
             }
         }
@@ -365,13 +495,45 @@ final class USBCameraLink: ObservableObject {
         let dataContainer = outgoingData.map {
             makeDataContainer(code: code, transactionID: transactionID, payload: $0)
         }
-        let (first, second) = try await device.requestSendPTPCommand(command, outData: dataContainer)
-        return Self.decodeTransaction(
-            first: first,
-            second: second,
-            fallbackTransactionID: transactionID,
-            fallbackCode: PTPResponseCode.ok.rawValue
+        let parameterText = parameters.map { String(format: "0x%08X", $0) }.joined(separator: ",")
+        log(
+            "[usb][ptp] send opcode=0x\(String(format: "%04X", code)) tx=\(transactionID) " +
+                "framing=\(framing.rawValue) params=[\(parameterText)] commandBytes=\(command.count) " +
+                "outBytes=\(outgoingData?.count ?? 0)"
         )
+        do {
+            let (first, second) = try await device.requestSendPTPCommand(command, outData: dataContainer)
+            let firstProbe = Self.probeContainer(first)
+            let secondProbe = Self.probeContainer(second)
+            let result = Self.decodeTransaction(
+                first: first,
+                second: second,
+                fallbackTransactionID: transactionID,
+                fallbackCode: PTPResponseCode.ok.rawValue
+            )
+            log(
+                "[usb][ptp] recv opcode=0x\(String(format: "%04X", code)) tx=\(transactionID) " +
+                    "first=\(Self.containerDescription(firstProbe.kind))/\(first.count)B " +
+                    "second=\(Self.containerDescription(secondProbe.kind))/\(second.count)B " +
+                    "responseFound=\(firstProbe.kind == .response || secondProbe.kind == .response) " +
+                    "code=0x\(String(format: "%04X", result.code)) dataBytes=\(result.data.count) " +
+                    "dataMode=\(result.dataMode.rawValue)"
+            )
+            if result.dataMode != .raw,
+               (firstProbe.kind == nil && !first.isEmpty) || (secondProbe.kind == nil && !second.isEmpty)
+            {
+                log(
+                    "[usb][ptp] 未识别容器 firstHex=\(first.hexDump) secondHex=\(second.hexDump)"
+                )
+            }
+            return result
+        } catch {
+            log(
+                "[usb][ptp] transportError opcode=0x\(String(format: "%04X", code)) tx=\(transactionID) " +
+                    "error=\(String(reflecting: error)) description=\(error.localizedDescription)"
+            )
+            throw error
+        }
     }
 
     private func makeCommandContainer(code: UInt16, transactionID: UInt32, parameters: [UInt32]) -> Data {
@@ -452,15 +614,28 @@ final class USBCameraLink: ObservableObject {
         }
 
         var data = Data()
+        var dataMode = USBPTPDataMode.none
         if let dataContainer {
             data = payload(of: dataContainer, headerOffset: dataOffset)
+            dataMode = .container
+        } else if responseContainer != nil {
+            // ImageCaptureCore may strip the inbound data-container header and return only the
+            // PTP dataset. Only accept that form when the other value is a valid response.
+            if !firstIsResponse, firstProbe.kind == nil, !first.isEmpty {
+                data = first
+                dataMode = .raw
+            } else if !secondIsResponse, secondProbe.kind == nil, !second.isEmpty {
+                data = second
+                dataMode = .raw
+            }
         }
 
         return USBPTPTransactionResult(
             code: code,
             transactionID: transactionID,
             parameters: parameters,
-            data: data
+            data: data,
+            dataMode: dataMode
         )
     }
 
@@ -488,6 +663,15 @@ final class USBCameraLink: ObservableObject {
             }
         }
         return container.subdata(in: start..<end)
+    }
+
+    private static func containerDescription(_ kind: USBPTPContainerKind?) -> String {
+        switch kind {
+        case .command: return "command"
+        case .data: return "data"
+        case .response: return "response"
+        case nil: return "unknown"
+        }
     }
 
     // MARK: - 内容目录
@@ -615,9 +799,28 @@ final class USBCameraLink: ObservableObject {
         logHandler?(message)
     }
 
+    private static func authorizationDescription(_ status: ICAuthorizationStatus) -> String {
+        if status == .authorized { return "authorized" }
+        if status == .denied { return "denied" }
+        if status == .restricted { return "restricted" }
+        if status == .notDetermined { return "notDetermined" }
+        return "unknown(\(status.rawValue))"
+    }
+
+    private static func deviceDiagnosticDescription(_ device: ICDevice) -> String {
+        let capabilities = device.capabilities.map { String(describing: $0) }.joined(separator: ",")
+        return "device class=\(String(describing: Swift.type(of: device))) " +
+            "name=\(device.name ?? "--") productKind=\(device.productKind ?? "--") " +
+            "transport=\(device.transportType ?? "--") typeRaw=\(device.type.rawValue) " +
+            "vid=0x\(String(format: "%04X", UInt32(bitPattern: device.usbVendorID))) " +
+            "pid=0x\(String(format: "%04X", UInt32(bitPattern: device.usbProductID))) " +
+            "location=0x\(String(format: "%08X", UInt32(bitPattern: device.usbLocationID))) " +
+            "uuid=\(device.uuidString ?? "--") hasSession=\(device.hasOpenSession) " +
+            "capabilities=[\(capabilities)]"
+    }
+
     static func identifier(for device: ICDevice) -> String {
         if let uuid = device.uuidString, !uuid.isEmpty { return uuid }
-        if let serial = device.serialNumberString, !serial.isEmpty { return "serial:\(serial)" }
         return "usb:\(device.usbLocationID)"
     }
 
@@ -626,7 +829,7 @@ final class USBCameraLink: ObservableObject {
             id: identifier(for: device),
             name: device.name ?? "",
             model: device.productKind ?? device.name ?? "",
-            serialNumber: device.serialNumberString ?? "",
+            serialNumber: "",
             vendorID: device.usbVendorID,
             productID: device.usbProductID,
             locationID: device.usbLocationID
@@ -664,8 +867,15 @@ final class USBCameraLink: ObservableObject {
     }
 
     /// ImageCaptureCore 的回调可能来自任意队列，统一转发到主线程处理。
-    func forwardDeviceAdded(_ device: ICDevice) {
-        guard let camera = device as? ICCameraDevice else { return }
+    func forwardDeviceAdded(_ device: ICDevice, source: String, moreComing: Bool) {
+        log(
+            "[usb][discovery] didAdd source=\(source) moreComing=\(moreComing) " +
+                Self.deviceDiagnosticDescription(device)
+        )
+        guard let camera = device as? ICCameraDevice else {
+            log("[usb][discovery] 忽略非 ICCameraDevice class=\(String(describing: Swift.type(of: device)))")
+            return
+        }
         register(camera)
     }
 
@@ -676,11 +886,11 @@ final class USBCameraLink: ObservableObject {
     func forwardCatalogCompleted() {
         catalogDidComplete = true
         catalogProgress = 1
-        log("[usb] 内容目录枚举完成")
+        log("[usb][session] 收到内容目录枚举完成回调")
     }
 
-    func forwardSessionClosed(reason: String) {
-        handleSessionClosed(reason: reason)
+    func forwardSessionClosed(device: ICDevice, reason: String) {
+        handleSessionClosed(device: device, reason: reason)
     }
 
     func forwardLog(_ message: String) {
@@ -702,19 +912,13 @@ private final class USBCameraProxy: NSObject, ICDeviceBrowserDelegate, ICDeviceD
 
     func deviceBrowser(_ browser: ICDeviceBrowser, didAdd device: ICDevice, moreComing: Bool) {
         Task { @MainActor [weak link] in
-            link?.forwardDeviceAdded(device)
+            link?.forwardDeviceAdded(device, source: "callback", moreComing: moreComing)
         }
     }
 
     func deviceBrowser(_ browser: ICDeviceBrowser, didRemove device: ICDevice, moreGoing: Bool) {
         Task { @MainActor [weak link] in
             link?.forwardDeviceRemoved(device)
-        }
-    }
-
-    func deviceBrowserDidEnumerateLocalDevices(_ browser: ICDeviceBrowser) {
-        Task { @MainActor [weak link] in
-            link?.forwardLog("已完成本机 USB 设备枚举")
         }
     }
 
@@ -727,26 +931,68 @@ private final class USBCameraProxy: NSObject, ICDeviceBrowserDelegate, ICDeviceD
     }
 
     func device(_ device: ICDevice, didOpenSessionWithError error: Error?) {
-        guard let error else { return }
         Task { @MainActor [weak link] in
-            link?.forwardLog("打开会话返回错误：\(error.localizedDescription)")
+            if let error {
+                link?.forwardLog(
+                    "[session] 打开会话回调 error=\(String(reflecting: error)) " +
+                        "description=\(error.localizedDescription)"
+                )
+            } else {
+                link?.forwardLog("[session] 打开会话回调成功 hasOpenSession=\(device.hasOpenSession)")
+            }
         }
     }
 
     func device(_ device: ICDevice, didCloseSessionWithError error: Error?) {
         let reason = error.map { "USB 会话已关闭：\($0.localizedDescription)" } ?? "USB 会话已关闭"
         Task { @MainActor [weak link] in
-            link?.forwardSessionClosed(reason: reason)
+            link?.forwardSessionClosed(device: device, reason: reason)
         }
     }
 
     func deviceDidBecomeReady(_ device: ICDevice) {
         Task { @MainActor [weak link] in
-            link?.forwardLog("USB 设备已就绪")
+            link?.forwardLog("[session] USB 设备已就绪 hasOpenSession=\(device.hasOpenSession)")
+        }
+    }
+
+    func device(_ device: ICDevice, didEncounterError error: Error?) {
+        Task { @MainActor [weak link] in
+            link?.forwardLog(
+                "[session] 设备错误 error=\(error.map { String(reflecting: $0) } ?? "nil")"
+            )
         }
     }
 
     // MARK: ICCameraDeviceDelegate
+
+    func cameraDevice(_ camera: ICCameraDevice, didAdd items: [ICCameraItem]) {}
+
+    func cameraDevice(_ camera: ICCameraDevice, didRemove items: [ICCameraItem]) {}
+
+    func cameraDevice(
+        _ camera: ICCameraDevice,
+        didReceiveThumbnail thumbnail: CGImage?,
+        for item: ICCameraItem,
+        error: Error?
+    ) {}
+
+    func cameraDevice(
+        _ camera: ICCameraDevice,
+        didReceiveMetadata metadata: [AnyHashable: Any]?,
+        for item: ICCameraItem,
+        error: Error?
+    ) {}
+
+    func cameraDevice(_ camera: ICCameraDevice, didRenameItems items: [ICCameraItem]) {}
+
+    func cameraDeviceDidChangeCapability(_ camera: ICCameraDevice) {}
+
+    func cameraDevice(_ camera: ICCameraDevice, didReceivePTPEvent eventData: Data) {}
+
+    func cameraDeviceDidRemoveAccessRestriction(_ device: ICDevice) {}
+
+    func cameraDeviceDidEnableAccessRestriction(_ device: ICDevice) {}
 
     func deviceDidBecomeReady(withCompleteContentCatalog device: ICCameraDevice) {
         Task { @MainActor [weak link] in
@@ -773,6 +1019,7 @@ final class USBPTPChannel: PTPChannel {
         let transactionID: UInt32
         let dataPhaseInfo: UInt32
         let parameters: [UInt32]
+        var expectedDataLength: UInt64?
         var dataPayload: Data
     }
 
@@ -807,12 +1054,29 @@ final class USBPTPChannel: PTPChannel {
                 transactionID: payload.uint32(at: 6),
                 dataPhaseInfo: payload.uint32(at: 0),
                 parameters: parameters,
+                expectedDataLength: nil,
                 dataPayload: Data()
             )
             queuedPackets.removeAll(keepingCapacity: true)
 
-        case .startData, .data, .endData:
-            guard var operation = pending, payload.count >= 4 else {
+        case .startData:
+            guard var operation = pending,
+                  operation.dataPhaseInfo == 2,
+                  payload.count >= 12,
+                  payload.uint32(at: 0) == operation.transactionID
+            else {
+                throw CameraConnectionError.unexpectedPacket
+            }
+            operation.expectedDataLength = payload.uint64(at: 4)
+            pending = operation
+
+        case .data, .endData:
+            guard var operation = pending,
+                  operation.dataPhaseInfo == 2,
+                  operation.expectedDataLength != nil,
+                  payload.count >= 4,
+                  payload.uint32(at: 0) == operation.transactionID
+            else {
                 throw CameraConnectionError.unexpectedPacket
             }
             if payload.count > 4 {
@@ -852,6 +1116,13 @@ final class USBPTPChannel: PTPChannel {
         pending = nil
 
         let isDataOut = operation.dataPhaseInfo == 2
+        if isDataOut {
+            guard let expectedDataLength = operation.expectedDataLength,
+                  UInt64(operation.dataPayload.count) == expectedDataLength
+            else {
+                throw CameraConnectionError.malformedPacket
+            }
+        }
         let result = try await link.performTransaction(
             code: operation.code,
             transactionID: operation.transactionID,
