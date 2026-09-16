@@ -921,6 +921,7 @@ private struct CameraConnectionSheet: View {
                         .padding(.vertical, 6)
                     }
                     .buttonStyle(.glassProminent)
+                    .tint(.blue)
                     .disabled(isConnecting || manualHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }

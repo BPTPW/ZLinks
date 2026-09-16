@@ -123,6 +123,9 @@ struct GalleryView: View {
                     selectedDirectoryID = newValue
                 }
             }
+            .onChange(of: camera.galleryItems) { _, items in
+                synchronizeGalleryState(with: items)
+            }
             .onChange(of: camera.state) { _, _ in
                 downloadStore.cameraStateChanged(camera)
             }
@@ -655,8 +658,6 @@ struct GalleryView: View {
         do {
             try await camera.deleteGalleryItems(items)
             isDeletingGallery = false
-            await reloadGallery(force: true)
-            selectedHandles = selectedHandles.intersection(Set(camera.galleryItems.map(\.handle)))
             if dismissPreview { selectedItem = nil }
             exitSelectionMode()
             return true
@@ -720,6 +721,24 @@ struct GalleryView: View {
 
         isRefreshing = false
         await pumpVisibleThumbnails()
+    }
+
+    @MainActor
+    private func synchronizeGalleryState(with items: [CameraConnectionService.GalleryItem]) {
+        let validHandles = Set(items.map(\.handle))
+        let validObjectHandles = Set(items.flatMap { item in
+            [item.handle, item.rawHandle, item.jpegHandle].compactMap { $0 }
+        })
+        selectedHandles.formIntersection(validHandles)
+        visibleHandles.formIntersection(validHandles)
+        failedThumbnails.formIntersection(validObjectHandles)
+        thumbnailImages = thumbnailImages.filter { validHandles.contains($0.key) }
+        thumbnailSourceHandles = thumbnailSourceHandles.filter { validHandles.contains($0.key) }
+
+        if let selectedItem {
+            self.selectedItem = items.first(where: { $0.handle == selectedItem.handle })
+        }
+        Task { await pumpVisibleThumbnails() }
     }
 
     @MainActor

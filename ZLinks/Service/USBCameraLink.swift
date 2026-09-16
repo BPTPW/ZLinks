@@ -127,6 +127,7 @@ final class USBCameraLink: ObservableObject {
     /// 相机被拔出或系统关闭会话时回调，由 CameraConnectionService 处理断线。
     var deviceDisconnectedHandler: ((String) -> Void)?
     var logHandler: ((String) -> Void)?
+    var eventHandler: ((PTPEvent) -> Void)?
 
     private let browser = ICDeviceBrowser()
     private lazy var proxy = USBCameraProxy(link: self)
@@ -926,6 +927,34 @@ final class USBCameraLink: ObservableObject {
     func forwardLog(_ message: String) {
         log("[usb] \(message)")
     }
+
+    func forwardPTPEvent(_ data: Data) {
+        let payload: Data
+        if data.count >= 12, data.uint16(at: 4) == 4 {
+            let declaredLength = Int(data.uint32(at: 0))
+            guard declaredLength >= 12, declaredLength <= data.count else {
+                log("[usb][event] PTP 事件容器长度非法 bytes=\(data.count) hex=\(data.hexDump)")
+                return
+            }
+            payload = data.subdata(in: 6..<declaredLength)
+        } else if data.count >= 8, data.uint16(at: 0) == 4 {
+            payload = Data(data.dropFirst(2))
+        } else if data.count >= 6, PTPEventCode(rawValue: data.uint16(at: 0)) != nil {
+            payload = data
+        } else {
+            log("[usb][event] 无法识别 PTP 事件容器 bytes=\(data.count) hex=\(data.hexDump)")
+            return
+        }
+
+        do {
+            let event = try PTPEvent(payload: payload)
+            let parameters = event.parameters.map { String(format: "0x%08X", $0) }.joined(separator: ",")
+            log("[usb][event] 收到 \(event.debugName) transaction=\(event.transactionID) params=[\(parameters)]")
+            eventHandler?(event)
+        } catch {
+            log("[usb][event] PTP 事件解析失败 error=\(error.localizedDescription) hex=\(data.hexDump)")
+        }
+    }
 }
 
 /// ICDeviceBrowser / ICDevice / ICCameraDevice 的 Objective-C 回调代理。
@@ -1018,7 +1047,11 @@ private final class USBCameraProxy: NSObject, ICDeviceBrowserDelegate, ICDeviceD
 
     func cameraDeviceDidChangeCapability(_ camera: ICCameraDevice) {}
 
-    func cameraDevice(_ camera: ICCameraDevice, didReceivePTPEvent eventData: Data) {}
+    func cameraDevice(_ camera: ICCameraDevice, didReceivePTPEvent eventData: Data) {
+        Task { @MainActor [weak link] in
+            link?.forwardPTPEvent(eventData)
+        }
+    }
 
     func cameraDeviceDidRemoveAccessRestriction(_ device: ICDevice) {}
 

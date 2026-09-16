@@ -441,6 +441,7 @@ final class CameraConnectionService: ObservableObject {
     private var metadataDirectoryID: UInt32?
     private var metadataRecords: [NikonObjectMetadata] = []
     private var metadataRevision = 0
+    private var galleryEventRevisions: [UInt32: UInt64] = [:]
     private var liveViewTask: Task<Void, Never>?
     private var liveViewGeneration = 0
     private var liveViewConsumers = 0
@@ -513,6 +514,8 @@ final class CameraConnectionService: ObservableObject {
         }
         state = .connecting
         linkKind = .wifi
+        let generation = UUID()
+        connectionGeneration = generation
 
         do {
             let channel = PTPIPTCPChannel(endpoint: endpoint)
@@ -521,6 +524,13 @@ final class CameraConnectionService: ObservableObject {
             }
             channel.failureHandler = { [weak self] reason in
                 self?.noteTransportFailure(reason: reason)
+            }
+            channel.eventHandler = { [weak self, weak channel] event in
+                guard let self, let channel else { return }
+                Task { @MainActor [weak self, weak channel] in
+                    guard let self, let channel, self.connectionGeneration == generation else { return }
+                    self.handlePTPEvent(event, on: channel, connectionGeneration: generation)
+                }
             }
             commandChannel = channel
             try await channel.open()
@@ -664,6 +674,14 @@ final class CameraConnectionService: ObservableObject {
         }
         usbLink.deviceDisconnectedHandler = { [weak self] reason in
             self?.handleUSBDisconnect(reason: reason)
+        }
+        usbLink.eventHandler = { [weak self] event in
+            guard let self, let channel = self.commandChannel else { return }
+            self.handlePTPEvent(
+                event,
+                on: channel,
+                connectionGeneration: self.connectionGeneration
+            )
         }
         usbLinkObserver = usbLink.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
@@ -856,6 +874,7 @@ final class CameraConnectionService: ObservableObject {
         metadataDirectoryID = nil
         metadataRecords = []
         metadataRevision = 0
+        galleryEventRevisions = [:]
     }
 
     private func isCurrentGalleryLoad(_ generation: Int, directoryID: UInt32? = nil) -> Bool {
@@ -871,6 +890,163 @@ final class CameraConnectionService: ObservableObject {
             return selectedGalleryDirectoryID == directoryID
         }
         return true
+    }
+
+    private func handlePTPEvent(
+        _ event: PTPEvent,
+        on connection: any PTPChannel,
+        connectionGeneration: UUID
+    ) {
+        guard let handle = event.parameters.first else {
+            appendLog("[event] \(event.debugName) 缺少 ObjectHandle")
+            return
+        }
+
+        let revision = (galleryEventRevisions[handle] ?? 0) &+ 1
+        galleryEventRevisions[handle] = revision
+
+        switch PTPEventCode(rawValue: event.code) {
+        case .objectAdded:
+            Task { [weak self] in
+                await self?.applyObjectAdded(
+                    handle: handle,
+                    revision: revision,
+                    on: connection,
+                    connectionGeneration: connectionGeneration
+                )
+            }
+        case .objectRemoved:
+            applyObjectRemoved(handle: handle)
+        case nil:
+            break
+        }
+    }
+
+    private func applyObjectAdded(
+        handle: UInt32,
+        revision: UInt64,
+        on connection: any PTPChannel,
+        connectionGeneration: UUID
+    ) async {
+        guard galleryItems.allSatisfy({
+            $0.handle != handle && $0.rawHandle != handle && $0.jpegHandle != handle
+        }) else {
+            appendLog("[图库][event] ObjectAdded 已存在 handle=0x\(String(format: "%08X", handle))")
+            return
+        }
+
+        var info: ParsedObjectInfo?
+        for attempt in 1...5 {
+            guard self.connectionGeneration == connectionGeneration,
+                  galleryEventRevisions[handle] == revision,
+                  !Task.isCancelled else { return }
+            do {
+                info = try await fetchObjectInfo(handle: handle, on: connection, priority: .foreground)
+            } catch {
+                appendLog(
+                    "[图库][event] ObjectAdded 读取信息失败 handle=0x\(String(format: "%08X", handle)) " +
+                        "attempt=\(attempt) error=\(error.localizedDescription)"
+                )
+            }
+            if info != nil { break }
+            if attempt < 5 {
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+        }
+
+        guard self.connectionGeneration == connectionGeneration,
+              galleryEventRevisions[handle] == revision,
+              let info else {
+            appendLog("[图库][event] ObjectAdded 无法取得对象信息 handle=0x\(String(format: "%08X", handle))")
+            return
+        }
+        guard !isAssociationObject(objectFormat: info.objectFormat),
+              isGalleryMedia(objectFormat: info.objectFormat, filename: info.filename) else {
+            appendLog("[图库][event] ObjectAdded 跳过非媒体 handle=0x\(String(format: "%08X", handle))")
+            return
+        }
+        guard let directory = galleryDirectories.first(where: { $0.id == selectedGalleryDirectoryID }),
+              await object(info, belongsTo: directory, on: connection) else {
+            appendLog(
+                "[图库][event] ObjectAdded 不属于当前目录 handle=0x\(String(format: "%08X", handle)) " +
+                    "parent=0x\(String(format: "%08X", info.parentObject))"
+            )
+            return
+        }
+        guard self.connectionGeneration == connectionGeneration,
+              galleryEventRevisions[handle] == revision else { return }
+
+        let item = makeGalleryItem(handle: handle, info: info)
+        galleryItems = Self.galleryItemsByAdding(item, to: galleryItems)
+        if metadataDirectoryID == directory.id {
+            let record = NikonObjectMetadata(
+                handle: handle,
+                attribute: 0,
+                unknown: 0,
+                captureDate: item.captureDate
+            )
+            metadataRecords.removeAll { $0.handle == handle }
+            metadataRecords.append(record)
+            metadataRecordsByHandle[handle] = record
+            metadataResolvedItems[handle] = item
+            metadataExcludedHandles.remove(handle)
+            metadataAttemptedHandles.insert(handle)
+            metadataRevision &+= 1
+        }
+        if let count = cameraStatus.mediaObjectCount {
+            cameraStatus.mediaObjectCount = count + 1
+        }
+        appendLog(
+            "[图库][event] 已增加 \(info.filename) handle=0x\(String(format: "%08X", handle)) " +
+                "captureDate=\(item.captureDate.map(String.init(describing:)) ?? "nil")"
+        )
+    }
+
+    private func object(
+        _ info: ParsedObjectInfo,
+        belongsTo directory: GalleryDirectory,
+        on connection: any PTPChannel
+    ) async -> Bool {
+        guard info.storageID == directory.storageID else { return false }
+        if directory.isSyntheticRoot { return true }
+
+        var parent = info.parentObject
+        var visited = Set<UInt32>()
+        for _ in 0..<32 {
+            if parent == directory.handle { return true }
+            if parent == 0 || parent == 0xffff_ffff || !visited.insert(parent).inserted {
+                return false
+            }
+            guard let parentInfo = try? await fetchObjectInfo(
+                handle: parent,
+                on: connection,
+                priority: .foreground
+            ) else { return false }
+            parent = parentInfo.parentObject
+        }
+        return false
+    }
+
+    private func applyObjectRemoved(handle: UInt32) {
+        let containedHandle = galleryItems.contains {
+            $0.handle == handle || $0.rawHandle == handle || $0.jpegHandle == handle
+        }
+        galleryItems = Self.galleryItemsByRemoving(handle: handle, from: galleryItems)
+        thumbnailCache[handle] = nil
+        previewImageCache[handle] = nil
+        objectImageCache[handle] = nil
+        metadataInfoTasks[handle]?.cancel()
+        metadataInfoTasks[handle] = nil
+        metadataRecordsByHandle[handle] = nil
+        metadataResolvedItems[handle] = nil
+        metadataExcludedHandles.remove(handle)
+        metadataAttemptedHandles.remove(handle)
+        metadataRecords.removeAll { $0.handle == handle }
+        metadataRevision &+= 1
+        if containedHandle, let count = cameraStatus.mediaObjectCount {
+            cameraStatus.mediaObjectCount = max(count - 1, 0)
+        }
+        appendLog("[图库][event] 已移除 handle=0x\(String(format: "%08X", handle))")
     }
 
     private func waitForRecoveredCommandConnection(
@@ -3071,6 +3247,59 @@ final class CameraConnectionService: ObservableObject {
         }
     }
 
+    nonisolated static func galleryItemsByAdding(_ item: GalleryItem, to items: [GalleryItem]) -> [GalleryItem] {
+        guard items.allSatisfy({
+            $0.id != item.id
+                && $0.rawHandle != item.id
+                && $0.jpegHandle != item.id
+        }) else { return items }
+        return sortedGalleryItems(mergePairedPhotos(items + [item]))
+    }
+
+    nonisolated static func galleryItemsByRemoving(handle: UInt32, from items: [GalleryItem]) -> [GalleryItem] {
+        let remaining = items.compactMap { item -> GalleryItem? in
+            guard item.id == handle || item.rawHandle == handle || item.jpegHandle == handle else {
+                return item
+            }
+            guard !item.isVideo else { return nil }
+
+            if item.rawHandle == handle, let jpegHandle = item.jpegHandle {
+                return GalleryItem(
+                    id: jpegHandle,
+                    filename: item.jpegFilename ?? item.filename,
+                    objectFormat: item.objectFormat,
+                    fileSize: item.jpegFileSize ?? 0,
+                    isVideo: false,
+                    captureDate: item.captureDate,
+                    rawHandle: nil,
+                    rawFilename: nil,
+                    rawFileSize: nil,
+                    jpegHandle: jpegHandle,
+                    jpegFilename: item.jpegFilename ?? item.filename,
+                    jpegFileSize: item.jpegFileSize
+                )
+            }
+            if item.jpegHandle == handle, let rawHandle = item.rawHandle {
+                return GalleryItem(
+                    id: rawHandle,
+                    filename: item.rawFilename ?? item.filename,
+                    objectFormat: 0xb802,
+                    fileSize: item.rawFileSize ?? 0,
+                    isVideo: false,
+                    captureDate: item.captureDate,
+                    rawHandle: rawHandle,
+                    rawFilename: item.rawFilename ?? item.filename,
+                    rawFileSize: item.rawFileSize,
+                    jpegHandle: nil,
+                    jpegFilename: nil,
+                    jpegFileSize: nil
+                )
+            }
+            return nil
+        }
+        return sortedGalleryItems(remaining)
+    }
+
     private nonisolated static func mergePairedPhotos(_ sourceItems: [GalleryItem]) -> [GalleryItem] {
         var merged: [GalleryItem] = []
         var photoIndexes: [String: Int] = [:]
@@ -3200,8 +3429,10 @@ final class CameraConnectionService: ObservableObject {
     }
 
     private struct ParsedObjectInfo: Sendable {
+        var storageID: UInt32
         var objectFormat: UInt16
         var fileSize: UInt64
+        var parentObject: UInt32
         var filename: String
         var captureDate: Date?
         var modificationDate: Date?
@@ -3245,11 +3476,32 @@ final class CameraConnectionService: ObservableObject {
         let modificationDate = try readPTPString(from: data, offset: offset)
 
         return ParsedObjectInfo(
+            storageID: data.uint32(at: 0),
             objectFormat: objectFormat,
             fileSize: fileSize,
+            parentObject: data.uint32(at: 38),
             filename: filename.value,
             captureDate: parsePTPDateTime(captureDate.value),
             modificationDate: parsePTPDateTime(modificationDate.value)
+        )
+    }
+
+    private func makeGalleryItem(handle: UInt32, info: ParsedObjectInfo) -> GalleryItem {
+        let isVideo = isVideoMedia(objectFormat: info.objectFormat, filename: info.filename)
+        let isRAW = !isVideo && isRAWMedia(objectFormat: info.objectFormat, filename: info.filename)
+        return GalleryItem(
+            id: handle,
+            filename: info.filename,
+            objectFormat: info.objectFormat,
+            fileSize: info.fileSize,
+            isVideo: isVideo,
+            captureDate: info.captureDate ?? info.modificationDate,
+            rawHandle: isRAW ? handle : nil,
+            rawFilename: isRAW ? info.filename : nil,
+            rawFileSize: isRAW ? info.fileSize : nil,
+            jpegHandle: !isVideo && !isRAW ? handle : nil,
+            jpegFilename: !isVideo && !isRAW ? info.filename : nil,
+            jpegFileSize: !isVideo && !isRAW ? info.fileSize : nil
         )
     }
 

@@ -54,10 +54,12 @@ final class PTPIPTCPChannel: PTPChannel {
     private let endpoint: NWEndpoint
     private var command: NWConnection?
     private var event: NWConnection?
+    private var eventTask: Task<Void, Never>?
 
     /// Reported back to `CameraConnectionService` so it can reconnect.
     var failureHandler: ((String) -> Void)?
     var logHandler: ((String) -> Void)?
+    var eventHandler: ((PTPEvent) -> Void)?
 
     private(set) var connectionNumber: UInt32?
 
@@ -125,6 +127,8 @@ final class PTPIPTCPChannel: PTPChannel {
             }
             throw CameraConnectionError.unexpectedPacket
         }
+        logHandler?("[event] InitEventAck，开始监听相机事件")
+        startEventLoop(on: event)
     }
 
     func send(packet: Data) async throws {
@@ -139,6 +143,9 @@ final class PTPIPTCPChannel: PTPChannel {
 
     func close() {
         failureHandler = nil
+        eventHandler = nil
+        eventTask?.cancel()
+        eventTask = nil
         command?.stateUpdateHandler = nil
         event?.stateUpdateHandler = nil
         command?.cancel()
@@ -146,6 +153,38 @@ final class PTPIPTCPChannel: PTPChannel {
         command = nil
         event = nil
         connectionNumber = nil
+    }
+
+    private func startEventLoop(on connection: NWConnection) {
+        eventTask?.cancel()
+        eventTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                while !Task.isCancelled {
+                    let packet = try await self.receivePacket(on: connection)
+                    guard packet.type == PTPIPPacketType.event.rawValue else {
+                        self.logHandler?(
+                            "[event] 忽略非事件报文 type=\(packet.typeName) payload=\(packet.payload.hexDump)"
+                        )
+                        continue
+                    }
+                    let event = try PTPEvent(payload: packet.payload)
+                    let parameters = event.parameters
+                        .map { String(format: "0x%08X", $0) }
+                        .joined(separator: ",")
+                    self.logHandler?(
+                        "[event] 收到 \(event.debugName) transaction=\(event.transactionID) params=[\(parameters)]"
+                    )
+                    self.eventHandler?(event)
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled else { return }
+                self.logHandler?("[event] 监听失败 error=\(error.localizedDescription)")
+                self.failureHandler?("Event Connection 已断开：\(error.localizedDescription)")
+            }
+        }
     }
 
     // MARK: - Socket helpers
@@ -318,6 +357,39 @@ struct PTPIPPacket {
     var hexDump: String {
         uint32Data(UInt32(payload.count + 8)).hexDump + " " + uint32Data(type).hexDump +
             (payload.isEmpty ? "" : " " + payload.hexDump)
+    }
+}
+
+struct PTPEvent: Equatable, Sendable {
+    let code: UInt16
+    let transactionID: UInt32
+    let parameters: [UInt32]
+
+    init(payload: Data) throws {
+        guard payload.count >= 6, (payload.count - 6).isMultiple(of: 4) else {
+            throw CameraConnectionError.malformedPacket
+        }
+        code = payload.uint16(at: 0)
+        transactionID = payload.uint32(at: 2)
+        parameters = stride(from: 6, to: payload.count, by: 4).map {
+            payload.uint32(at: $0)
+        }
+    }
+
+    var debugName: String {
+        PTPEventCode(rawValue: code)?.debugName ?? String(format: "Event(0x%04X)", code)
+    }
+}
+
+enum PTPEventCode: UInt16 {
+    case objectAdded = 0x4002
+    case objectRemoved = 0x4003
+
+    var debugName: String {
+        switch self {
+        case .objectAdded: return "ObjectAdded"
+        case .objectRemoved: return "ObjectRemoved"
+        }
     }
 }
 
