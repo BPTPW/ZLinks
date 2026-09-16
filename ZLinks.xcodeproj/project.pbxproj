@@ -376,6 +376,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "Z Links";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.photography";
+				INFOPLIST_KEY_NSCameraUsageDescription = "ZLinks 需要访问通过 USB 连接的相机，以读取照片并控制相机拍摄。";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "ZLinks 使用本地网络连接 Nikon 相机并读取相机信息。";
 				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "ZLinks 需要将从相机下载的原始照片保存到你的相册。";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -416,6 +417,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "Z Links";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.photography";
+				INFOPLIST_KEY_NSCameraUsageDescription = "ZLinks 需要访问通过 USB 连接的相机，以读取照片并控制相机拍摄。";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "ZLinks 使用本地网络连接 Nikon 相机并读取相机信息。";
 				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "ZLinks 需要将从相机下载的原始照片保存到你的相册。";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;

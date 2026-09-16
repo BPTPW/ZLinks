@@ -205,12 +205,10 @@ struct CaptureView: View {
         ZStack {
             Color.black
 
-            if let image = camera.liveViewImage {
-                CaptureLiveViewImageSurface(
-                    image: image,
-                    mirrorsPreview: mirrorsPreview
-                )
-            } else {
+            CaptureLiveImageView(
+                stream: camera.liveViewStream,
+                mirrorsPreview: mirrorsPreview
+            ) {
                 liveViewPlaceholder
             }
 
@@ -646,12 +644,10 @@ private struct CaptureFullscreenMonitor: View {
         ZStack {
             Color.black
 
-            if let image = camera.liveViewImage {
-                CaptureLiveViewImageSurface(
-                    image: image,
-                    mirrorsPreview: mirrorsPreview
-                )
-            } else {
+            CaptureLiveImageView(
+                stream: camera.liveViewStream,
+                mirrorsPreview: mirrorsPreview
+            ) {
                 VStack(spacing: 10) {
                     ProgressView()
                         .tint(.white)
@@ -699,6 +695,24 @@ private struct CaptureFullscreenMonitor: View {
     private var isConnected: Bool {
         if case .connected = camera.state { return true }
         return false
+    }
+}
+
+/// 只订阅实时画面流的监看视图：每帧只会重建这里，不再带动整个拍摄界面。
+private struct CaptureLiveImageView<Placeholder: View>: View {
+    @ObservedObject var stream: LiveViewStream
+    var mirrorsPreview: Bool
+    @ViewBuilder var placeholder: () -> Placeholder
+
+    var body: some View {
+        if let image = stream.image {
+            CaptureLiveViewImageSurface(
+                image: image,
+                mirrorsPreview: mirrorsPreview
+            )
+        } else {
+            placeholder()
+        }
     }
 }
 

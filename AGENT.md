@@ -8,15 +8,42 @@ Verified against Nikon Z5 (`FriendlyName=Z5_2_8064268`, firmware string `V1.20`)
 
 ## Connection Flow
 
-1. `CameraConnectionSheet` presents two modes:
+1. `CameraConnectionSheet` presents three modes:
    - AP mode: the camera creates the Wi-Fi network. `CameraWiFiService` uses `NEHotspotConfiguration` to ask iOS to join a user-provided SSID. The system owns the confirmation UI and routing decision.
    - STA mode: the camera joins an existing LAN or phone hotspot.
+   - USB mode: the camera is wired to the device. `USBCameraLink` drives ImageCaptureCore; every read (metadata, gallery, downloads, live view) goes over the cable. See “USB 有线连接” below.
 2. `CameraDiscoveryService` finds hosts on the active IPv4 Wi-Fi subnet by probing TCP port `15740`. This is a best-effort discovery mechanism, not an SSID scanner.
 3. `CameraConnectionService` opens two TCP connections to the camera:
    - command connection: PTP/IP Init Command, then PTP operations;
    - event connection: PTP/IP Init Event, kept separate from command traffic.
 4. The command connection opens PTP session `1`, requests `GetDeviceInfo`, then performs optional status reads for battery, storage, object count, and lens properties.
 5. Connection debug logs are not shown inside the connection sheet. Open them from the “我的相机” toolbar `info.circle` button, which presents a dedicated full-screen log drawer.
+
+## USB 有线连接（USB Link）
+
+主页面连接方式除 AP / STA 外新增 `USB 有线`，由 `USBCameraLink`（ImageCaptureCore）实现。一次连接同时提供两条通道：
+
+1. **PTP 直通**：`ICCameraDevice.requestSendPTPCommand` 承载 PTP 命令容器。`USBPTPChannel` 把上层现有的 PTP/IP 报文翻译成 PTP 容器，再把响应还原成 PTP/IP 报文，因此 `CameraConnectionService.operation`、事务号、超时、数据分片逻辑在 Wi-Fi 与 USB 上完全一致。
+   - 相机会话由 `ICDeviceBrowser` 建立（`requestOpenSession`）。App 自己的 `OpenSession` 返回 `0x201E` 时按“会话已存在”处理，不视为失败。
+   - 命令容器的 4 字节长度前缀在不同系统版本上要求不一致：连接时会用 `OpenSession` + `GetDeviceInfo` 依次尝试 `standard` 与 `lengthLess` 两种拼装方式，并缓存可用的那一种。
+   - 系统回调返回的两个 `Data` 可能是（响应容器, 数据容器），也可能是相反顺序，因此按容器类型（1=命令 / 2=数据 / 3=响应）判定，不依赖参数位置。
+   - 相机返回的事务号可能与请求不同，`USBPTPChannel` 统一回填调用方的事务号。
+2. **内容目录**：`ICCameraDevice.contents` 提供目录与对象列表，`requestThumbnailData` 取缩略图，`requestReadData(atOffset:length:)` 以 8 MB 分块读取原图。图库列表 / 缩略图 / 原图下载不再逐条走 PTP 轮询。
+
+链路选择与降级：
+
+- `CameraConnectionService.linkKind` 记录当前链路，`isUSBPTPReady` 表示 USB 上的 PTP 直通是否可用。
+- 相机不提供 PTP 直通时仍可用 USB 目录模式浏览与下载照片：相机信息来自 `ICDevice`（名称 / 序列号），电量来自 `ICCameraDevice.batteryLevel`，实时图传与参数控制不可用。
+- USB 断线由 ImageCaptureCore 回调通知（`didCloseSessionWithError` / `didRemove`），不参与 PTP/IP 自动重连；`beginAutomaticReconnect` 只处理 Wi-Fi。
+- USB 模式下 `refreshGallery` 走 `refreshUSBGallery`，仅当内容目录为空时才回退 `refreshGalleryViaPTP`。
+- 每次手动刷新都会重建目录快照，因此刚拍下的照片会出现在图库里。
+
+## 性能要点（实时图传 / 图库）
+
+- 实时画面放在 `LiveViewStream` 中单独发布。若挂在 `CameraConnectionService` 的 `@Published` 属性上，每一帧都会重建整个 Tab 层级。
+- 实时 JPEG 在后台线程解码（`decodeLiveViewJPEG` + `CGImageSource`）并立即展开位图，避免主线程每帧解码。
+- 拉帧操作使用 `.background` 优先级，图库缩略图与状态刷新可随时插队；循环中不再固定 `sleep(33ms)`，仅让出一次执行权。
+- USB 原图下载改用系统读取通道，分块 8 MB；Wi-Fi 仍使用 `GetPartialObject` 的 4 MB 分块。
 
 ## Successful Connection Checklist
 

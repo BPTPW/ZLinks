@@ -5,6 +5,7 @@
 
 import Combine
 import Foundation
+import ImageIO
 import Network
 import UIKit
 
@@ -380,7 +381,13 @@ final class CameraConnectionService: ObservableObject {
     @Published private(set) var galleryItems: [GalleryItem] = []
     @Published private(set) var debugLog = ""
     @Published private(set) var isReconnecting = false
-    @Published private(set) var liveViewImage: UIImage?
+    /// 实时画面单独发布：每帧只刷新监看视图，不再触发整个标签页重建。
+    let liveViewStream = LiveViewStream()
+    /// 兼容原有调用点的转发属性（读写都落到 liveViewStream）。
+    var liveViewImage: UIImage? {
+        get { liveViewStream.image }
+        set { liveViewStream.setImage(newValue) }
+    }
     @Published private(set) var isLiveViewActive = false
     @Published private(set) var liveViewError: String?
     @Published private(set) var liveViewFrameRate: Double?
@@ -400,9 +407,14 @@ final class CameraConnectionService: ObservableObject {
         activeCaptureWrite != nil || captureWriteTask != nil
     }
 
-    private var commandConnection: NWConnection?
-    private var eventConnection: NWConnection?
-    private var connectionNumber: UInt32?
+    /// 当前链路类型：Wi-Fi 或 USB 有线。
+    @Published private(set) var linkKind: CameraLinkKind = .wifi
+    /// USB 有线链路：设备发现、PTP 直通与内容目录。
+    let usbLink = USBCameraLink()
+    private var commandChannel: (any PTPChannel)?
+    private var isUSBPTPReady = false
+    private var usbCatalog: USBCameraCatalog = .empty
+    private var usbLinkObserver: AnyCancellable?
     private var transactionID: UInt32 = 0
     private var isOperationBusy = false
     private var foregroundOperationWaiters: [CheckedContinuation<Void, Never>] = []
@@ -459,6 +471,7 @@ final class CameraConnectionService: ObservableObject {
                 self?.handleAppDidBecomeActive()
             }
         }
+        observeUSBCameraLink()
     }
 
     deinit {
@@ -487,74 +500,22 @@ final class CameraConnectionService: ObservableObject {
             disconnect(clearRememberedDevice: false)
         }
         state = .connecting
+        linkKind = .wifi
 
         do {
-            let command = NWConnection(to: endpoint, using: .tcp)
-            commandConnection = command
-            appendLog("[command] 创建 TCP 连接")
-            try await start(command)
-            appendLog("[command] TCP 已就绪")
-
-            let guid = Data([
-                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-                0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff
-            ])
-            try await send(ptpIPPacket(type: .initCommandRequest, payload: initCommandPayload(guid: guid)), on: command)
-            let acknowledgement = try await receivePacket(on: command)
-            guard acknowledgement.type == PTPIPPacketType.initCommandAck.rawValue else {
-                appendLog("[command] InitCommandAck 失败 expected=InitCommandAck actual=\(acknowledgement.typeName) payload=\(acknowledgement.payload.hexDump)")
-                if acknowledgement.type == PTPIPPacketType.initFail.rawValue, acknowledgement.payload.count >= 4 {
-                    throw CameraConnectionError.initFailed(acknowledgement.payload.uint32(at: 0))
-                }
-                throw CameraConnectionError.unexpectedPacket
+            let channel = PTPIPTCPChannel(endpoint: endpoint)
+            channel.logHandler = { [weak self] message in
+                self?.appendLog(message)
             }
-
-            let initResult = try parseInitCommandAck(acknowledgement.payload)
-            connectionNumber = initResult.connectionNumber
-            appendLog("[command] InitCommandAck connectionNumber=\(initResult.connectionNumber), name=\(initResult.name.debugDescription)")
-
-            let event = NWConnection(to: endpoint, using: .tcp)
-            eventConnection = event
-            appendLog("[event] 创建 TCP 连接")
-            try await start(event)
-            appendLog("[event] TCP 已就绪")
-            try await send(ptpIPPacket(type: .initEventRequest, payload: uint32Data(initResult.connectionNumber)), on: event)
-
-            let eventAcknowledgement = try await receivePacket(on: event)
-            guard eventAcknowledgement.type == PTPIPPacketType.initEventAck.rawValue else {
-                appendLog("[event] InitEventAck 失败 expected=InitEventAck actual=\(eventAcknowledgement.typeName) payload=\(eventAcknowledgement.payload.hexDump)")
-                if eventAcknowledgement.type == PTPIPPacketType.initFail.rawValue, eventAcknowledgement.payload.count >= 4 {
-                    throw CameraConnectionError.initFailed(eventAcknowledgement.payload.uint32(at: 0))
-                }
-                throw CameraConnectionError.unexpectedPacket
+            channel.failureHandler = { [weak self] reason in
+                self?.noteTransportFailure(reason: reason)
             }
+            commandChannel = channel
+            try await channel.open()
+            appendLog("[command] PTP/IP 会话已建立 connectionNumber=\(channel.connectionNumber ?? 0)")
 
-            transactionID = 0
-            let sessionID: UInt32 = 1
-            let openSessionResponse = try await operation(
-                .openSession,
-                parameters: [sessionID],
-                dataPhase: nil,
-                on: command
-            )
-            guard openSessionResponse.code == .ok else {
-                throw CameraConnectionError.ptpResponse(openSessionResponse.code)
-            }
+            try await establishSession(on: channel)
 
-            let deviceInfoResponse = try await operation(
-                .getDeviceInfo,
-                parameters: [],
-                dataPhase: .receive,
-                on: command
-            )
-            guard deviceInfoResponse.code == .ok, let deviceInfo = deviceInfoResponse.data else {
-                throw CameraConnectionError.ptpResponse(deviceInfoResponse.code)
-            }
-
-            cameraInfo = try parseDeviceInfo(deviceInfo)
-            appendLog("DeviceInfo 解析成功 manufacturer=\(cameraInfo?.manufacturer ?? ""), model=\(cameraInfo?.model ?? ""), serial=\(cameraInfo?.serialNumber ?? "")")
-            cameraStatus = await readCameraStatus(on: command)
-            lensInfo = await readLensInfo(on: command)
             connectedHost = displayHost
             state = .connected
             isReconnecting = false
@@ -570,6 +531,143 @@ final class CameraConnectionService: ObservableObject {
                 state = .failed(error.localizedDescription)
             }
         }
+    }
+
+    /// 建立 PTP 会话并读取机身信息。Wi-Fi 与 USB 共用同一套流程。
+    private func establishSession(on connection: any PTPChannel) async throws {
+        transactionID = 0
+        let sessionID: UInt32 = 1
+        let openSessionResponse = try await operation(
+            .openSession,
+            parameters: [sessionID],
+            dataPhase: nil,
+            on: connection
+        )
+        if openSessionResponse.code != PTPResponseCode.ok.rawValue,
+           openSessionResponse.code != PTPResponseCode.sessionAlreadyOpen.rawValue
+        {
+            throw CameraConnectionError.ptpResponse(openSessionResponse.code)
+        }
+        if openSessionResponse.code == PTPResponseCode.sessionAlreadyOpen.rawValue {
+            appendLog("OpenSession 返回会话已存在（0x201E），沿用相机会话")
+        }
+
+        let deviceInfoResponse = try await operation(
+            .getDeviceInfo,
+            parameters: [],
+            dataPhase: .receive,
+            on: connection
+        )
+        guard deviceInfoResponse.code == PTPResponseCode.ok.rawValue,
+              let deviceInfo = deviceInfoResponse.data
+        else {
+            throw CameraConnectionError.ptpResponse(deviceInfoResponse.code)
+        }
+
+        cameraInfo = try parseDeviceInfo(deviceInfo)
+        appendLog(
+            "DeviceInfo 解析成功 manufacturer=\(cameraInfo?.manufacturer ?? ""), " +
+                "model=\(cameraInfo?.model ?? ""), serial=\(cameraInfo?.serialNumber ?? "")"
+        )
+        cameraStatus = await readCameraStatus(on: connection)
+        lensInfo = await readLensInfo(on: connection)
+    }
+
+    /// USB 有线连接：先打开 ImageCaptureCore 会话，再按相机能力启用 PTP 直通。
+    func connectUSBCamera(_ descriptor: USBCameraDescriptor) async {
+        if case .connecting = state, linkKind == .usb {
+            appendLog("[usb] 忽略重复连接请求 device=\(descriptor.title)")
+            return
+        }
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        lastEndpoint = nil
+        lastDisplayHost = nil
+        disconnect(clearRememberedDevice: false)
+        let generation = UUID()
+        connectionGeneration = generation
+        state = .connecting
+        linkKind = .usb
+        isUSBPTPReady = false
+        usbCatalog = .empty
+        observeUSBCameraLink()
+
+        do {
+            try await usbLink.open(descriptor)
+            guard connectionGeneration == generation else { return }
+            usbCatalog = usbLink.catalogSnapshot()
+            connectedHost = "\(descriptor.title)（USB）"
+
+            if usbLink.isPTPReady {
+                let channel = USBPTPChannel(link: usbLink)
+                commandChannel = channel
+                do {
+                    try await establishSession(on: channel)
+                    guard connectionGeneration == generation else { return }
+                    isUSBPTPReady = true
+                    appendLog("[usb] PTP 直通会话已建立")
+                } catch {
+                    appendLog("[usb] PTP 会话初始化失败，降级为目录模式 error=\(error.localizedDescription)")
+                    channel.close()
+                    commandChannel = nil
+                }
+            } else {
+                appendLog("[usb] 相机未开放 PTP 直通，仅使用 USB 目录读取")
+            }
+
+            if !isUSBPTPReady {
+                applyUSBOnlyCameraInfo(descriptor)
+            }
+
+            state = .connected
+            isReconnecting = false
+            appendLog("USB 连接成功")
+        } catch {
+            guard connectionGeneration == generation else { return }
+            appendLog("USB 连接失败 error=\(error.localizedDescription)")
+            usbLink.closeSession()
+            disconnectConnections()
+            state = .failed(error.localizedDescription)
+        }
+    }
+
+    /// 无 PTP 直通时，用系统提供的设备信息填充界面。
+    private func applyUSBOnlyCameraInfo(_ descriptor: USBCameraDescriptor) {
+        cameraInfo = CameraInfo(
+            manufacturer: descriptor.manufacturerName,
+            model: descriptor.title,
+            serialNumber: descriptor.serialNumber
+        )
+        var status = CameraStatus()
+        status.batteryLevel = usbLink.batteryLevel
+        cameraStatus = status
+    }
+
+    private func observeUSBCameraLink() {
+        guard usbLinkObserver == nil else { return }
+        usbLink.logHandler = { [weak self] message in
+            self?.appendLog(message)
+        }
+        usbLink.deviceDisconnectedHandler = { [weak self] reason in
+            self?.handleUSBDisconnect(reason: reason)
+        }
+        usbLinkObserver = usbLink.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
+    }
+
+    private func handleUSBDisconnect(reason: String) {
+        guard linkKind == .usb else { return }
+        switch state {
+        case .connecting, .connected:
+            break
+        case .disconnected, .failed:
+            return
+        }
+        connectionGeneration = UUID()
+        appendLog("检测到 USB 连接断开 reason=\(reason)")
+        disconnect(clearRememberedDevice: false)
+        state = .failed("USB 连接已断开，请重新插拔数据线后重试")
     }
 
     func disconnect() {
@@ -606,6 +704,10 @@ final class CameraConnectionService: ObservableObject {
         isInitiatingCapture = false
         captureControlError = nil
         stopLiveViewInternal(sendEndCommand: false)
+        isUSBPTPReady = false
+        usbCatalog = .empty
+        linkKind = .wifi
+        usbLink.closeSession()
         state = .disconnected
 
         if clearRememberedDevice {
@@ -618,10 +720,10 @@ final class CameraConnectionService: ObservableObject {
     private func handleAppDidBecomeActive() {
         if case .connected = state {
             guard reconnectTask == nil else { return }
-            let commandReady = commandConnection?.state == .ready
-            let eventReady = eventConnection?.state == .ready
-            guard !commandReady || !eventReady else { return }
-            beginAutomaticReconnect(reason: "应用回到前台后检测到连接已断开")
+            // USB 链路由 ImageCaptureCore 回调通知断线，不做 TCP 探测。
+            if linkKind == .wifi, let channel = commandChannel, !channel.isReady {
+                beginAutomaticReconnect(reason: "应用回到前台后检测到连接已断开")
+            }
             return
         }
 
@@ -636,20 +738,16 @@ final class CameraConnectionService: ObservableObject {
         beginAutomaticReconnect(reason: "应用启动后自动连接上次相机")
     }
 
-    private func handleTransportFailure(_ connection: NWConnection, generation: UUID, reason: String) {
-        guard generation == connectionGeneration else { return }
-        guard commandConnection === connection || eventConnection === connection else { return }
-        guard case .connected = state else { return }
+    private func noteTransportFailure(reason: String) {
+        guard case .connected = state, linkKind == .wifi else { return }
         appendLog("检测到相机连接断开 reason=\(reason)")
         beginAutomaticReconnect(reason: reason)
     }
 
-    private func noteTransportError(_ connection: NWConnection, reason: String) {
-        handleTransportFailure(connection, generation: connectionGeneration, reason: reason)
-    }
-
     private func beginAutomaticReconnect(reason: String) {
         if reconnectTask != nil { return }
+        // USB 断线由 ImageCaptureCore 回调处理，这里只负责 PTP/IP 自动重连。
+        guard linkKind == .wifi else { return }
         guard let endpoint = lastEndpoint, let displayHost = lastDisplayHost else {
             state = .disconnected
             return
@@ -683,10 +781,34 @@ final class CameraConnectionService: ObservableObject {
     }
 
     func refreshCameraStatus() async {
-        guard case .connected = state, let commandConnection else { return }
+        guard case .connected = state else { return }
+        if linkKind == .usb {
+            await refreshUSBCameraStatus()
+            return
+        }
+        guard let channel = commandChannel else { return }
         appendLog("开始刷新相机状态")
-        cameraStatus = await readCameraStatus(on: commandConnection)
-        lensInfo = await readLensInfo(on: commandConnection)
+        cameraStatus = await readCameraStatus(on: channel)
+        lensInfo = await readLensInfo(on: channel)
+    }
+
+    /// USB 状态下电量来自系统，容量等指标仍走 PTP 直通（如果相机支持）。
+    private func refreshUSBCameraStatus() async {
+        var status = CameraStatus()
+        status.batteryLevel = usbLink.batteryLevel
+        if isUSBPTPReady, let channel = commandChannel {
+            let ptpStatus = await readCameraStatus(on: channel)
+            if ptpStatus.batteryLevel != nil {
+                status.batteryLevel = ptpStatus.batteryLevel
+            }
+            status.storages = ptpStatus.storages
+            status.mediaObjectCount = ptpStatus.mediaObjectCount
+            lensInfo = await readLensInfo(on: channel)
+        }
+        if status.mediaObjectCount == nil, usbCatalog.objectCount > 0 {
+            status.mediaObjectCount = usbCatalog.objectCount
+        }
+        cameraStatus = status
     }
 
     func refreshCameraStatusPeriodically(every interval: Duration = .seconds(3)) async {
@@ -728,12 +850,12 @@ final class CameraConnectionService: ObservableObject {
     private func waitForRecoveredCommandConnection(
         generation: Int,
         directoryID: UInt32
-    ) async -> NWConnection? {
+    ) async -> (any PTPChannel)? {
         for _ in 0..<60 {
             guard isMatchingGalleryLoad(generation, directoryID: directoryID) else { return nil }
             if case .connected = state,
-               let connection = commandConnection,
-               case .ready = connection.state
+               let connection = commandChannel,
+               connection.isReady
             {
                 return connection
             }
@@ -745,7 +867,20 @@ final class CameraConnectionService: ObservableObject {
     /// Refresh directory list, keep/select a directory, then load that directory's media.
     func refreshGallery(selectingDirectoryID directoryID: UInt32? = nil) async {
         let generation = beginGalleryLoad()
-        guard case .connected = state, let commandConnection else {
+        guard case .connected = state else {
+            galleryItems = []
+            galleryDirectories = []
+            selectedGalleryDirectoryID = nil
+            appendLog("[图库] 未连接相机，跳过刷新")
+            return
+        }
+
+        if linkKind == .usb {
+            await refreshUSBGallery(selectingDirectoryID: directoryID, generation: generation)
+            return
+        }
+
+        guard let channel = commandChannel else {
             galleryItems = []
             galleryDirectories = []
             selectedGalleryDirectoryID = nil
@@ -755,7 +890,7 @@ final class CameraConnectionService: ObservableObject {
 
         appendLog("[图库] 开始刷新目录列表")
         do {
-            let directories = try await loadGalleryDirectories(on: commandConnection)
+            let directories = try await loadGalleryDirectories(on: channel)
             guard isCurrentGalleryLoad(generation) else { return }
             galleryDirectories = directories
             appendLog("[图库] 目录列表完成 count=\(directories.count)")
@@ -779,6 +914,124 @@ final class CameraConnectionService: ObservableObject {
         }
     }
 
+    /// USB 图库：目录与对象列表直接来自系统内容目录，省掉逐条 PTP 轮询。
+    private func refreshUSBGallery(selectingDirectoryID directoryID: UInt32?, generation: Int) async {
+        let startedAt = Date()
+        appendLog("[图库] USB 目录刷新开始")
+        usbCatalog = usbLink.refreshCatalogSnapshot()
+        guard isCurrentGalleryLoad(generation) else { return }
+
+        let directories = usbCatalog.folders.map(Self.makeGalleryDirectory)
+        guard !directories.isEmpty else {
+            appendLog("[图库] USB 内容目录为空，回退 PTP 枚举")
+            await refreshGalleryViaPTP(selectingDirectoryID: directoryID, generation: generation)
+            return
+        }
+
+        galleryDirectories = directories
+        let preferred = directoryID ?? selectedGalleryDirectoryID
+        let selected = directories.first(where: { $0.id == preferred })?.id ?? directories.first?.id
+        selectedGalleryDirectoryID = selected
+        appendLog("[图库] USB 目录列表完成 dirs=\(directories.count)")
+
+        guard let selected else {
+            galleryItems = []
+            appendLog("[图库] 没有可选择的目录")
+            return
+        }
+        await loadUSBGalleryMedia(forDirectoryID: selected, generation: generation)
+        let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
+        appendLog("[图库] USB 刷新完成 elapsedMs=\(elapsedMs)")
+    }
+
+    /// USB 目录不可用时沿用 PTP 枚举（需要 PTP 直通）。
+    private func refreshGalleryViaPTP(selectingDirectoryID directoryID: UInt32?, generation: Int) async {
+        guard isUSBPTPReady, let channel = commandChannel else {
+            galleryDirectories = []
+            galleryItems = []
+            appendLog("[图库] PTP 回退不可用")
+            return
+        }
+        do {
+            let directories = try await loadGalleryDirectories(on: channel)
+            guard isCurrentGalleryLoad(generation) else { return }
+            galleryDirectories = directories
+            let preferred = directoryID ?? selectedGalleryDirectoryID
+            let selected = directories.first(where: { $0.id == preferred })?.id ?? directories.first?.id
+            selectedGalleryDirectoryID = selected
+            guard let selected else {
+                galleryItems = []
+                return
+            }
+            await loadGalleryMedia(forDirectoryID: selected, clearCaches: true, generation: generation)
+        } catch {
+            guard isCurrentGalleryLoad(generation) else { return }
+            appendLog("[图库] PTP 回退失败 error=\(error.localizedDescription)")
+        }
+    }
+
+    private func loadUSBGalleryMedia(forDirectoryID directoryID: UInt32, generation: Int) async {
+        guard let folder = usbCatalog.folders.first(where: { $0.handle == directoryID }) else {
+            appendLog("[图库] USB 目录不存在 handle=0x\(String(format: "%08X", directoryID))")
+            galleryItems = []
+            return
+        }
+
+        let startedAt = Date()
+        let items = buildUSBGalleryItems(folder.entries)
+        guard isCurrentGalleryLoad(generation, directoryID: directoryID) else { return }
+
+        thumbnailCache = [:]
+        previewImageCache = [:]
+        objectImageCache = [:]
+        galleryItems = items
+
+        let photos = items.filter { !$0.isVideo }.count
+        let videos = items.filter(\.isVideo).count
+        let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
+        appendLog(
+            "[图库] USB 目录媒体完成 dir=\(folder.path) photos=\(photos) videos=\(videos) " +
+                "total=\(items.count) elapsedMs=\(elapsedMs)"
+        )
+    }
+
+    private nonisolated static func makeGalleryDirectory(_ folder: USBCameraCatalog.Folder) -> GalleryDirectory {
+        GalleryDirectory(
+            id: folder.handle,
+            storageID: folder.storageID,
+            name: folder.name,
+            path: folder.path,
+            isSyntheticRoot: folder.isSyntheticRoot
+        )
+    }
+
+    /// 把 USB 目录条目映射成图库条目，RAW/JPEG 配对复用与 PTP 分支相同的合并规则。
+    private func buildUSBGalleryItems(_ entries: [USBCameraCatalog.Entry]) -> [GalleryItem] {
+        var candidates: [GalleryItem] = []
+        for entry in entries {
+            let isVideo = entry.isVideo || isVideoMedia(objectFormat: 0, filename: entry.filename)
+            let isRAW = !isVideo && (entry.isRAW || isRAWMedia(objectFormat: 0, filename: entry.filename))
+            guard isVideo || isRAW || isImageMedia(objectFormat: 0, filename: entry.filename) else { continue }
+            candidates.append(
+                GalleryItem(
+                    id: entry.handle,
+                    filename: entry.filename,
+                    objectFormat: isVideo ? 0x300d : (isRAW ? 0xb802 : 0x3801),
+                    fileSize: entry.fileSize,
+                    isVideo: isVideo,
+                    captureDate: entry.captureDate,
+                    rawHandle: isRAW ? entry.handle : nil,
+                    rawFilename: isRAW ? entry.filename : nil,
+                    rawFileSize: isRAW ? entry.fileSize : nil,
+                    jpegHandle: (!isVideo && !isRAW) ? entry.handle : nil,
+                    jpegFilename: (!isVideo && !isRAW) ? entry.filename : nil,
+                    jpegFileSize: (!isVideo && !isRAW) ? entry.fileSize : nil
+                )
+            )
+        }
+        return Self.sortedGalleryItems(Self.mergePairedPhotos(candidates))
+    }
+
     /// Switch directory: clear current gallery and load the chosen folder.
     func selectGalleryDirectory(id: UInt32) async {
         guard galleryDirectories.contains(where: { $0.id == id }) else {
@@ -794,6 +1047,10 @@ final class CameraConnectionService: ObservableObject {
         thumbnailCache = [:]
         previewImageCache = [:]
         objectImageCache = [:]
+        if linkKind == .usb {
+            await loadUSBGalleryMedia(forDirectoryID: id, generation: generation)
+            return
+        }
         await loadGalleryMedia(forDirectoryID: id, clearCaches: true, generation: generation)
     }
 
@@ -802,7 +1059,7 @@ final class CameraConnectionService: ObservableObject {
         clearCaches: Bool,
         generation: Int
     ) async {
-        guard case .connected = state, let commandConnection else {
+        guard case .connected = state, let channel = commandChannel else {
             appendLog("[图库] 未连接相机，跳过媒体加载")
             return
         }
@@ -819,12 +1076,12 @@ final class CameraConnectionService: ObservableObject {
 
         let startedAt = Date()
         appendLog("[图库] 开始加载目录 \(directory.pickerTitle) path=\(directory.path) handle=0x\(String(format: "%08X", directory.handle))")
-        var mediaConnection = commandConnection
+        var mediaConnection = channel
         if supportedOperations.contains(PTPOperationCode.getObjectsMetadata.rawValue) {
             appendLog("[图库] GetObjectsMetaData可用")
             appendLog("[图库] 使用 GetObjectsMetaData 获取列表")
             do {
-                let metadata = try await fetchNikonObjectsMetadata(in: directory, on: commandConnection)
+                let metadata = try await fetchNikonObjectsMetadata(in: directory, on: channel)
                 guard isCurrentGalleryLoad(generation, directoryID: directoryID) else { return }
                 let records = metadata.records
                 let skeleton = await Task.detached(priority: .userInitiated) {
@@ -837,7 +1094,7 @@ final class CameraConnectionService: ObservableObject {
                     await self?.enrichMetadataGallery(
                         metadata,
                         in: directory,
-                        on: commandConnection,
+                        on: channel,
                         generation: generation
                     )
                 }
@@ -848,8 +1105,8 @@ final class CameraConnectionService: ObservableObject {
                 guard isMatchingGalleryLoad(generation, directoryID: directoryID) else { return }
                 appendLog("[图库] GetObjectsMetaData失败 reason=\(error.localizedDescription)")
                 appendLog("[图库] GetObjectsMetaData失败，回退标准对象枚举")
-                if case .ready = commandConnection.state {
-                    mediaConnection = commandConnection
+                if channel.isReady {
+                    mediaConnection = channel
                 } else if let recovered = await waitForRecoveredCommandConnection(
                     generation: generation,
                     directoryID: directoryID
@@ -890,7 +1147,23 @@ final class CameraConnectionService: ObservableObject {
         if let cached = thumbnailCache[handle], let image = UIImage(data: cached) {
             return image
         }
-        guard case .connected = state, let commandConnection else {
+
+        if linkKind == .usb, usbLink.hasObject(handle: handle) {
+            do {
+                if let data = try await usbLink.thumbnailData(forHandle: handle) {
+                    thumbnailCache[handle] = data
+                    return UIImage(data: data)
+                }
+                appendLog("[图库] USB 缩略图为空 handle=0x\(String(format: "%08X", handle))")
+            } catch {
+                appendLog(
+                    "[图库] USB 缩略图失败 handle=0x\(String(format: "%08X", handle)) " +
+                        "error=\(error.localizedDescription)"
+                )
+            }
+        }
+
+        guard case .connected = state, let channel = commandChannel else {
             appendLog("[图库] 缩略图跳过 handle=0x\(String(format: "%08X", handle)) reason=未连接")
             return nil
         }
@@ -901,7 +1174,7 @@ final class CameraConnectionService: ObservableObject {
                 .getThumb,
                 parameters: [handle],
                 dataPhase: .receive,
-                on: commandConnection,
+                on: channel,
                 logStyle: .silent
             )
             guard response.code == PTPResponseCode.ok.rawValue, let data = response.data, !data.isEmpty else {
@@ -922,9 +1195,26 @@ final class CameraConnectionService: ObservableObject {
     /// Downloads the original object bytes without decoding or recompressing them.
     func objectData(for handle: UInt32) async -> Data? {
         if let cached = objectImageCache[handle] { return cached }
-        guard case .connected = state, let commandConnection else { return nil }
+        guard case .connected = state else { return nil }
+
+        if linkKind == .usb, usbLink.hasObject(handle: handle) {
+            do {
+                let data = try await usbLink.readObjectData(forHandle: handle)
+                guard !data.isEmpty else { return nil }
+                objectImageCache[handle] = data
+                return data
+            } catch {
+                appendLog(
+                    "[图库] USB 原始文件下载失败 handle=0x\(String(format: "%08X", handle)) " +
+                        "error=\(error.localizedDescription)"
+                )
+                return nil
+            }
+        }
+
+        guard let channel = commandChannel else { return nil }
         do {
-            let response = try await operation(.getObject, parameters: [handle], dataPhase: .receive, on: commandConnection, logStyle: .silent)
+            let response = try await operation(.getObject, parameters: [handle], dataPhase: .receive, on: channel, logStyle: .silent)
             guard response.code == PTPResponseCode.ok.rawValue, let data = response.data, !data.isEmpty else { return nil }
             objectImageCache[handle] = data
             return data
@@ -936,12 +1226,23 @@ final class CameraConnectionService: ObservableObject {
 
     /// Reads an object in chunks and reports the number of bytes received after each chunk.
     func objectData(for handle: UInt32, progress: @escaping @MainActor (UInt64, UInt64) -> Void) async throws -> Data {
-        guard case .connected = state, let commandConnection else {
+        guard case .connected = state else {
             throw CameraConnectionError.connectionCancelled
         }
 
         let total = galleryItems.first(where: { $0.handle == handle })?.fileSize ?? 0
-        return try await fetchPartialObject(handle: handle, on: commandConnection) { received in
+
+        // USB 优先走系统的大块读取通道，吞吐远高于逐条 PTP 轮询。
+        if linkKind == .usb, usbLink.hasObject(handle: handle) {
+            return try await usbLink.readObjectData(forHandle: handle) { received, reportedTotal in
+                progress(received, reportedTotal > 0 ? reportedTotal : total)
+            }
+        }
+
+        guard let channel = commandChannel else {
+            throw CameraConnectionError.connectionCancelled
+        }
+        return try await fetchPartialObject(handle: handle, on: channel) { received in
             progress(received, total)
         }
     }
@@ -949,8 +1250,11 @@ final class CameraConnectionService: ObservableObject {
     /// Deletes every object belonging to each selected photo. A RAW+JPEG item
     /// contributes both object handles, so the camera never retains its pair.
     func deleteGalleryItems(_ items: [GalleryItem]) async throws {
-        guard case .connected = state, let commandConnection else {
+        guard case .connected = state else {
             throw CameraConnectionError.connectionCancelled
+        }
+        guard let channel = commandChannel else {
+            throw CameraConnectionError.usbUnavailable("当前 USB 连接未提供 PTP 直通，暂不支持删除相机内文件")
         }
 
         var handles = Set<UInt32>()
@@ -971,7 +1275,7 @@ final class CameraConnectionService: ObservableObject {
                 .deleteObject,
                 parameters: [handle],
                 dataPhase: nil,
-                on: commandConnection,
+                on: channel,
                 logStyle: .compact,
                 priority: .foreground
             )
@@ -995,14 +1299,14 @@ final class CameraConnectionService: ObservableObject {
                 return .preview(image)
             }
 
-            guard case .connected = state, let commandConnection else { return nil }
+            guard case .connected = state, let channel = commandChannel else { return nil }
             let filename = galleryItems.first(where: { $0.handle == handle })?.filename
             do {
                 let response = try await operation(
                     .getPreviewImage,
                     parameters: [],
                     dataPhase: .receive,
-                    on: commandConnection,
+                    on: channel,
                     logStyle: .silent
                 )
                 if response.code == PTPResponseCode.ok.rawValue,
@@ -1034,11 +1338,33 @@ final class CameraConnectionService: ObservableObject {
         if let cached = objectImageCache[handle], let image = UIImage(data: cached) {
             return image
         }
-        guard case .connected = state, let commandConnection else { return nil }
-
+        guard case .connected = state else { return nil }
         let filename = galleryItems.first(where: { $0.handle == handle })?.filename
+
+        if linkKind == .usb, usbLink.hasObject(handle: handle) {
+            do {
+                let data = try await usbLink.readObjectData(forHandle: handle)
+                guard !data.isEmpty, let image = UIImage(data: data) else {
+                    appendLog(
+                        "[图库] USB 原图无效 \(galleryItemLabel(handle: handle, filename: filename)) " +
+                            "bytes=\(data.count)"
+                    )
+                    return nil
+                }
+                objectImageCache[handle] = data
+                return image
+            } catch {
+                appendLog(
+                    "[图库] USB 原图异常 \(galleryItemLabel(handle: handle, filename: filename)) " +
+                        "error=\(error.localizedDescription)"
+                )
+                return nil
+            }
+        }
+
+        guard let channel = commandChannel else { return nil }
         do {
-            let data = try await fetchPartialObject(handle: handle, on: commandConnection)
+            let data = try await fetchPartialObject(handle: handle, on: channel)
             guard !data.isEmpty, let image = UIImage(data: data) else {
                 appendLog("[图库] 分块原图无效 \(galleryItemLabel(handle: handle, filename: filename)) bytes=\(data.count)")
                 return nil
@@ -1053,7 +1379,7 @@ final class CameraConnectionService: ObservableObject {
 
     private func fetchPartialObject(
         handle: UInt32,
-        on connection: NWConnection,
+        on connection: any PTPChannel,
         progress: (@MainActor (UInt64) -> Void)? = nil
     ) async throws -> Data {
         let chunkSize: UInt32 = 4 * 1024 * 1024
@@ -1116,7 +1442,7 @@ final class CameraConnectionService: ObservableObject {
     /// Query the camera's DevicePropDesc datasets when the Capture tab opens.
     /// The returned range or enum forms are the sole source for editable values.
     func refreshCaptureParameterCapabilities() async {
-        guard case .connected = state, let commandConnection else {
+        guard case .connected = state, let channel = commandChannel else {
             captureParameterOptions = [:]
             capturePropertyDescriptions = [:]
             return
@@ -1138,7 +1464,7 @@ final class CameraConnectionService: ObservableObject {
             if Task.isCancelled { break }
             guard let description = await readCapturePropertyDescription(
                 for: parameter,
-                on: commandConnection
+                on: channel
             ) else { continue }
 
             let normalizedValues = description.allowedValues.map {
@@ -1180,7 +1506,7 @@ final class CameraConnectionService: ObservableObject {
 
     /// Read the exposure-related PTP properties shown in the Capture tab.
     func refreshCaptureParameters() async {
-        guard case .connected = state, let commandConnection else {
+        guard case .connected = state, let channel = commandChannel else {
             captureParameters = [:]
             return
         }
@@ -1193,7 +1519,7 @@ final class CameraConnectionService: ObservableObject {
         var values: [CaptureParameter: UInt64] = [:]
         for parameter in CaptureParameter.allCases {
             if Task.isCancelled { break }
-            if let value = await readCaptureParameter(parameter, on: commandConnection) {
+            if let value = await readCaptureParameter(parameter, on: channel) {
                 values[parameter] = value
             }
         }
@@ -1245,7 +1571,7 @@ final class CameraConnectionService: ObservableObject {
     /// variants expose only the single marker parameter.
     @discardableResult
     func initiateCaptureRecInMedia() async -> Bool {
-        guard case .connected = state, let commandConnection else {
+        guard case .connected = state, let channel = commandChannel else {
             captureControlError = "相机未连接。"
             return false
         }
@@ -1267,7 +1593,7 @@ final class CameraConnectionService: ObservableObject {
                     .initiateCaptureRecInMedia,
                     parameters: parameters,
                     dataPhase: nil,
-                    on: commandConnection,
+                    on: channel,
                     logStyle: .compact,
                     timeout: .seconds(8)
                 )
@@ -1278,7 +1604,7 @@ final class CameraConnectionService: ObservableObject {
                         "[capture] InitiateCaptureRecInMedia 成功 " +
                             "parameters=\(logParameters(parameters))"
                     )
-                    try await waitUntilDeviceReady(on: commandConnection, logPrefix: "[capture]")
+                    try await waitUntilDeviceReady(on: channel, logPrefix: "[capture]")
                     return true
                 }
 
@@ -1324,7 +1650,7 @@ final class CameraConnectionService: ObservableObject {
     /// value the body actually accepted.
     @discardableResult
     func setCaptureParameter(_ parameter: CaptureParameter, rawValue: UInt64) async -> Bool {
-        guard case .connected = state, let commandConnection else {
+        guard case .connected = state, let channel = commandChannel else {
             captureControlError = "相机未连接。"
             return false
         }
@@ -1341,7 +1667,7 @@ final class CameraConnectionService: ObservableObject {
                 .setDevicePropValue,
                 parameters: [UInt32(parameter.writePropertyCode(for: rawValue))],
                 dataPhase: .send(parameter.writeData(for: rawValue)),
-                on: commandConnection,
+                on: channel,
                 logStyle: .compact,
                 timeout: .seconds(5)
             )
@@ -1362,7 +1688,7 @@ final class CameraConnectionService: ObservableObject {
                     .setDevicePropValue,
                     parameters: [UInt32(fallbackCode)],
                     dataPhase: .send(fallbackData),
-                    on: commandConnection,
+                    on: channel,
                     logStyle: .compact,
                     timeout: .seconds(5)
                 )
@@ -1381,7 +1707,7 @@ final class CameraConnectionService: ObservableObject {
             // Let the body settle before refreshing the real value. This keeps
             // the UI truthful when the camera clamps a value to its own steps.
             try? await Task.sleep(for: .milliseconds(180))
-            let actualValue = await readCaptureParameter(parameter, on: commandConnection)
+            let actualValue = await readCaptureParameter(parameter, on: channel)
             if let actualValue {
                 captureParameters[parameter] = actualValue
                 appendLog("[capture] 参数回读 name=\(parameter.title) raw=\(actualValue)")
@@ -1401,7 +1727,7 @@ final class CameraConnectionService: ObservableObject {
 
     private func readCaptureParameter(
         _ parameter: CaptureParameter,
-        on connection: NWConnection
+        on connection: any PTPChannel
     ) async -> UInt64? {
         if let value = await readDeviceProperty(parameter.rawValue, on: connection) {
             return parameter.normalizeStandardRead(value)
@@ -1438,7 +1764,7 @@ final class CameraConnectionService: ObservableObject {
     }
 
     private func beginLiveViewSession() async {
-        guard case .connected = state, let commandConnection else {
+        guard case .connected = state, let channel = commandChannel else {
             liveViewError = "相机未连接"
             isLiveViewActive = false
             liveViewImage = nil
@@ -1467,7 +1793,7 @@ final class CameraConnectionService: ObservableObject {
         appendLog("[liveview] 开始启动实时图传 generation=\(generation)")
 
         do {
-            try await prepareLiveView(on: commandConnection)
+            try await prepareLiveView(on: channel)
             guard generation == liveViewGeneration, liveViewConsumers > 0, case .connected = state else { return }
             isLiveViewActive = true
             liveViewError = nil
@@ -1504,7 +1830,7 @@ final class CameraConnectionService: ObservableObject {
             liveViewError = nil
             return
         }
-        guard case .connected = state, let commandConnection, supportsOperation(.endLiveView) else {
+        guard case .connected = state, let channel = commandChannel, supportsOperation(.endLiveView) else {
             liveViewError = nil
             return
         }
@@ -1515,7 +1841,7 @@ final class CameraConnectionService: ObservableObject {
                     .endLiveView,
                     parameters: [],
                     dataPhase: nil,
-                    on: commandConnection,
+                    on: channel,
                     logStyle: .compact
                 )
                 self.appendLog("[liveview] EndLiveView code=0x\(String(format: "%04X", response.code))")
@@ -1536,7 +1862,7 @@ final class CameraConnectionService: ObservableObject {
         supportedOperations.contains(code.rawValue)
     }
 
-    private func prepareLiveView(on connection: NWConnection) async throws {
+    private func prepareLiveView(on connection: any PTPChannel) async throws {
         // Prefer leaving the camera body monitor usable: only enter application mode
         // when StartLiveView is rejected without it.
         var start = try await operation(
@@ -1572,7 +1898,7 @@ final class CameraConnectionService: ObservableObject {
         try await waitUntilDeviceReady(on: connection)
     }
 
-    private func waitUntilDeviceReady(on connection: NWConnection, logPrefix: String = "[liveview]") async throws {
+    private func waitUntilDeviceReady(on connection: any PTPChannel, logPrefix: String = "[liveview]") async throws {
         guard supportsOperation(.deviceReady) else {
             try await Task.sleep(for: .milliseconds(400))
             return
@@ -1608,11 +1934,11 @@ final class CameraConnectionService: ObservableObject {
               generation == liveViewGeneration,
               liveViewConsumers > 0,
               case .connected = state,
-              let commandConnection
+              let channel = commandChannel
         {
             do {
                 if let frame = try await fetchLiveViewFrame(
-                    on: commandConnection,
+                    on: channel,
                     priority: .background
                 ) {
                     applyLiveViewFrame(frame)
@@ -1654,7 +1980,7 @@ final class CameraConnectionService: ObservableObject {
     }
 
     private func fetchLiveViewFrame(
-        on connection: NWConnection,
+        on connection: any PTPChannel,
         priority: OperationPriority
     ) async throws -> LiveViewFrame? {
         let preferred: [PTPOperationCode] = supportsOperation(.getLiveViewImageEx)
@@ -1663,6 +1989,7 @@ final class CameraConnectionService: ObservableObject {
         var lastCode: UInt16 = 0
         for code in preferred where supportsOperation(code) || code == .getLiveViewImage {
             // Always allow 0x9203 attempt even if DeviceInfo omitted it; some bodies still answer.
+            // 拉帧用后台优先级：图库缩略图、状态刷新可以随时插队。
             let response = try await operation(
                 code,
                 parameters: [],
@@ -1679,7 +2006,8 @@ final class CameraConnectionService: ObservableObject {
             guard response.code == PTPResponseCode.ok.rawValue, let data = response.data, data.count > 64 else {
                 continue
             }
-            if let image = decodeLiveViewJPEG(from: data) {
+            // JPEG 解码放到主线程之外：解码是刷新率的最大瓶颈。
+            if let image = await Self.decodeLiveViewJPEG(from: data) {
                 return LiveViewFrame(
                     image: image,
                     focusMetadata: NikonLiveViewFocusMetadata(
@@ -1713,7 +2041,7 @@ final class CameraConnectionService: ObservableObject {
               isLiveViewFocusPointAvailable,
               !isSettingLiveViewFocusPoint,
               supportsOperation(.changeAfArea),
-              let commandConnection,
+              let channel = commandChannel,
               let metadata = liveViewFocusMetadata
         else { return false }
 
@@ -1729,7 +2057,7 @@ final class CameraConnectionService: ObservableObject {
                     UInt32(cameraPoint.y.rounded())
                 ],
                 dataPhase: nil,
-                on: commandConnection,
+                on: channel,
                 logStyle: .compact,
                 priority: .foreground,
                 timeout: .seconds(5)
@@ -1744,7 +2072,7 @@ final class CameraConnectionService: ObservableObject {
             )
             for _ in 0..<4 {
                 if let frame = try await fetchLiveViewFrame(
-                    on: commandConnection,
+                    on: channel,
                     priority: .foreground
                 ) {
                     applyLiveViewFrame(frame)
@@ -1759,15 +2087,21 @@ final class CameraConnectionService: ObservableObject {
         }
     }
 
-    private func decodeLiveViewJPEG(from data: Data) -> UIImage? {
-        if let image = UIImage(data: data) {
-            return image
-        }
-        guard let jpeg = extractJPEGPayload(from: data) else { return nil }
-        return UIImage(data: jpeg)
+    /// 后台线程解码并立即展开位图，避免每帧在主线程做昂贵的 JPEG 解码。
+    private nonisolated static func decodeLiveViewJPEG(from data: Data) async -> UIImage? {
+        await Task.detached(priority: .userInitiated) {
+            let payload = jpegPayload(from: data) ?? data
+            guard let source = CGImageSourceCreateWithData(payload as CFData, nil),
+                  let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil)
+            else {
+                return UIImage(data: data)
+            }
+            return UIImage(cgImage: cgImage)
+        }.value
     }
 
-    private func extractJPEGPayload(from data: Data) -> Data? {
+    /// 机身返回的对象可能带私有头，截取 SOI..EOI 之间的 JPEG 数据。
+    private nonisolated static func jpegPayload(from data: Data) -> Data? {
         guard let soi = data.range(of: Data([0xff, 0xd8])) else { return nil }
         if let eoi = data.range(of: Data([0xff, 0xd9]), options: [], in: soi.lowerBound..<data.endIndex) {
             return Data(data[soi.lowerBound..<eoi.upperBound])
@@ -1779,7 +2113,7 @@ final class CameraConnectionService: ObservableObject {
         _ code: PTPOperationCode,
         parameters: [UInt32],
         dataPhase: DataPhase?,
-        on connection: NWConnection,
+        on connection: any PTPChannel,
         logStyle: OperationLogStyle = .verbose,
         priority: OperationPriority = .foreground,
         timeout: Duration? = nil
@@ -1790,8 +2124,8 @@ final class CameraConnectionService: ObservableObject {
         transactionID = currentTransactionID
         activeOperationTransactionID = currentTransactionID
         let timeoutTask = timeout.map { timeout in
-            Task { [weak self, weak connection] in
-                guard let self, let connection else { return }
+            Task { [weak self] in
+                guard let self else { return }
                 do {
                     try await Task.sleep(for: timeout)
                 } catch {
@@ -1820,7 +2154,8 @@ final class CameraConnectionService: ObservableObject {
                     "[command] CancelTransaction未收到响应 name=\(code.debugName) " +
                         "transaction=\(currentTransactionID)，重建连接"
                 )
-                connection.cancel()
+                guard self.linkKind == .wifi else { return }
+                connection.close()
                 self.beginAutomaticReconnect(reason: "\(code.debugName) 超时")
             }
         }
@@ -1968,64 +2303,7 @@ final class CameraConnectionService: ObservableObject {
         }
     }
 
-    private func start(_ connection: NWConnection) async throws {
-        let generation = connectionGeneration
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            connection.stateUpdateHandler = { state in
-                switch state {
-                case .ready:
-                    Task { @MainActor in
-                        self.appendLog("NWConnection state=ready")
-                    }
-                    connection.stateUpdateHandler = nil
-                    continuation.resume()
-                case .failed(let error):
-                    Task { @MainActor in
-                        self.appendLog("NWConnection state=failed error=\(String(reflecting: error))")
-                        self.handleTransportFailure(connection, generation: generation, reason: error.localizedDescription)
-                    }
-                    connection.stateUpdateHandler = nil
-                    continuation.resume(throwing: error)
-                case .cancelled:
-                    Task { @MainActor in
-                        self.appendLog("NWConnection state=cancelled")
-                        self.handleTransportFailure(connection, generation: generation, reason: "连接已取消")
-                    }
-                    connection.stateUpdateHandler = nil
-                    continuation.resume(throwing: CameraConnectionError.connectionCancelled)
-                default:
-                    break
-                }
-            }
-            connection.start(queue: .main)
-        }
-        monitorConnection(connection)
-    }
-
-    private func monitorConnection(_ connection: NWConnection) {
-        let generation = connectionGeneration
-        connection.stateUpdateHandler = { [weak self, weak connection] state in
-            guard let self, let connection else { return }
-            switch state {
-            case .ready:
-                Task { @MainActor in self.appendLog("NWConnection state=ready") }
-            case .failed(let error):
-                Task { @MainActor in
-                    self.appendLog("NWConnection state=failed error=\(String(reflecting: error))")
-                    self.handleTransportFailure(connection, generation: generation, reason: error.localizedDescription)
-                }
-            case .cancelled:
-                Task { @MainActor in
-                    self.appendLog("NWConnection state=cancelled")
-                    self.handleTransportFailure(connection, generation: generation, reason: "连接已取消")
-                }
-            default:
-                break
-            }
-        }
-    }
-
-    private func send(_ packet: Data, on connection: NWConnection, logStyle: OperationLogStyle = .verbose) async throws {
+    private func send(_ packet: Data, on connection: any PTPChannel, logStyle: OperationLogStyle = .verbose) async throws {
         switch logStyle {
         case .verbose:
             appendLog("发送 PTP/IP type=\(packet.packetTypeName) totalBytes=\(packet.count) hex=\(packet.hexDump)")
@@ -2034,76 +2312,26 @@ final class CameraConnectionService: ObservableObject {
         case .silent:
             break
         }
-        do {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                connection.send(content: packet, completion: .contentProcessed { error in
-                    if let error {
-                        continuation.resume(throwing: error)
-                    } else {
-                        continuation.resume()
-                    }
-                })
-            }
-        } catch {
-            noteTransportError(connection, reason: error.localizedDescription)
-            throw error
-        }
+        try await connection.send(packet: packet)
     }
 
-    private func receivePacket(on connection: NWConnection, logStyle: OperationLogStyle = .verbose) async throws -> PTPIPPacket {
-        let header = try await receiveExactly(8, on: connection)
-        let totalLength = Int(header.uint32(at: 0))
-        guard totalLength >= 8 else {
-            appendLog("接收报文长度非法 totalLength=\(totalLength) header=\(header.hexDump)")
-            throw CameraConnectionError.malformedPacket
-        }
-        let type = header.uint32(at: 4)
-        let payload = totalLength > 8 ? try await receiveExactly(totalLength - 8, on: connection) : Data()
-        let packet = PTPIPPacket(type: type, payload: payload)
+    private func receivePacket(on connection: any PTPChannel, logStyle: OperationLogStyle = .verbose) async throws -> PTPIPPacket {
+        let packet = try await connection.receivePacket()
         switch logStyle {
         case .verbose:
-            appendLog("接收 PTP/IP type=\(packet.typeName) totalBytes=\(totalLength) payloadBytes=\(payload.count) hex=\(packet.hexDump)")
+            appendLog("接收 PTP/IP type=\(packet.typeName) payloadBytes=\(packet.payload.count) hex=\(packet.hexDump)")
         case .compact:
-            appendLog("接收 PTP/IP type=\(packet.typeName) totalBytes=\(totalLength) payloadBytes=\(payload.count)")
+            appendLog("接收 PTP/IP type=\(packet.typeName) payloadBytes=\(packet.payload.count)")
         case .silent:
             break
         }
         return packet
     }
 
-    private func receiveExactly(_ count: Int, on connection: NWConnection) async throws -> Data {
-        var collected = Data()
-        while collected.count < count {
-            let remaining = count - collected.count
-            let chunk: Data
-            do {
-                chunk = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
-                    connection.receive(minimumIncompleteLength: 1, maximumLength: remaining) { data, _, isComplete, error in
-                        if let error {
-                            continuation.resume(throwing: error)
-                        } else if let data, !data.isEmpty {
-                            continuation.resume(returning: data)
-                        } else if isComplete {
-                            continuation.resume(throwing: CameraConnectionError.connectionCancelled)
-                        }
-                    }
-                }
-            } catch {
-                noteTransportError(connection, reason: error.localizedDescription)
-                throw error
-            }
-            collected.append(chunk)
-        }
-        return collected
-    }
-
     private func disconnectConnections() {
-        connectionGeneration = UUID()
-        commandConnection?.cancel()
-        eventConnection?.cancel()
-        commandConnection = nil
-        eventConnection = nil
-        connectionNumber = nil
+        commandChannel?.close()
+        commandChannel = nil
+        isUSBPTPReady = false
     }
 
     private func acquireOperationSlot(priority: OperationPriority) async {
@@ -2153,7 +2381,7 @@ final class CameraConnectionService: ObservableObject {
         return waiter
     }
 
-    private func loadGalleryDirectories(on connection: NWConnection) async throws -> [GalleryDirectory] {
+    private func loadGalleryDirectories(on connection: any PTPChannel) async throws -> [GalleryDirectory] {
         let storageIDs = try await fetchStorageIDs(on: connection)
         if storageIDs.isEmpty {
             appendLog("[图库] 未发现可用存储")
@@ -2306,7 +2534,7 @@ final class CameraConnectionService: ObservableObject {
 
     private func fetchNikonObjectsMetadata(
         in directory: GalleryDirectory,
-        on connection: NWConnection
+        on connection: any PTPChannel
     ) async throws -> NikonObjectsMetadata {
         guard !directory.isSyntheticRoot else {
             throw NikonMetadataLoadError.allStrategiesFailed(
@@ -2366,7 +2594,7 @@ final class CameraConnectionService: ObservableObject {
                 hadFailure = true
                 lastFailure = "策略 \(strategyName) path=\(target.path) 传输异常：\(error.localizedDescription)"
                 appendLog("[图库] GetObjectsMetaData策略失败 strategy=\(strategyName) reason=\(lastFailure)")
-                if case .ready = connection.state {
+                if connection.isReady {
                     continue
                 }
                 throw NikonMetadataLoadError.allStrategiesFailed(
@@ -2463,7 +2691,7 @@ final class CameraConnectionService: ObservableObject {
     private func enrichMetadataGallery(
         _ metadata: NikonObjectsMetadata,
         in directory: GalleryDirectory,
-        on connection: NWConnection,
+        on connection: any PTPChannel,
         generation: Int
     ) async {
         var resolved: [UInt32: GalleryItem] = [:]
@@ -2561,7 +2789,7 @@ final class CameraConnectionService: ObservableObject {
 
     private func loadMediaItems(
         in directory: GalleryDirectory,
-        on connection: NWConnection,
+        on connection: any PTPChannel,
         generation: Int
     ) async throws -> [GalleryItem] {
         let rootHandles = try await fetchObjectHandles(
@@ -2749,7 +2977,7 @@ final class CameraConnectionService: ObservableObject {
         return base.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
     }
 
-    private func fetchStorageIDs(on connection: NWConnection) async throws -> [UInt32] {
+    private func fetchStorageIDs(on connection: any PTPChannel) async throws -> [UInt32] {
         let response = try await operation(
             .getStorageIDs,
             parameters: [],
@@ -2776,7 +3004,7 @@ final class CameraConnectionService: ObservableObject {
         storageID: UInt32,
         objectFormat: UInt32,
         parent: UInt32,
-        on connection: NWConnection
+        on connection: any PTPChannel
     ) async throws -> [UInt32] {
         let response = try await operation(
             .getObjectHandles,
@@ -2832,7 +3060,7 @@ final class CameraConnectionService: ObservableObject {
 
     private func fetchObjectInfo(
         handle: UInt32,
-        on connection: NWConnection,
+        on connection: any PTPChannel,
         priority: OperationPriority = .foreground
     ) async throws -> ParsedObjectInfo? {
         let response = try await operation(
@@ -2937,7 +3165,7 @@ final class CameraConnectionService: ObservableObject {
         return formatter.date(from: core)
     }
 
-    private func readCameraStatus(on connection: NWConnection) async -> CameraStatus {
+    private func readCameraStatus(on connection: any PTPChannel) async -> CameraStatus {
         var status = CameraStatus()
 
         // These are standard PTP properties. Nikon may omit one or expose a
@@ -3020,7 +3248,7 @@ final class CameraConnectionService: ObservableObject {
         )
     }
 
-    private func readLensInfo(on connection: NWConnection) async -> LensInfo {
+    private func readLensInfo(on connection: any PTPChannel) async -> LensInfo {
         var info = LensInfo(connectionState: .unknown)
         appendLog("开始读取镜头信息")
 
@@ -3133,7 +3361,7 @@ final class CameraConnectionService: ObservableObject {
 
     private func readDeviceProperty(
         _ propertyCode: UInt16,
-        on connection: NWConnection
+        on connection: any PTPChannel
     ) async -> UInt64? {
         guard let response = try? await operation(
             .getDevicePropValue,
@@ -3153,7 +3381,7 @@ final class CameraConnectionService: ObservableObject {
 
     private func readCapturePropertyDescription(
         for parameter: CaptureParameter,
-        on connection: NWConnection
+        on connection: any PTPChannel
     ) async -> CapturePropertyDescription? {
         let propertyCodes = [parameter.rawValue, parameter.fallbackPropertyCode]
             .compactMap { $0 }
@@ -3176,7 +3404,7 @@ final class CameraConnectionService: ObservableObject {
 
     private func readDevicePropertyDescription(
         _ propertyCode: UInt16,
-        on connection: NWConnection
+        on connection: any PTPChannel
     ) async -> CapturePropertyDescription? {
         guard let response = try? await operation(
             .getDevicePropDesc,
@@ -3287,47 +3515,6 @@ final class CameraConnectionService: ObservableObject {
             return String(format: "f/%.1f", tenths)
         }
         return String(format: "f/%.2f", value)
-    }
-
-    private func initCommandPayload(guid: Data) -> Data {
-        var payload = Data(guid.prefix(16))
-        if payload.count < 16 {
-            payload.append(Data(repeating: 0, count: 16 - payload.count))
-        }
-        payload.append(utf16NullTerminatedString("ZLinks iOS"))
-        payload.append(uint32Data(0x00010000))
-        return payload
-    }
-
-    private func parseInitCommandAck(_ data: Data) throws -> (connectionNumber: UInt32, name: String) {
-        guard data.count >= 24 else {
-            throw CameraConnectionError.malformedPacket
-        }
-        let connectionNumber = data.uint32(at: 0)
-        let protocolVersionOffset = data.count - 4
-        guard protocolVersionOffset >= 20, protocolVersionOffset % 2 == 0 else {
-            throw CameraConnectionError.malformedPacket
-        }
-
-        var nameEnd = 20
-        while nameEnd + 1 < protocolVersionOffset {
-            if data.uint16(at: nameEnd) == 0 {
-                break
-            }
-            nameEnd += 2
-        }
-        guard nameEnd + 1 < protocolVersionOffset,
-              data.uint16(at: nameEnd) == 0
-        else {
-            appendLog("InitCommandAck FriendlyName 未找到 UTF-16 终止符 start=20 end=\(protocolVersionOffset)")
-            throw CameraConnectionError.malformedPacket
-        }
-
-        let nameData = data[20..<nameEnd]
-        let name = String(data: nameData, encoding: .utf16LittleEndian) ?? ""
-        let protocolVersion = data.uint32(at: protocolVersionOffset)
-        appendLog("InitCommandAck FriendlyName=\(name.debugDescription) protocolVersion=0x\(String(format: "%08X", protocolVersion))")
-        return (connectionNumber, name)
     }
 
     private func parseDeviceInfo(_ data: Data) throws -> CameraInfo {
@@ -3502,47 +3689,7 @@ private struct PTPResponse {
     }
 }
 
-private struct PTPIPPacket {
-    let type: UInt32
-    let payload: Data
-
-    var typeName: String { PTPIPPacketType(rawValue: type)?.debugName ?? String(format: "0x%08X", type) }
-    var hexDump: String { uint32Data(UInt32(payload.count + 8)).hexDump + " " + uint32Data(type).hexDump + (payload.isEmpty ? "" : " " + payload.hexDump) }
-}
-
-private enum PTPIPPacketType: UInt32 {
-    case initCommandRequest = 0x00000001
-    case initCommandAck = 0x00000002
-    case initEventRequest = 0x00000003
-    case initEventAck = 0x00000004
-    case initFail = 0x00000005
-    case operationRequest = 0x00000006
-    case operationResponse = 0x00000007
-    case event = 0x00000008
-    case startData = 0x00000009
-    case data = 0x0000000a
-    case cancelTransaction = 0x0000000b
-    case endData = 0x0000000c
-
-    var debugName: String {
-        switch self {
-        case .initCommandRequest: return "InitCommandRequest"
-        case .initCommandAck: return "InitCommandAck"
-        case .initEventRequest: return "InitEventRequest"
-        case .initEventAck: return "InitEventAck"
-        case .initFail: return "InitFail"
-        case .operationRequest: return "OperationRequest"
-        case .operationResponse: return "OperationResponse"
-        case .event: return "Event"
-        case .startData: return "StartData"
-        case .data: return "Data"
-        case .cancelTransaction: return "CancelTransaction"
-        case .endData: return "EndData"
-        }
-    }
-}
-
-private enum PTPOperationCode: UInt16 {
+enum PTPOperationCode: UInt16 {
     case getDeviceInfo = 0x1001
     case openSession = 0x1002
     case getStorageIDs = 0x1004
@@ -3600,52 +3747,6 @@ private enum PTPOperationCode: UInt16 {
     }
 }
 
-private enum PTPResponseCode: UInt16 {
-    case ok = 0x2001
-    case operationNotSupported = 0x2006
-    case deviceBusy = 0x2019
-    case invalidParameter = 0x201d
-}
-
-private extension UInt16 {
-    static let ok = PTPResponseCode.ok.rawValue
-}
-
-private enum CameraConnectionError: LocalizedError {
-    case connectionCancelled
-    case malformedPacket
-    case unexpectedPacket
-    case transactionMismatch
-    case ptpResponse(UInt16)
-    case initFailed(UInt32)
-
-    var errorDescription: String? {
-        switch self {
-        case .connectionCancelled:
-            return "与相机的连接已关闭。"
-        case .malformedPacket:
-            return "相机返回了无法识别的数据。"
-        case .unexpectedPacket:
-            return "相机未完成 PTP/IP 初始化。"
-        case .transactionMismatch:
-            return "相机响应与当前请求不匹配。"
-        case .ptpResponse(let code):
-            switch code {
-            case 0x200a:
-                return "当前相机或拍摄模式不支持该参数。"
-            case 0x2019:
-                return "相机正忙，请稍后重试。"
-            case 0x201a:
-                return "相机拒绝修改该参数。"
-            default:
-                return String(format: "相机拒绝了请求（0x%04X）。", code)
-            }
-        case .initFailed(let code):
-            return String(format: "相机拒绝了 PTP/IP 初始化（失败码 0x%08X）。", code)
-        }
-    }
-}
-
 private enum NikonMetadataLoadError: LocalizedError {
     case allStrategiesFailed(responseCode: UInt16?, reason: String)
 
@@ -3660,65 +3761,8 @@ private enum NikonMetadataLoadError: LocalizedError {
     }
 }
 
-private func ptpIPPacket(type: PTPIPPacketType, payload: Data) -> Data {
-    uint32Data(UInt32(payload.count + 8)) + uint32Data(type.rawValue) + payload
-}
-
-private func uint16Data(_ value: UInt16) -> Data {
-    withUnsafeBytes(of: value.littleEndian) { Data($0) }
-}
-
-private func uint32Data(_ value: UInt32) -> Data {
-    withUnsafeBytes(of: value.littleEndian) { Data($0) }
-}
-
-private func ptpString(_ string: String) -> Data {
-    let utf16 = Array(string.utf16)
-    var data = Data([UInt8(min(utf16.count + 1, Int(UInt8.max)))])
-    for codeUnit in utf16.prefix(Int(UInt8.max) - 1) {
-        data.append(uint16Data(codeUnit))
-    }
-    data.append(uint16Data(0))
-    return data
-}
-
-private func utf16NullTerminatedString(_ string: String) -> Data {
-    var data = Data()
-    for codeUnit in string.utf16 {
-        data.append(uint16Data(codeUnit))
-    }
-    data.append(uint16Data(0))
-    return data
-}
-
 private extension Data {
-    var hexDump: String {
-        let limit = 256
-        let bytes = prefix(limit).map { String(format: "%02X", $0) }.joined(separator: " ")
-        return count > limit ? "\(bytes) ... [truncated, total=\(count)]" : bytes
-    }
-
-    var packetTypeName: String {
-        guard count >= 8 else { return "invalid-header" }
-        return PTPIPPacketType(rawValue: uint32(at: 4))?.debugName ?? String(format: "0x%08X", uint32(at: 4))
-    }
-
-    func uint16(at offset: Int) -> UInt16 {
-        UInt16(self[offset]) | UInt16(self[offset + 1]) << 8
-    }
-
     func cgFloat16(at offset: Int) -> CGFloat {
         CGFloat(Int(uint16(at: offset)))
-    }
-
-    func uint32(at offset: Int) -> UInt32 {
-        UInt32(self[offset])
-            | UInt32(self[offset + 1]) << 8
-            | UInt32(self[offset + 2]) << 16
-            | UInt32(self[offset + 3]) << 24
-    }
-
-    func uint64(at offset: Int) -> UInt64 {
-        UInt64(uint32(at: offset)) | UInt64(uint32(at: offset + 4)) << 32
     }
 }
