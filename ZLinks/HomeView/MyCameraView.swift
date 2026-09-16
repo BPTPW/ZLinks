@@ -606,6 +606,7 @@ private struct CameraConnectionSheet: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var discovery = CameraDiscoveryService()
     @AppStorage(CameraConnectionService.autoConnectOnLaunchKey) private var autoConnectOnLaunch = false
+    @AppStorage(CameraConnectionService.usbFastConnectKey) private var usbFastConnect = true
     @State private var selectedMode: ConnectionMode = .accessPoint
     @State private var isConnecting = false
     @State private var isAdvancedOptionsExpanded = false
@@ -644,8 +645,6 @@ private struct CameraConnectionSheet: View {
                                     .foregroundStyle(.secondary)
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(14)
-                            .background(.blue.opacity(0.1), in: RoundedRectangle(cornerRadius: 14))
                         }
 
                         if case let .failed(message) = camera.state {
@@ -849,7 +848,7 @@ private struct CameraConnectionSheet: View {
                     Button {
                         isConnecting = true
                         Task { @MainActor in
-                            await camera.connectUSBCamera(usbCamera)
+                            await camera.connectUSBCamera(usbCamera, fastConnect: usbFastConnect)
                             isConnecting = false
                         }
                     } label: {
@@ -875,8 +874,8 @@ private struct CameraConnectionSheet: View {
                 }
             }
 
-            Toggle(isOn: $autoConnectOnLaunch) {
-                Text("应用启动时恢复 WI-FI 连接")
+            Toggle(isOn: $usbFastConnect) {
+                Text("快速连接")
                     .font(.subheadline.weight(.medium))
             }
             .tint(.blue)

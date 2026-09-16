@@ -35,7 +35,7 @@ Verified against Nikon Z5 (`FriendlyName=Z5_2_8064268`, firmware string `V1.20`)
 - `CameraConnectionService.linkKind` 记录当前链路，`isUSBPTPReady` 表示 USB 上的 PTP 直通是否可用。
 - 相机不提供 PTP 直通时仍可用 USB 目录模式浏览与下载照片：相机信息来自 `ICDevice`（名称 / 序列号），电量来自 `ICCameraDevice.batteryLevel`，实时图传与参数控制不可用。
 - USB 断线由 ImageCaptureCore 回调通知（`didCloseSessionWithError` / `didRemove`），不参与 PTP/IP 自动重连；`beginAutomaticReconnect` 只处理 Wi-Fi。
-- USB 模式下 `refreshGallery` 走 `refreshUSBGallery`，仅当内容目录为空时才回退 `refreshGalleryViaPTP`。
+- USB 快速连接默认开启并通过 `camera.usbFastConnect` 持久化。关闭时沿用系统内容目录优先；开启时连接不等待内容目录，图库优先走 PTP，只有 PTP 刷新失败才等待并读取系统内容目录兜底。
 - 每次手动刷新都会重建目录快照，因此刚拍下的照片会出现在图库里。
 
 ## 性能要点（实时图传 / 图库）

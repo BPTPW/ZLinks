@@ -253,7 +253,7 @@ final class USBCameraLink: ObservableObject {
     // MARK: - 会话
 
     /// 打开 USB 会话并准备好两条数据通道。失败时抛出可直接展示给用户的错误。
-    func open(_ descriptor: USBCameraDescriptor) async throws {
+    func open(_ descriptor: USBCameraDescriptor, loadContentCatalog: Bool = true) async throws {
         closeSession()
         guard let device = devicesByID[descriptor.id] else {
             throw CameraConnectionError.usbUnavailable("未检测到该 USB 相机，请重新插拔数据线后重试")
@@ -288,10 +288,12 @@ final class USBCameraLink: ObservableObject {
         isSessionOpen = true
         log("[usb][session] 会话已建立 hasOpenSession=\(device.hasOpenSession)")
 
-        catalogDidComplete = false
-        try await waitForCatalog(device)
-        catalog = makeCatalogSnapshot(device)
-        log("[usb][session] 内容目录完成 folders=\(catalog.folders.count) objects=\(catalog.objectCount)")
+        if loadContentCatalog {
+            _ = try await loadCatalogSnapshot()
+        } else {
+            statusMessage = "正在建立 PTP 连接"
+            log("[usb][session] 快速连接已开启，跳过内容目录等待")
+        }
 
         do {
             try await negotiateFraming(device)
@@ -691,6 +693,20 @@ final class USBCameraLink: ObservableObject {
     // MARK: - 内容目录
 
     func catalogSnapshot() -> USBCameraCatalog { catalog }
+
+    /// 等待系统内容目录就绪并建立快照。快速连接只在 PTP 图库失败后调用。
+    @discardableResult
+    func loadCatalogSnapshot() async throws -> USBCameraCatalog {
+        guard let device = activeDevice, isSessionOpen else {
+            throw CameraConnectionError.connectionCancelled
+        }
+        if !catalogDidComplete, device.contentCatalogPercentCompleted < 100 {
+            try await waitForCatalog(device)
+        }
+        catalog = makeCatalogSnapshot(device)
+        log("[usb][session] 内容目录完成 folders=\(catalog.folders.count) objects=\(catalog.objectCount)")
+        return catalog
+    }
 
     /// 重新遍历目录树。拍摄新照片后相机目录会变化，因此每次手动刷新都重建快照。
     @discardableResult

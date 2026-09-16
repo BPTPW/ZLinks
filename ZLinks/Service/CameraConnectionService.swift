@@ -191,6 +191,7 @@ struct NikonLiveViewFocusMetadata: Equatable {
 @MainActor
 final class CameraConnectionService: ObservableObject {
     static let autoConnectOnLaunchKey = "camera.autoConnectOnLaunch"
+    static let usbFastConnectKey = "camera.usbFastConnect"
 
     enum State: Equatable {
         case disconnected
@@ -414,6 +415,8 @@ final class CameraConnectionService: ObservableObject {
     private var commandChannel: (any PTPChannel)?
     private var isUSBPTPReady = false
     private var usbCatalog: USBCameraCatalog = .empty
+    private var usesUSBFastConnect = false
+    private var isUsingUSBCatalogGallery = false
     private var usbLinkObserver: AnyCancellable?
     private var transactionID: UInt32 = 0
     private var isOperationBusy = false
@@ -574,7 +577,7 @@ final class CameraConnectionService: ObservableObject {
     }
 
     /// USB 有线连接：先打开 ImageCaptureCore 会话，再按相机能力启用 PTP 直通。
-    func connectUSBCamera(_ descriptor: USBCameraDescriptor) async {
+    func connectUSBCamera(_ descriptor: USBCameraDescriptor, fastConnect: Bool = true) async {
         if case .connecting = state, linkKind == .usb {
             appendLog("[usb] 忽略重复连接请求 device=\(descriptor.title)")
             return
@@ -590,10 +593,12 @@ final class CameraConnectionService: ObservableObject {
         linkKind = .usb
         isUSBPTPReady = false
         usbCatalog = .empty
+        usesUSBFastConnect = fastConnect
+        isUsingUSBCatalogGallery = false
         observeUSBCameraLink()
 
         do {
-            try await usbLink.open(descriptor)
+            try await usbLink.open(descriptor, loadContentCatalog: !fastConnect)
             guard connectionGeneration == generation else { return }
             usbCatalog = usbLink.catalogSnapshot()
             connectedHost = "\(descriptor.title)（USB）"
@@ -706,6 +711,8 @@ final class CameraConnectionService: ObservableObject {
         stopLiveViewInternal(sendEndCommand: false)
         isUSBPTPReady = false
         usbCatalog = .empty
+        usesUSBFastConnect = false
+        isUsingUSBCatalogGallery = false
         linkKind = .wifi
         usbLink.closeSession()
         state = .disconnected
@@ -876,6 +883,27 @@ final class CameraConnectionService: ObservableObject {
         }
 
         if linkKind == .usb {
+            if usesUSBFastConnect {
+                let didLoadViaPTP = await refreshGalleryViaPTP(
+                    selectingDirectoryID: directoryID,
+                    generation: generation
+                )
+                guard !didLoadViaPTP, isCurrentGalleryLoad(generation) else { return }
+                appendLog("[图库] PTP 图库刷新失败，开始 USB 内容目录兜底")
+                do {
+                    usbCatalog = try await usbLink.loadCatalogSnapshot()
+                    guard isCurrentGalleryLoad(generation) else { return }
+                    await refreshUSBGallery(
+                        selectingDirectoryID: directoryID,
+                        generation: generation,
+                        fallsBackToPTP: false
+                    )
+                } catch {
+                    guard isCurrentGalleryLoad(generation) else { return }
+                    appendLog("[图库] USB 内容目录兜底失败 error=\(error.localizedDescription)")
+                }
+                return
+            }
             await refreshUSBGallery(selectingDirectoryID: directoryID, generation: generation)
             return
         }
@@ -907,7 +935,7 @@ final class CameraConnectionService: ObservableObject {
                 return
             }
 
-            await loadGalleryMedia(forDirectoryID: selected, clearCaches: true, generation: generation)
+            _ = await loadGalleryMedia(forDirectoryID: selected, clearCaches: true, generation: generation)
         } catch {
             guard isCurrentGalleryLoad(generation) else { return }
             appendLog("[图库] 目录列表失败 error=\(error.localizedDescription)")
@@ -915,7 +943,11 @@ final class CameraConnectionService: ObservableObject {
     }
 
     /// USB 图库：目录与对象列表直接来自系统内容目录，省掉逐条 PTP 轮询。
-    private func refreshUSBGallery(selectingDirectoryID directoryID: UInt32?, generation: Int) async {
+    private func refreshUSBGallery(
+        selectingDirectoryID directoryID: UInt32?,
+        generation: Int,
+        fallsBackToPTP: Bool = true
+    ) async {
         let startedAt = Date()
         appendLog("[图库] USB 目录刷新开始")
         usbCatalog = usbLink.refreshCatalogSnapshot()
@@ -923,11 +955,19 @@ final class CameraConnectionService: ObservableObject {
 
         let directories = usbCatalog.folders.map(Self.makeGalleryDirectory)
         guard !directories.isEmpty else {
-            appendLog("[图库] USB 内容目录为空，回退 PTP 枚举")
-            await refreshGalleryViaPTP(selectingDirectoryID: directoryID, generation: generation)
+            if fallsBackToPTP {
+                appendLog("[图库] USB 内容目录为空，回退 PTP 枚举")
+                _ = await refreshGalleryViaPTP(selectingDirectoryID: directoryID, generation: generation)
+            } else {
+                galleryDirectories = []
+                galleryItems = []
+                selectedGalleryDirectoryID = nil
+                appendLog("[图库] USB 内容目录兜底为空")
+            }
             return
         }
 
+        isUsingUSBCatalogGallery = true
         galleryDirectories = directories
         let preferred = directoryID ?? selectedGalleryDirectoryID
         let selected = directories.first(where: { $0.id == preferred })?.id ?? directories.first?.id
@@ -945,28 +985,38 @@ final class CameraConnectionService: ObservableObject {
     }
 
     /// USB 目录不可用时沿用 PTP 枚举（需要 PTP 直通）。
-    private func refreshGalleryViaPTP(selectingDirectoryID directoryID: UInt32?, generation: Int) async {
+    @discardableResult
+    private func refreshGalleryViaPTP(
+        selectingDirectoryID directoryID: UInt32?,
+        generation: Int
+    ) async -> Bool {
         guard isUSBPTPReady, let channel = commandChannel else {
             galleryDirectories = []
             galleryItems = []
             appendLog("[图库] PTP 回退不可用")
-            return
+            return false
         }
         do {
             let directories = try await loadGalleryDirectories(on: channel)
-            guard isCurrentGalleryLoad(generation) else { return }
+            guard isCurrentGalleryLoad(generation) else { return false }
+            isUsingUSBCatalogGallery = false
             galleryDirectories = directories
             let preferred = directoryID ?? selectedGalleryDirectoryID
             let selected = directories.first(where: { $0.id == preferred })?.id ?? directories.first?.id
             selectedGalleryDirectoryID = selected
             guard let selected else {
                 galleryItems = []
-                return
+                return true
             }
-            await loadGalleryMedia(forDirectoryID: selected, clearCaches: true, generation: generation)
+            return await loadGalleryMedia(
+                forDirectoryID: selected,
+                clearCaches: true,
+                generation: generation
+            )
         } catch {
-            guard isCurrentGalleryLoad(generation) else { return }
+            guard isCurrentGalleryLoad(generation) else { return false }
             appendLog("[图库] PTP 回退失败 error=\(error.localizedDescription)")
+            return false
         }
     }
 
@@ -1047,25 +1097,25 @@ final class CameraConnectionService: ObservableObject {
         thumbnailCache = [:]
         previewImageCache = [:]
         objectImageCache = [:]
-        if linkKind == .usb {
+        if linkKind == .usb, isUsingUSBCatalogGallery {
             await loadUSBGalleryMedia(forDirectoryID: id, generation: generation)
             return
         }
-        await loadGalleryMedia(forDirectoryID: id, clearCaches: true, generation: generation)
+        _ = await loadGalleryMedia(forDirectoryID: id, clearCaches: true, generation: generation)
     }
 
     private func loadGalleryMedia(
         forDirectoryID directoryID: UInt32,
         clearCaches: Bool,
         generation: Int
-    ) async {
+    ) async -> Bool {
         guard case .connected = state, let channel = commandChannel else {
             appendLog("[图库] 未连接相机，跳过媒体加载")
-            return
+            return false
         }
         guard let directory = galleryDirectories.first(where: { $0.id == directoryID }) else {
             appendLog("[图库] 媒体加载失败：目录无效")
-            return
+            return false
         }
 
         if clearCaches {
@@ -1082,12 +1132,12 @@ final class CameraConnectionService: ObservableObject {
             appendLog("[图库] 使用 GetObjectsMetaData 获取列表")
             do {
                 let metadata = try await fetchNikonObjectsMetadata(in: directory, on: channel)
-                guard isCurrentGalleryLoad(generation, directoryID: directoryID) else { return }
+                guard isCurrentGalleryLoad(generation, directoryID: directoryID) else { return false }
                 let records = metadata.records
                 let skeleton = await Task.detached(priority: .userInitiated) {
                     records.map(Self.makeSkeletonItem)
                 }.value
-                guard isCurrentGalleryLoad(generation, directoryID: directoryID) else { return }
+                guard isCurrentGalleryLoad(generation, directoryID: directoryID) else { return false }
                 galleryItems = skeleton
                 appendLog("[图库] GetObjectsMetaData成功生成对象数=\(skeleton.count)")
                 galleryEnrichmentTask = Task { [weak self] in
@@ -1100,9 +1150,9 @@ final class CameraConnectionService: ObservableObject {
                 }
                 await galleryEnrichmentTask?.value
                 galleryEnrichmentTask = nil
-                return
+                return true
             } catch {
-                guard isMatchingGalleryLoad(generation, directoryID: directoryID) else { return }
+                guard isMatchingGalleryLoad(generation, directoryID: directoryID) else { return false }
                 appendLog("[图库] GetObjectsMetaData失败 reason=\(error.localizedDescription)")
                 appendLog("[图库] GetObjectsMetaData失败，回退标准对象枚举")
                 if channel.isReady {
@@ -1115,7 +1165,7 @@ final class CameraConnectionService: ObservableObject {
                     appendLog("[图库] 连接恢复完成，开始标准对象枚举")
                 } else {
                     appendLog("[图库] 标准对象枚举未启动 reason=连接恢复超时")
-                    return
+                    return false
                 }
             }
         } else {
@@ -1128,18 +1178,20 @@ final class CameraConnectionService: ObservableObject {
                 on: mediaConnection,
                 generation: generation
             )
-            guard isCurrentGalleryLoad(generation, directoryID: directoryID) else { return }
+            guard isCurrentGalleryLoad(generation, directoryID: directoryID) else { return false }
             galleryItems = items
             let photos = items.filter { !$0.isVideo }.count
             let videos = items.filter(\.isVideo).count
             let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
             appendLog(
                 "[图库] 目录媒体完成 dir=\(directory.pickerTitle) photos=\(photos) videos=\(videos) " +
-                    "total=\(items.count) elapsedMs=\(elapsedMs)"
+                "total=\(items.count) elapsedMs=\(elapsedMs)"
             )
+            return true
         } catch {
-            guard isCurrentGalleryLoad(generation, directoryID: directoryID) else { return }
+            guard isCurrentGalleryLoad(generation, directoryID: directoryID) else { return false }
             appendLog("[图库] 目录媒体失败 dir=\(directory.pickerTitle) error=\(error.localizedDescription)")
+            return false
         }
     }
 
@@ -2395,33 +2447,53 @@ final class CameraConnectionService: ObservableObject {
         var directories: [GalleryDirectory] = []
         var seenDirectoryHandles = Set<UInt32>()
         var rootHasDirectMedia = false
+        var successfulStorageEnumerations = 0
+        var lastStorageEnumerationError: Error?
 
         for storageID in storageIDs {
             // Most PTP cameras support filtering handles by Association (folder) format.
             // This avoids fetching ObjectInfo for every photo before the first grid can appear.
-            let filteredFolders = try? await fetchObjectHandles(
-                storageID: storageID,
-                objectFormat: 0x3001,
-                parent: 0xffffffff,
-                on: connection
-            )
+            let filteredFolders: [UInt32]?
+            do {
+                filteredFolders = try await fetchObjectHandles(
+                    storageID: storageID,
+                    objectFormat: 0x3001,
+                    parent: 0xffffffff,
+                    on: connection
+                )
+            } catch {
+                filteredFolders = nil
+                lastStorageEnumerationError = error
+            }
             let usesAssociationFilter = filteredFolders?.isEmpty == false
             var seedHandles: [UInt32] = []
             if usesAssociationFilter {
                 seedHandles = filteredFolders ?? []
+                successfulStorageEnumerations += 1
                 appendLog(
                     "[图库] 使用目录过滤 storageID=0x\(String(format: "%08X", storageID)) folders=\(seedHandles.count)"
                 )
-            } else if let root = try? await fetchObjectHandles(
-                storageID: storageID,
-                objectFormat: 0,
-                parent: 0xffffffff,
-                on: connection
-            ) {
-                appendLog(
-                    "[图库] 目录过滤不可用，回退根目录扫描 storageID=0x\(String(format: "%08X", storageID)) count=\(root.count)"
-                )
-                seedHandles = root
+            } else {
+                do {
+                    let root = try await fetchObjectHandles(
+                        storageID: storageID,
+                        objectFormat: 0,
+                        parent: 0xffffffff,
+                        on: connection
+                    )
+                    successfulStorageEnumerations += 1
+                    appendLog(
+                        "[图库] 目录过滤不可用，回退根目录扫描 storageID=0x\(String(format: "%08X", storageID)) count=\(root.count)"
+                    )
+                    seedHandles = root
+                } catch {
+                    lastStorageEnumerationError = error
+                    appendLog(
+                        "[图库] 存储枚举失败 storageID=0x\(String(format: "%08X", storageID)) " +
+                            "error=\(error.localizedDescription)"
+                    )
+                    continue
+                }
             }
 
             // Walk folders breadth-first. Keep folders that directly contain media.
@@ -2503,6 +2575,10 @@ final class CameraConnectionService: ObservableObject {
                     queue.append((subfolder.handle, nextPath))
                 }
             }
+        }
+
+        if successfulStorageEnumerations == 0, let lastStorageEnumerationError {
+            throw lastStorageEnumerationError
         }
 
         if rootHasDirectMedia {
