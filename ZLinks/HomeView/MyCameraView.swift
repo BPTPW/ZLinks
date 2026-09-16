@@ -721,18 +721,18 @@ private struct CameraConnectionSheet: View {
                     "若连接的是已有 WI-FI，则让 iPhone 加入相同的局域网。",
                     "点击扫描将自动发现局域网中的相机设备"
                 ],
-                note: "扫描使用 PTP/IP 默认端口 15740。"
+                note: "若无法搜索到相机，可以在高级选项中输入相机 IP 地址直接连接。扫描使用 PTP/IP 默认端口 15740。"
             )
         case .usb:
             GuidePanel(
                 title: "USB 有线连接",
-                symbol: "cable.connector",
+                symbol: "cable.connector.video",
                 steps: [
-                    "使用 USB 数据线连接相机与 iPhone / iPad（iPhone 需要相机转接器）。",
-                    "在相机 USB 菜单中选择 PTP（部分机型显示为「连接至电脑」）。",
+                    "使用 USB 数据线连接相机与手机连接。",
+                    "在相机 USB 中保证 MTP/PTP 功能打开。",
                     "保持相机开机，在下方列表点击识别到的相机即可连接。"
                 ],
-                note: "USB 有线连接下，相机信息、图库读取与下载、实时监看全部走数据线，速度与刷新率均高于 WI-FI。"
+                note: "若无法搜索到相机，请检查相机是否开机、线材是否为原装，或重启软件后再试。"
             )
         }
     }
@@ -856,13 +856,11 @@ private struct CameraConnectionSheet: View {
                         HStack(alignment: .center, spacing: 12) {
                             Image(systemName: "cable.connector")
                                 .font(.body.weight(.semibold))
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(usbCamera.title)
-                                    .font(.subheadline.weight(.semibold))
-                                Text(usbCamera.subtitle)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
+                            Text(usbCamera.title)
+                                .font(.subheadline.weight(.semibold))
+                            Text(usbCamera.subtitle)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                             Spacer(minLength: 8)
                             Image(systemName: "chevron.right")
                                 .font(.footnote.weight(.semibold))
