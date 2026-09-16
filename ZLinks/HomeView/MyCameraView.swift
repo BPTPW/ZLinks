@@ -86,7 +86,10 @@ struct MyCameraView: View {
             }
 
             if case .connected = camera.state {
+                detailRow("连接方式", value: camera.linkKind.title)
                 detailRow("相机地址", value: camera.connectedHost ?? "--")
+            } else {
+                detailRow("可用连接", value: "WI-FI（AP / STA）· USB 有线")
             }
 
             Divider()
@@ -597,6 +600,7 @@ private struct CameraConnectionSheet: View {
     enum ConnectionMode: String, CaseIterable, Identifiable {
         case accessPoint = "AP 模式"
         case station = "STA 模式"
+        case usb = "USB 有线"
 
         var id: Self { self }
     }
@@ -628,8 +632,24 @@ private struct CameraConnectionSheet: View {
                         if selectedMode == .accessPoint {
                             cameraWiFiForm
                         }
-                        discoveredCameras
-                        advancedOptions
+                        if selectedMode == .usb {
+                            usbCameras
+                        } else {
+                            discoveredCameras
+                            advancedOptions
+                        }
+
+                        if isConnecting {
+                            HStack(spacing: 10) {
+                                ProgressView()
+                                Text("正在连接相机…")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(14)
+                            .background(.blue.opacity(0.1), in: RoundedRectangle(cornerRadius: 14))
+                        }
 
                         if case let .failed(message) = camera.state {
                             Label(message, systemImage: "exclamationmark.triangle.fill")
@@ -658,18 +678,33 @@ private struct CameraConnectionSheet: View {
                     dismiss()
                 }
             }
+            .onChange(of: selectedMode) { _, mode in
+                if mode == .usb {
+                    discovery.stop()
+                    camera.usbLink.startDiscovery()
+                } else {
+                    camera.usbLink.stopDiscovery()
+                    discovery.start()
+                }
+            }
             .onDisappear {
                 discovery.stop()
+                camera.usbLink.stopDiscovery()
             }
             .onAppear {
-                discovery.start()
+                if selectedMode == .usb {
+                    camera.usbLink.startDiscovery()
+                } else {
+                    discovery.start()
+                }
             }
         }
     }
 
     @ViewBuilder
     private var modeGuide: some View {
-        if selectedMode == .accessPoint {
+        switch selectedMode {
+        case .accessPoint:
             GuidePanel(
                 title: "连接相机 WI-FI 网络",
                 symbol: "wifi",
@@ -680,7 +715,7 @@ private struct CameraConnectionSheet: View {
                 ],
                 note: "若无法搜索到相机，可以在高级选项中输入相机 IP 地址直接连接。扫描使用 PTP/IP 默认端口 15740。"
             )
-        } else {
+        case .station:
             GuidePanel(
                 title: "相机 STA 模式连接网络",
                 symbol: "network",
@@ -690,6 +725,17 @@ private struct CameraConnectionSheet: View {
                     "点击扫描将自动发现局域网中的相机设备"
                 ],
                 note: "扫描使用 PTP/IP 默认端口 15740。"
+            )
+        case .usb:
+            GuidePanel(
+                title: "USB 有线连接",
+                symbol: "cable.connector",
+                steps: [
+                    "使用 USB 数据线连接相机与 iPhone / iPad（iPhone 需要相机转接器）。",
+                    "在相机 USB 菜单中选择 PTP（部分机型显示为「连接至电脑」）。",
+                    "保持相机开机，在下方列表点击识别到的相机即可连接。"
+                ],
+                note: "USB 有线连接下，相机信息、图库读取与下载、实时监看全部走数据线，速度与刷新率均高于 WI-FI。"
             )
         }
     }
@@ -766,6 +812,76 @@ private struct CameraConnectionSheet: View {
 
             Toggle(isOn: $autoConnectOnLaunch) {
                 Text("应用启动时恢复连接")
+                    .font(.subheadline.weight(.medium))
+            }
+            .tint(.blue)
+            .padding(.vertical, 8)
+        }
+    }
+
+    private var usbCameras: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("USB 相机")
+                    .font(.headline).fontWeight(.semibold)
+                Spacer()
+                Button {
+                    camera.usbLink.startDiscovery()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.plain)
+                .frame(width: 42, height: 42)
+                .glassEffect(.regular.interactive(), in: .circle)
+                .accessibilityLabel("重新扫描 USB 相机")
+            }
+
+            if camera.usbLink.cameras.isEmpty {
+                HStack(spacing: 10) {
+                    if camera.usbLink.isBrowsing {
+                        ProgressView()
+                    }
+                    Text(camera.usbLink.statusMessage)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 10)
+            } else {
+                ForEach(camera.usbLink.cameras) { usbCamera in
+                    Button {
+                        isConnecting = true
+                        Task { @MainActor in
+                            await camera.connectUSBCamera(usbCamera)
+                            isConnecting = false
+                        }
+                    } label: {
+                        HStack(alignment: .center, spacing: 12) {
+                            Image(systemName: "cable.connector")
+                                .font(.body.weight(.semibold))
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(usbCamera.title)
+                                    .font(.subheadline.weight(.semibold))
+                                Text(usbCamera.subtitle)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer(minLength: 8)
+                            Image(systemName: "chevron.right")
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(.tertiary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(14)
+                    }
+                    .buttonStyle(.glass)
+                    .disabled(isConnecting)
+                    .accessibilityIdentifier("usbCameraButton")
+                }
+            }
+
+            Toggle(isOn: $autoConnectOnLaunch) {
+                Text("应用启动时恢复 WI-FI 连接")
                     .font(.subheadline.weight(.medium))
             }
             .tint(.blue)

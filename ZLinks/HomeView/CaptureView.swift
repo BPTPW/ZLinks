@@ -180,14 +180,12 @@ struct CaptureView: View {
         ZStack {
             Color.black
 
-            if let image = camera.liveViewImage {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .scaleEffect(x: mirrorsPreview ? -1 : 1, y: 1)
-                    .animation(.easeInOut(duration: 0.18), value: mirrorsPreview)
-            } else {
+            CaptureLiveImageView(
+                stream: camera.liveViewStream,
+                mirrorsPreview: mirrorsPreview
+            )
+
+            if camera.liveViewImage == nil {
                 liveViewPlaceholder
             }
 
@@ -517,14 +515,12 @@ private struct CaptureFullscreenMonitor: View {
         ZStack {
             Color.black
 
-            if let image = camera.liveViewImage {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .scaleEffect(x: mirrorsPreview ? -1 : 1, y: 1)
-                    .animation(.easeInOut(duration: 0.18), value: mirrorsPreview)
-            } else {
+            CaptureLiveImageView(
+                stream: camera.liveViewStream,
+                mirrorsPreview: mirrorsPreview
+            )
+
+            if camera.liveViewImage == nil {
                 VStack(spacing: 10) {
                     ProgressView()
                         .tint(.white)
@@ -572,6 +568,23 @@ private struct CaptureFullscreenMonitor: View {
     private var isConnected: Bool {
         if case .connected = camera.state { return true }
         return false
+    }
+}
+
+/// 只订阅实时画面流的监看视图：每帧只会重建这里，不再带动整个拍摄界面。
+private struct CaptureLiveImageView: View {
+    @ObservedObject var stream: LiveViewStream
+    var mirrorsPreview: Bool
+
+    var body: some View {
+        if let image = stream.image {
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFit()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .scaleEffect(x: mirrorsPreview ? -1 : 1, y: 1)
+                .animation(.easeInOut(duration: 0.18), value: mirrorsPreview)
+        }
     }
 }
 
