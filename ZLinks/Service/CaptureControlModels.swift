@@ -510,10 +510,11 @@ enum CaptureOptionCatalog {
     ]
 
     private static let meteringModeOptions: [CaptureOption] = [
-        CaptureOption(rawValue: 0x0003, title: "矩阵"),
+        CaptureOption(rawValue: 0x0001, title: "平均"),
         CaptureOption(rawValue: 0x0002, title: "中央重点"),
+        CaptureOption(rawValue: 0x0003, title: "矩阵"),
         CaptureOption(rawValue: 0x0004, title: "中央点"),
-        CaptureOption(rawValue: 0x0001, title: "平均")
+        CaptureOption(rawValue: 0x8010, title: "亮部重点")
     ]
 
     private static let exposureModeOptions: [CaptureOption] = [
