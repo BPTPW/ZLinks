@@ -19,6 +19,7 @@ struct GalleryView: View {
     @State private var isRefreshing = false
     @State private var loadError: String?
     @State private var thumbnailImages: [UInt32: UIImage] = [:]
+    @State private var thumbnailSourceHandles: [UInt32: UInt32] = [:]
     @State private var failedThumbnails: Set<UInt32> = []
     @State private var visibleHandles: Set<UInt32> = []
     @State private var isThumbnailPumpRunning = false
@@ -175,7 +176,8 @@ struct GalleryView: View {
             .navigationDestination(item: $selectedItem) { item in
                 GalleryPreviewView(
                     item: item,
-                    thumbnail: thumbnailImages[item.handle],
+                    thumbnail: thumbnailSourceHandles[item.handle] == item.thumbnailHandle
+                        ? thumbnailImages[item.handle] : nil,
                     camera: camera,
                     onDownload: { format in
                         Task { await startTransfer(item: item, format: format) }
@@ -384,9 +386,10 @@ struct GalleryView: View {
     private func galleryCell(for item: CameraConnectionService.GalleryItem) -> some View {
         GalleryThumbnailCell(
             item: item,
-            image: thumbnailImages[item.handle],
+            image: thumbnailSourceHandles[item.handle] == item.thumbnailHandle
+                ? thumbnailImages[item.handle] : nil,
             cornerRadius: cornerRadius,
-            hasFailed: failedThumbnails.contains(item.handle),
+            hasFailed: failedThumbnails.contains(item.thumbnailHandle),
             isSelected: selectedHandles.contains(item.handle),
             selectionMode: isSelectionMode
         )
@@ -684,6 +687,7 @@ struct GalleryView: View {
     private func reloadGallery(force: Bool) async {
         guard isConnected else {
             thumbnailImages = [:]
+            thumbnailSourceHandles = [:]
             failedThumbnails = []
             visibleHandles = []
             selectedDirectoryID = nil
@@ -699,6 +703,7 @@ struct GalleryView: View {
         isRefreshing = true
         loadError = nil
         thumbnailImages = [:]
+        thumbnailSourceHandles = [:]
         failedThumbnails = []
 
         await camera.refreshGallery(selectingDirectoryID: selectedDirectoryID)
@@ -728,6 +733,7 @@ struct GalleryView: View {
 
         // Clear UI immediately on switch.
         thumbnailImages = [:]
+        thumbnailSourceHandles = [:]
         failedThumbnails = []
         visibleHandles = []
 
@@ -775,20 +781,25 @@ struct GalleryView: View {
                 continue
             }
 
-            if thumbnailImages[item.handle] != nil || failedThumbnails.contains(item.handle) {
-                continue
-            }
-
             guard visibleHandles.contains(item.handle) else { continue }
+            guard let readyItem = await camera.galleryItemReadyForThumbnail(item.handle),
+                  visibleHandles.contains(readyItem.handle) else { continue }
+            let sourceHandle = readyItem.thumbnailHandle
+            if thumbnailSourceHandles[readyItem.handle] == sourceHandle
+                || failedThumbnails.contains(sourceHandle) { continue }
 
-            if let image = await camera.thumbnailImage(for: item.thumbnailHandle) {
+            if let image = await camera.thumbnailImage(for: sourceHandle) {
                 guard !isRefreshing, !isDeletingGallery else { break }
+                guard let current = camera.galleryItems.first(where: { $0.handle == readyItem.handle }),
+                      current.thumbnailHandle == sourceHandle,
+                      visibleHandles.contains(current.handle) else { continue }
                 withAnimation(.easeIn(duration: 0.28)) {
-                    thumbnailImages[item.handle] = image
+                    thumbnailImages[current.handle] = image
+                    thumbnailSourceHandles[current.handle] = sourceHandle
                 }
                 await Task.yield()
-            } else if visibleHandles.contains(item.handle) {
-                failedThumbnails.insert(item.handle)
+            } else if visibleHandles.contains(readyItem.handle) {
+                failedThumbnails.insert(sourceHandle)
             }
         }
     }
@@ -797,8 +808,8 @@ struct GalleryView: View {
     private func nextVisibleItemNeedingWork() -> CameraConnectionService.GalleryItem? {
         for item in camera.galleryItems where visibleHandles.contains(item.handle) {
             let needsThumb =
-                thumbnailImages[item.handle] == nil
-                    && !failedThumbnails.contains(item.handle)
+                thumbnailSourceHandles[item.handle] != item.thumbnailHandle
+                    && !failedThumbnails.contains(item.thumbnailHandle)
             if needsThumb {
                 return item
             }

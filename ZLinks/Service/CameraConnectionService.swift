@@ -432,6 +432,15 @@ final class CameraConnectionService: ObservableObject {
     private var supportedOperations: Set<UInt16> = []
     private var galleryLoadGeneration = 0
     private var galleryEnrichmentTask: Task<Void, Never>?
+    private var metadataRecordsByHandle: [UInt32: NikonObjectMetadata] = [:]
+    private var metadataResolvedItems: [UInt32: GalleryItem] = [:]
+    private var metadataExcludedHandles: Set<UInt32> = []
+    private var metadataAttemptedHandles: Set<UInt32> = []
+    private var metadataInfoTasks: [UInt32: Task<ParsedObjectInfo?, Never>] = [:]
+    private var metadataConnection: (any PTPChannel)?
+    private var metadataDirectoryID: UInt32?
+    private var metadataRecords: [NikonObjectMetadata] = []
+    private var metadataRevision = 0
     private var liveViewTask: Task<Void, Never>?
     private var liveViewGeneration = 0
     private var liveViewConsumers = 0
@@ -837,6 +846,16 @@ final class CameraConnectionService: ObservableObject {
         galleryLoadGeneration &+= 1
         galleryEnrichmentTask?.cancel()
         galleryEnrichmentTask = nil
+        for task in metadataInfoTasks.values { task.cancel() }
+        metadataInfoTasks = [:]
+        metadataRecordsByHandle = [:]
+        metadataResolvedItems = [:]
+        metadataExcludedHandles = []
+        metadataAttemptedHandles = []
+        metadataConnection = nil
+        metadataDirectoryID = nil
+        metadataRecords = []
+        metadataRevision = 0
     }
 
     private func isCurrentGalleryLoad(_ generation: Int, directoryID: UInt32? = nil) -> Bool {
@@ -1140,6 +1159,10 @@ final class CameraConnectionService: ObservableObject {
                 guard isCurrentGalleryLoad(generation, directoryID: directoryID) else { return false }
                 galleryItems = skeleton
                 appendLog("[图库] GetObjectsMetaData成功生成对象数=\(skeleton.count)")
+                metadataRecords = records
+                metadataRecordsByHandle = Dictionary(records.map { ($0.handle, $0) }, uniquingKeysWith: { first, _ in first })
+                metadataConnection = channel
+                metadataDirectoryID = directoryID
                 galleryEnrichmentTask = Task { [weak self] in
                     await self?.enrichMetadataGallery(
                         metadata,
@@ -1148,8 +1171,6 @@ final class CameraConnectionService: ObservableObject {
                         generation: generation
                     )
                 }
-                await galleryEnrichmentTask?.value
-                galleryEnrichmentTask = nil
                 return true
             } catch {
                 guard isMatchingGalleryLoad(generation, directoryID: directoryID) else { return false }
@@ -2770,71 +2791,18 @@ final class CameraConnectionService: ObservableObject {
         on connection: any PTPChannel,
         generation: Int
     ) async {
-        var resolved: [UInt32: GalleryItem] = [:]
-        var excludedHandles = Set<UInt32>()
-        var failedInfo = 0
         var pendingChanges = 0
         var lastPublish = Date()
 
         for (index, record) in metadata.records.enumerated() {
             guard isCurrentGalleryLoad(generation, directoryID: directory.id) else { return }
-            do {
-                if let info = try await fetchObjectInfo(
-                    handle: record.handle,
-                    on: connection,
-                    priority: .background
-                ) {
-                    if isAssociationObject(objectFormat: info.objectFormat)
-                        || !isGalleryMedia(objectFormat: info.objectFormat, filename: info.filename)
-                    {
-                        excludedHandles.insert(record.handle)
-                    } else {
-                        let isVideo = isVideoMedia(objectFormat: info.objectFormat, filename: info.filename)
-                        let isRAW = !isVideo && isRAWMedia(objectFormat: info.objectFormat, filename: info.filename)
-                        resolved[record.handle] = GalleryItem(
-                            id: record.handle,
-                            filename: info.filename,
-                            objectFormat: info.objectFormat,
-                            fileSize: info.fileSize,
-                            isVideo: isVideo,
-                            captureDate: record.captureDate ?? info.captureDate ?? info.modificationDate,
-                            rawHandle: isRAW ? record.handle : nil,
-                            rawFilename: isRAW ? info.filename : nil,
-                            rawFileSize: isRAW ? info.fileSize : nil,
-                            jpegHandle: !isVideo && !isRAW ? record.handle : nil,
-                            jpegFilename: !isVideo && !isRAW ? info.filename : nil,
-                            jpegFileSize: !isVideo && !isRAW ? info.fileSize : nil
-                        )
-                    }
-                } else {
-                    failedInfo += 1
-                }
-            } catch {
-                failedInfo += 1
-                appendLog(
-                    "[图库] 后台 ObjectInfo 跳过 handle=0x\(String(format: "%08X", record.handle)) " +
-                        "error=\(error.localizedDescription)"
-                )
-            }
+            await resolveMetadataInfo(for: record, on: connection, generation: generation, priority: .background)
 
             pendingChanges += 1
             let isLast = index == metadata.records.count - 1
             let shouldPublish = isLast || pendingChanges >= 16 || Date().timeIntervalSince(lastPublish) >= 0.35
             if shouldPublish {
-                let records = metadata.records
-                let resolvedSnapshot = resolved
-                let excludedSnapshot = excludedHandles
-                let published = await Task.detached(priority: .utility) {
-                    Self.buildEnrichedGalleryItems(
-                        records: records,
-                        resolved: resolvedSnapshot,
-                        excludedHandles: excludedSnapshot
-                    )
-                }.value
-                guard isCurrentGalleryLoad(generation, directoryID: directory.id) else { return }
-                if published != galleryItems {
-                    galleryItems = published
-                }
+                await publishMetadataGallery(generation: generation, directoryID: directory.id)
                 pendingChanges = 0
                 lastPublish = Date()
             }
@@ -2847,11 +2815,116 @@ final class CameraConnectionService: ObservableObject {
         let videos = galleryItems.filter(\.isVideo).count
         appendLog(
             "[图库] GetObjectsMetaData补充完成 dir=\(directory.pickerTitle) " +
-                "objects=\(galleryItems.count) photos=\(photos) videos=\(videos) infoErrors=\(failedInfo)"
+                "objects=\(galleryItems.count) photos=\(photos) videos=\(videos) " +
+                "infoErrors=\(metadataAttemptedHandles.count - metadataResolvedItems.count - metadataExcludedHandles.count)"
         )
     }
 
-    private nonisolated static func buildEnrichedGalleryItems(
+    /// Resolve a visible skeleton before requesting its thumbnail. A paired item may no longer
+    /// have its own grid cell after this publishes the updated list.
+    func galleryItemReadyForThumbnail(_ handle: UInt32) async -> GalleryItem? {
+        guard let directoryID = metadataDirectoryID,
+              let connection = metadataConnection,
+              let record = metadataRecordsByHandle[handle]
+        else {
+            return galleryItems.first { $0.handle == handle }
+        }
+        let generation = galleryLoadGeneration
+        await resolveMetadataInfo(for: record, on: connection, generation: generation, priority: .foreground)
+        if let rawItem = metadataResolvedItems[handle], rawItem.rawHandle != nil,
+           let captureDate = record.captureDate
+        {
+            // Nikon pairs normally have neighboring handles and the same capture timestamp.
+            let pairKey = Self.photoPairKey(for: rawItem.filename)
+            for candidate in metadataRecords where candidate.handle != handle
+                && candidate.captureDate == captureDate
+                && abs(Int64(candidate.handle) - Int64(handle)) <= 4
+            {
+                guard isCurrentGalleryLoad(generation, directoryID: directoryID) else { return nil }
+                if metadataResolvedItems.values.contains(where: {
+                    $0.jpegHandle != nil && Self.photoPairKey(for: $0.filename) == pairKey
+                }) { break }
+                await resolveMetadataInfo(for: candidate, on: connection, generation: generation, priority: .foreground)
+            }
+        }
+        await publishMetadataGallery(generation: generation, directoryID: directoryID)
+        guard isCurrentGalleryLoad(generation, directoryID: directoryID) else { return nil }
+        return galleryItems.first { $0.handle == handle }
+    }
+
+    private func resolveMetadataInfo(
+        for record: NikonObjectMetadata,
+        on connection: any PTPChannel,
+        generation: Int,
+        priority: OperationPriority
+    ) async {
+        let handle = record.handle
+        guard !metadataAttemptedHandles.contains(handle) else { return }
+        let task: Task<ParsedObjectInfo?, Never>
+        if let existing = metadataInfoTasks[handle] {
+            task = existing
+        } else {
+            task = Task {
+                do {
+                    return try await fetchObjectInfo(handle: handle, on: connection, priority: priority)
+                } catch {
+                    appendLog(
+                        "[图库] ObjectInfo 跳过 handle=0x\(String(format: "%08X", handle)) " +
+                            "error=\(error.localizedDescription)"
+                    )
+                    return nil
+                }
+            }
+            metadataInfoTasks[handle] = task
+        }
+        let info = await task.value
+        guard isCurrentGalleryLoad(generation, directoryID: metadataDirectoryID),
+              !metadataAttemptedHandles.contains(handle) else { return }
+        metadataInfoTasks[handle] = nil
+        metadataAttemptedHandles.insert(handle)
+        metadataRevision &+= 1
+        guard let info else { return }
+        if isAssociationObject(objectFormat: info.objectFormat)
+            || !isGalleryMedia(objectFormat: info.objectFormat, filename: info.filename)
+        {
+            metadataExcludedHandles.insert(handle)
+            return
+        }
+        let isVideo = isVideoMedia(objectFormat: info.objectFormat, filename: info.filename)
+        let isRAW = !isVideo && isRAWMedia(objectFormat: info.objectFormat, filename: info.filename)
+        metadataResolvedItems[handle] = GalleryItem(
+            id: handle,
+            filename: info.filename,
+            objectFormat: info.objectFormat,
+            fileSize: info.fileSize,
+            isVideo: isVideo,
+            captureDate: record.captureDate ?? info.captureDate ?? info.modificationDate,
+            rawHandle: isRAW ? handle : nil,
+            rawFilename: isRAW ? info.filename : nil,
+            rawFileSize: isRAW ? info.fileSize : nil,
+            jpegHandle: !isVideo && !isRAW ? handle : nil,
+            jpegFilename: !isVideo && !isRAW ? info.filename : nil,
+            jpegFileSize: !isVideo && !isRAW ? info.fileSize : nil
+        )
+    }
+
+    private func publishMetadataGallery(generation: Int, directoryID: UInt32) async {
+        while isCurrentGalleryLoad(generation, directoryID: directoryID) {
+            let revision = metadataRevision
+            let records = metadataRecords
+            let resolved = metadataResolvedItems
+            let excluded = metadataExcludedHandles
+            let published = await Task.detached(priority: .utility) {
+                Self.buildEnrichedGalleryItems(records: records, resolved: resolved, excludedHandles: excluded)
+            }.value
+            guard isCurrentGalleryLoad(generation, directoryID: directoryID) else { return }
+            guard revision == metadataRevision else { continue }
+            if published != galleryItems { galleryItems = published }
+            return
+        }
+    }
+
+    nonisolated static func buildEnrichedGalleryItems(
         records: [NikonObjectMetadata],
         resolved: [UInt32: GalleryItem],
         excludedHandles: Set<UInt32>
