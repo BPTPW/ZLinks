@@ -8,6 +8,45 @@ import Foundation
 import Network
 import UIKit
 
+enum LiveViewRefreshInterval: String, CaseIterable {
+    case hz60
+    case hz30
+    case hz10
+    case hz5
+    case hz1
+    case seconds2
+    case seconds3
+    case seconds5
+
+    static let defaultValue: Self = .hz30
+
+    var title: String {
+        switch self {
+        case .hz60: return "60Hz"
+        case .hz30: return "30Hz"
+        case .hz10: return "10Hz"
+        case .hz5: return "5Hz"
+        case .hz1: return "1Hz"
+        case .seconds2: return "2s"
+        case .seconds3: return "3s"
+        case .seconds5: return "5s"
+        }
+    }
+
+    var duration: Duration {
+        switch self {
+        case .hz60: return .nanoseconds(16_666_667)
+        case .hz30: return .nanoseconds(33_333_333)
+        case .hz10: return .milliseconds(100)
+        case .hz5: return .milliseconds(200)
+        case .hz1: return .seconds(1)
+        case .seconds2: return .seconds(2)
+        case .seconds3: return .seconds(3)
+        case .seconds5: return .seconds(5)
+        }
+    }
+}
+
 struct LiveViewFocusPoint: Equatable {
     /// Position and frame size normalized to the currently displayed live-view crop.
     let position: CGPoint
@@ -345,6 +384,7 @@ final class CameraConnectionService: ObservableObject {
     @Published private(set) var isLiveViewActive = false
     @Published private(set) var liveViewError: String?
     @Published private(set) var liveViewFrameRate: Double?
+    @Published private(set) var liveViewRefreshInterval = LiveViewRefreshInterval.defaultValue
     @Published private(set) var liveViewFocusPoint: LiveViewFocusPoint?
     @Published private(set) var isLiveViewFocusPointAvailable = false
     @Published private(set) var isSettingLiveViewFocusPoint = false
@@ -393,8 +433,15 @@ final class CameraConnectionService: ObservableObject {
     private var foregroundObserver: NSObjectProtocol?
 
     private static let lastConnectedHostKey = "camera.lastConnectedHost"
+    private static let liveViewRefreshIntervalKey = "capture.liveViewRefreshInterval"
 
     init() {
+        if let rawValue = UserDefaults.standard.string(forKey: Self.liveViewRefreshIntervalKey),
+           let interval = LiveViewRefreshInterval(rawValue: rawValue)
+        {
+            liveViewRefreshInterval = interval
+        }
+
         if let rememberedHost = UserDefaults.standard.string(forKey: Self.lastConnectedHostKey)?
             .trimmingCharacters(in: .whitespacesAndNewlines),
             !rememberedHost.isEmpty
@@ -1384,6 +1431,12 @@ final class CameraConnectionService: ObservableObject {
         await endLiveViewSession()
     }
 
+    func setLiveViewRefreshInterval(_ interval: LiveViewRefreshInterval) {
+        guard liveViewRefreshInterval != interval else { return }
+        liveViewRefreshInterval = interval
+        UserDefaults.standard.set(interval.rawValue, forKey: Self.liveViewRefreshIntervalKey)
+    }
+
     private func beginLiveViewSession() async {
         guard case .connected = state, let commandConnection else {
             liveViewError = "相机未连接"
@@ -1592,7 +1645,7 @@ final class CameraConnectionService: ObservableObject {
                 continue
             }
             // Yield the command channel so gallery/status requests can interleave.
-            try? await Task.sleep(for: .milliseconds(33))
+            try? await Task.sleep(for: liveViewRefreshInterval.duration)
         }
         if generation == liveViewGeneration {
             isLiveViewActive = false

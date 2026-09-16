@@ -29,6 +29,8 @@ struct CaptureView: View {
     @AppStorage(CapturePreferenceKey.mirrorsPreview) private var mirrorsPreview = false
     @State private var editingParameter: CaptureParameter?
     @State private var sliderIndex = 0.0
+    @State private var isRefreshIntervalEditorPresented = false
+    @State private var refreshIntervalSliderIndex = 0.0
     @State private var isFullscreenPresented = false
 
     private let leftRailParameters: [CaptureParameter] = [
@@ -51,7 +53,7 @@ struct CaptureView: View {
                     .ignoresSafeArea()
 
                 workspace(for: proxy.size)
-                    .allowsHitTesting(editingParameter == nil)
+                    .allowsHitTesting(editingParameter == nil && !isRefreshIntervalEditorPresented)
 
                 if let parameter = editingParameter,
                    let options = editorOptions(for: parameter)
@@ -80,9 +82,31 @@ struct CaptureView: View {
                     )
                     .zIndex(10)
                 }
+
+                if isRefreshIntervalEditorPresented {
+                    Color.black.opacity(0.16)
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            closeRefreshIntervalEditor()
+                        }
+
+                    CaptureRefreshIntervalEditor(
+                        selectedIndex: $refreshIntervalSliderIndex,
+                        onClose: closeRefreshIntervalEditor,
+                        onValueChanged: camera.setLiveViewRefreshInterval
+                    )
+                    .padding(24)
+                    .frame(maxWidth: 560)
+                    .transition(
+                        .scale(scale: 0.94)
+                            .combined(with: .opacity)
+                    )
+                    .zIndex(10)
+                }
             }
         }
         .animation(.spring(response: 0.34, dampingFraction: 0.86), value: editingParameter)
+        .animation(.spring(response: 0.34, dampingFraction: 0.86), value: isRefreshIntervalEditorPresented)
         .task(id: liveViewSessionKey) {
             await camera.startLiveView()
             await camera.refreshCaptureParameterCapabilities()
@@ -168,7 +192,8 @@ struct CaptureView: View {
                 CapturePortraitKeyDeck(
                     showsGrid: $showsGrid,
                     mirrorsPreview: $mirrorsPreview,
-                    onSelect: openEditor
+                    onSelect: openEditor,
+                    onSelectRefreshInterval: openRefreshIntervalEditor
                 )
             }
             .padding(12)
@@ -322,11 +347,25 @@ struct CaptureView: View {
         } ?? 0
 
         sliderIndex = Double(index)
+        isRefreshIntervalEditorPresented = false
         editingParameter = parameter
     }
 
     private func closeEditor() {
         editingParameter = nil
+    }
+
+    private func openRefreshIntervalEditor() {
+        let options = LiveViewRefreshInterval.allCases
+        refreshIntervalSliderIndex = Double(
+            options.firstIndex(of: camera.liveViewRefreshInterval) ?? 0
+        )
+        editingParameter = nil
+        isRefreshIntervalEditorPresented = true
+    }
+
+    private func closeRefreshIntervalEditor() {
+        isRefreshIntervalEditorPresented = false
     }
 
     private func editorOptions(for parameter: CaptureParameter) -> [CaptureOption]? {
@@ -1068,6 +1107,7 @@ private struct CapturePortraitKeyDeck: View {
     @Binding var showsGrid: Bool
     @Binding var mirrorsPreview: Bool
     let onSelect: (CaptureParameter) -> Void
+    let onSelectRefreshInterval: () -> Void
 
     private let parameters: [CaptureParameter] = [
         .exposureCompensation,
@@ -1080,53 +1120,78 @@ private struct CapturePortraitKeyDeck: View {
     ]
 
     var body: some View {
-        LazyVGrid(
-            columns: [GridItem(.adaptive(minimum: 104, maximum: 170), spacing: 10)],
-            spacing: 10
-        ) {
-            ForEach(parameters) { parameter in
-                CaptureGlassKey(
-                    title: parameter.title,
-                    symbol: parameter.symbol,
-                    value: CaptureOptionCatalog.displayedValue(
-                        for: parameter,
-                        rawValue: camera.captureParameters[parameter]
-                    ),
-                    style: .tile,
-                    isOn: false,
-                    isBusy: camera.activeCaptureWrite == parameter,
-                    isAutoLocked: camera.isCaptureParameterAutoLocked(parameter),
-                    isEnabled: isConnected && camera.canOpenCaptureParameterEditor(parameter)
+        VStack(alignment: .leading, spacing: 14) {
+            LazyVGrid(
+                columns: [GridItem(.adaptive(minimum: 104, maximum: 170), spacing: 10)],
+                spacing: 10
+            ) {
+                ForEach(parameters) { parameter in
+                    CaptureGlassKey(
+                        title: parameter.title,
+                        symbol: parameter.symbol,
+                        value: CaptureOptionCatalog.displayedValue(
+                            for: parameter,
+                            rawValue: camera.captureParameters[parameter]
+                        ),
+                        style: .tile,
+                        isOn: false,
+                        isBusy: camera.activeCaptureWrite == parameter,
+                        isAutoLocked: camera.isCaptureParameterAutoLocked(parameter),
+                        isEnabled: isConnected && camera.canOpenCaptureParameterEditor(parameter)
+                    ) {
+                        onSelect(parameter)
+                    }
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("监看")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 4)
+
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 104, maximum: 170), spacing: 10)],
+                    spacing: 10
                 ) {
-                    onSelect(parameter)
-                }
-            }
+                    CaptureGlassKey(
+                        title: "网格",
+                        symbol: "grid",
+                        value: showsGrid ? "开" : "关",
+                        style: .tile,
+                        isOn: showsGrid,
+                        isBusy: false,
+                        isEnabled: true
+                    ) {
+                        withAnimation(.easeInOut(duration: 0.18)) {
+                            showsGrid.toggle()
+                        }
+                    }
 
-            CaptureGlassKey(
-                title: "网格",
-                symbol: "grid",
-                value: showsGrid ? "开" : "关",
-                style: .tile,
-                isOn: showsGrid,
-                isBusy: false,
-                isEnabled: true
-            ) {
-                withAnimation(.easeInOut(duration: 0.18)) {
-                    showsGrid.toggle()
-                }
-            }
+                    CaptureGlassKey(
+                        title: "镜像",
+                        symbol: "arrow.left.and.right",
+                        value: mirrorsPreview ? "开" : "关",
+                        style: .tile,
+                        isOn: mirrorsPreview,
+                        isBusy: false,
+                        isEnabled: true
+                    ) {
+                        withAnimation(.easeInOut(duration: 0.18)) {
+                            mirrorsPreview.toggle()
+                        }
+                    }
 
-            CaptureGlassKey(
-                title: "镜像",
-                symbol: "arrow.left.and.right",
-                value: mirrorsPreview ? "开" : "关",
-                style: .tile,
-                isOn: mirrorsPreview,
-                isBusy: false,
-                isEnabled: true
-            ) {
-                withAnimation(.easeInOut(duration: 0.18)) {
-                    mirrorsPreview.toggle()
+                    CaptureGlassKey(
+                        title: "图传刷新频率",
+                        symbol: "arrow.triangle.2.circlepath",
+                        value: camera.liveViewRefreshInterval.title,
+                        style: .tile,
+                        isOn: false,
+                        isBusy: false,
+                        isEnabled: true,
+                        action: onSelectRefreshInterval
+                    )
                 }
             }
         }
@@ -1135,6 +1200,90 @@ private struct CapturePortraitKeyDeck: View {
     private var isConnected: Bool {
         if case .connected = camera.state { return true }
         return false
+    }
+}
+
+private struct CaptureRefreshIntervalEditor: View {
+    @Binding var selectedIndex: Double
+    let onClose: () -> Void
+    let onValueChanged: (LiveViewRefreshInterval) -> Void
+
+    private let options = LiveViewRefreshInterval.allCases
+
+    private var safeIndex: Int {
+        min(max(Int(selectedIndex.rounded()), 0), options.count - 1)
+    }
+
+    private var selectedOption: LiveViewRefreshInterval {
+        options[safeIndex]
+    }
+
+    var body: some View {
+        VStack(spacing: 18) {
+            HStack(spacing: 10) {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .font(.headline)
+                    .frame(width: 34, height: 34)
+
+                Text("图传刷新频率")
+                    .font(.headline)
+
+                Spacer()
+
+                Button(action: onClose) {
+                    Image(systemName: "xmark")
+                        .font(.subheadline.bold())
+                        .frame(width: 34, height: 34)
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: .circle)
+                .accessibilityLabel("关闭")
+            }
+
+            Text(selectedOption.title)
+                .font(.system(size: 42, weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .contentTransition(.numericText(value: selectedIndex))
+                .animation(.snappy(duration: 0.2), value: safeIndex)
+
+            VStack(spacing: 8) {
+                Slider(
+                    value: sliderBinding,
+                    in: 0 ... Double(options.count - 1),
+                    step: 1,
+                    onEditingChanged: { isEditing in
+                        if !isEditing {
+                            onValueChanged(selectedOption)
+                        }
+                    }
+                )
+                .tint(.orange)
+
+                HStack {
+                    Text(options.first?.title ?? "--")
+                    Spacer()
+                    Text(options.last?.title ?? "--")
+                }
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+            }
+
+            Text("画面的拉取间隔，不代表实际帧率。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(22)
+        .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 30))
+        .shadow(color: .black.opacity(0.28), radius: 32, y: 18)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var sliderBinding: Binding<Double> {
+        Binding(
+            get: { selectedIndex },
+            set: { selectedIndex = $0 }
+        )
     }
 }
 
