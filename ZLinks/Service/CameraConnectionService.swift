@@ -253,7 +253,8 @@ final class CameraConnectionService: ObservableObject {
     init() {
         if let rememberedHost = UserDefaults.standard.string(forKey: Self.lastConnectedHostKey)?
             .trimmingCharacters(in: .whitespacesAndNewlines),
-           !rememberedHost.isEmpty {
+            !rememberedHost.isEmpty
+        {
             lastEndpoint = .hostPort(host: .init(rememberedHost), port: 15740)
             lastDisplayHost = rememberedHost
         }
@@ -1064,8 +1065,8 @@ final class CameraConnectionService: ObservableObject {
         defer { isInitiatingCapture = false }
 
         let parameterStrategies: [[UInt32]] = [
-            [0xFFFF_FFFF, 0],
-            [0xFFFF_FFFF]
+            [0xffffffff, 0],
+            [0xffffffff]
         ]
 
         do {
@@ -1158,7 +1159,8 @@ final class CameraConnectionService: ObservableObject {
             if response.code != PTPResponseCode.ok.rawValue,
                !(parameter == .focusMode && rawValue == 5),
                let fallbackCode = parameter.fallbackPropertyCode,
-               let fallbackData = parameter.fallbackData(for: rawValue) {
+               let fallbackData = parameter.fallbackData(for: rawValue)
+            {
                 appendLog(
                     "[capture] \(parameter.title) 属性 0x" +
                         String(format: "%04X", parameter.rawValue) +
@@ -1214,7 +1216,8 @@ final class CameraConnectionService: ObservableObject {
             return parameter.normalizeStandardRead(value)
         }
         if let fallbackCode = parameter.fallbackPropertyCode,
-           let value = await readDeviceProperty(fallbackCode, on: connection) {
+           let value = await readDeviceProperty(fallbackCode, on: connection)
+        {
             return parameter.normalizeFallbackRead(value)
         }
         return nil
@@ -1339,7 +1342,8 @@ final class CameraConnectionService: ObservableObject {
             logStyle: .compact
         )
         if start.code != PTPResponseCode.ok.rawValue,
-           supportsOperation(.changeApplicationMode) {
+           supportsOperation(.changeApplicationMode)
+        {
             appendLog("[liveview] StartLiveView 初次失败 code=0x\(String(format: "%04X", start.code))，尝试 ChangeApplicationMode")
             let mode = try await operation(
                 .changeApplicationMode,
@@ -1399,7 +1403,8 @@ final class CameraConnectionService: ObservableObject {
               generation == liveViewGeneration,
               liveViewConsumers > 0,
               case .connected = state,
-              let commandConnection {
+              let commandConnection
+        {
             do {
                 if let frame = try await fetchLiveViewFrame(on: commandConnection) {
                     liveViewImage = frame
@@ -1482,8 +1487,8 @@ final class CameraConnectionService: ObservableObject {
     }
 
     private func extractJPEGPayload(from data: Data) -> Data? {
-        guard let soi = data.range(of: Data([0xFF, 0xD8])) else { return nil }
-        if let eoi = data.range(of: Data([0xFF, 0xD9]), options: [], in: soi.lowerBound..<data.endIndex) {
+        guard let soi = data.range(of: Data([0xff, 0xd8])) else { return nil }
+        if let eoi = data.range(of: Data([0xff, 0xd9]), options: [], in: soi.lowerBound..<data.endIndex) {
             return Data(data[soi.lowerBound..<eoi.upperBound])
         }
         return Data(data[soi.lowerBound...])
@@ -1590,7 +1595,7 @@ final class CameraConnectionService: ObservableObject {
             let bytes = Array(outgoingData)
             var offset = 0
             while offset < bytes.count {
-                let end = min(offset + 65_536, bytes.count)
+                let end = min(offset + 65536, bytes.count)
                 let packetType: PTPIPPacketType = end == bytes.count ? .endData : .data
                 let payload = uint32Data(currentTransactionID) + Data(bytes[offset..<end])
                 try await send(
@@ -2112,7 +2117,7 @@ final class CameraConnectionService: ObservableObject {
                     try NikonObjectsMetadataParser.parse(data)
                 }.value
                 let elapsedNanoseconds = DispatchTime.now().uptimeNanoseconds - parseStarted
-                let elapsedMilliseconds = elapsedNanoseconds / 1_000_000
+                let elapsedMilliseconds = elapsedNanoseconds / 1000000
                 appendLog(
                     "[图库] GetObjectsMetaData解析 bytes=\(data.count) records=\(metadata.records.count) " +
                         "elapsedMs=\(elapsedMilliseconds) strategy=\(strategyName) path=\(target.path)"
@@ -2157,7 +2162,7 @@ final class CameraConnectionService: ObservableObject {
         )
     }
 
-    nonisolated private static func makeSkeletonItem(from record: NikonObjectMetadata) -> GalleryItem {
+    private nonisolated static func makeSkeletonItem(from record: NikonObjectMetadata) -> GalleryItem {
         GalleryItem(
             id: record.handle,
             filename: "",
@@ -2261,7 +2266,7 @@ final class CameraConnectionService: ObservableObject {
         )
     }
 
-    nonisolated private static func buildEnrichedGalleryItems(
+    private nonisolated static func buildEnrichedGalleryItems(
         records: [NikonObjectMetadata],
         resolved: [UInt32: GalleryItem],
         excludedHandles: Set<UInt32>
@@ -2392,7 +2397,7 @@ final class CameraConnectionService: ObservableObject {
         return items
     }
 
-    nonisolated private static func sortedGalleryItems(_ items: [GalleryItem]) -> [GalleryItem] {
+    private nonisolated static func sortedGalleryItems(_ items: [GalleryItem]) -> [GalleryItem] {
         items.sorted { lhs, rhs in
             switch (lhs.captureDate, rhs.captureDate) {
             case (let l?, let r?):
@@ -2408,7 +2413,7 @@ final class CameraConnectionService: ObservableObject {
         }
     }
 
-    nonisolated private static func mergePairedPhotos(_ sourceItems: [GalleryItem]) -> [GalleryItem] {
+    private nonisolated static func mergePairedPhotos(_ sourceItems: [GalleryItem]) -> [GalleryItem] {
         var merged: [GalleryItem] = []
         var photoIndexes: [String: Int] = [:]
 
@@ -2437,7 +2442,7 @@ final class CameraConnectionService: ObservableObject {
         return merged
     }
 
-    nonisolated private static func combinePhotoItems(_ lhs: GalleryItem, _ rhs: GalleryItem) -> GalleryItem {
+    private nonisolated static func combinePhotoItems(_ lhs: GalleryItem, _ rhs: GalleryItem) -> GalleryItem {
         let rawItem = lhs.rawHandle != nil ? lhs : rhs
         let jpegItem = lhs.jpegHandle != nil ? lhs : rhs
         let captureDate = lhs.captureDate ?? rhs.captureDate
@@ -2458,7 +2463,7 @@ final class CameraConnectionService: ObservableObject {
         )
     }
 
-    nonisolated private static func photoPairKey(for filename: String) -> String {
+    private nonisolated static func photoPairKey(for filename: String) -> String {
         let base = (filename as NSString).deletingPathExtension
         return base.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
     }
@@ -2616,7 +2621,7 @@ final class CameraConnectionService: ObservableObject {
     }
 
     private func isRAWMedia(objectFormat: UInt16, filename: String) -> Bool {
-        if objectFormat == 0xB802 || objectFormat == 0xB80A {
+        if objectFormat == 0xb802 || objectFormat == 0xb80a {
             return true
         }
         let ext = fileExtension(filename)
@@ -2714,10 +2719,12 @@ final class CameraConnectionService: ObservableObject {
         var volumeLabel = ""
 
         if data.count > 26,
-           let parsedDescription = try? readPTPString(from: data, offset: 26) {
+           let parsedDescription = try? readPTPString(from: data, offset: 26)
+        {
             description = parsedDescription.value.trimmingCharacters(in: .whitespacesAndNewlines)
             if parsedDescription.nextOffset < data.count,
-               let parsedVolumeLabel = try? readPTPString(from: data, offset: parsedDescription.nextOffset) {
+               let parsedVolumeLabel = try? readPTPString(from: data, offset: parsedDescription.nextOffset)
+            {
                 volumeLabel = parsedVolumeLabel.value.trimmingCharacters(in: .whitespacesAndNewlines)
             }
         }
@@ -2855,8 +2862,9 @@ final class CameraConnectionService: ObservableObject {
             logStyle: .silent,
             timeout: .seconds(4)
         ),
-        response.code == PTPResponseCode.ok.rawValue,
-        let data = response.data else {
+            response.code == PTPResponseCode.ok.rawValue,
+            let data = response.data
+        else {
             return nil
         }
         return readIntegerValue(from: data)
@@ -3307,7 +3315,7 @@ private enum PTPResponseCode: UInt16 {
     case ok = 0x2001
     case operationNotSupported = 0x2006
     case deviceBusy = 0x2019
-    case invalidParameter = 0x201D
+    case invalidParameter = 0x201d
 }
 
 private extension UInt16 {
@@ -3334,11 +3342,11 @@ private enum CameraConnectionError: LocalizedError {
             return "相机响应与当前请求不匹配。"
         case .ptpResponse(let code):
             switch code {
-            case 0x200A:
+            case 0x200a:
                 return "当前相机或拍摄模式不支持该参数。"
             case 0x2019:
                 return "相机正忙，请稍后重试。"
-            case 0x201A:
+            case 0x201a:
                 return "相机拒绝修改该参数。"
             default:
                 return String(format: "相机拒绝了请求（0x%04X）。", code)

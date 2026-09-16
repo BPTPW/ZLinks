@@ -30,7 +30,7 @@ final class CameraDiscoveryService: ObservableObject {
         statusMessage = "正在检测 Wi-Fi 局域网"
         scanTask = Task { [weak self] in
             var subnet: String?
-            for attempt in 0..<6 {
+            for attempt in 0 ..< 6 {
                 if Task.isCancelled { return }
                 subnet = Self.currentWiFiSubnet()
                 if subnet != nil { break }

@@ -788,7 +788,7 @@ private struct CameraConnectionSheet: View {
                     .textFieldStyle(.plain)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 8)
-                    .glassEffect(.regular.interactive(),in: .capsule)
+                    .glassEffect(.regular.interactive(), in: .capsule)
 
                 HStack {
                     Spacer()

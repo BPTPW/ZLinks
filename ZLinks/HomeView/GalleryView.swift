@@ -3,14 +3,14 @@
 //  ZLinks
 //
 
-import Photos
 import Combine
+import CoreLocation
+import ImageIO
+import MapKit
+import Photos
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
-import ImageIO
-import MapKit
-import CoreLocation
 
 struct GalleryView: View {
     @EnvironmentObject private var camera: CameraConnectionService
@@ -310,7 +310,7 @@ struct GalleryView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .frame(maxWidth: .infinity)
-        .glassEffect(.regular,in: .capsule)
+        .glassEffect(.regular, in: .capsule)
         .accessibilityLabel("按时间分类")
     }
 
@@ -1091,7 +1091,7 @@ private struct GalleryPreviewView: View {
                         await MainActor.run { isDeleting = false }
                     }
                 }
-                Button("取消", role: .cancel) { }
+                Button("取消", role: .cancel) {}
             }
         }
     }
@@ -1105,10 +1105,10 @@ private struct GalleryPreviewView: View {
     @ViewBuilder
     private var captureTimestampView: some View {
         if let captureDateParts {
-            VStack() {
+            VStack {
                 Text(captureDateParts.date)
                     .font(.caption.weight(.semibold))
-                    
+
                 Text(captureDateParts.time)
                     .font(.caption2)
             }
@@ -1163,7 +1163,6 @@ private struct GalleryPreviewView: View {
 
         return Locale(identifier: "zh-Hans-CN@hours=\(hourCycleOverride)")
     }
-
 
     @ViewBuilder
     private var previewImage: some View {

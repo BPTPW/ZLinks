@@ -8,11 +8,11 @@ import Foundation
 enum CaptureParameter: UInt16, CaseIterable, Hashable, Identifiable, Sendable {
     case whiteBalance = 0x5005
     case aperture = 0x5007
-    case focusMode = 0xD061
-    case meteringMode = 0x500B
-    case shutterSpeed = 0x500D
-    case exposureMode = 0x500E
-    case iso = 0x500F
+    case focusMode = 0xd061
+    case meteringMode = 0x500b
+    case shutterSpeed = 0x500d
+    case exposureMode = 0x500e
+    case iso = 0x500f
     case exposureCompensation = 0x5010
 
     var id: UInt16 { rawValue }
@@ -66,8 +66,8 @@ enum CaptureParameter: UInt16, CaseIterable, Hashable, Identifiable, Sendable {
     /// Nikon Z live-view focus uses 0xD061, while older bodies use 0x500A.
     var fallbackPropertyCode: UInt16? {
         switch self {
-        case .shutterSpeed: return 0xD100
-        case .focusMode: return 0x500A
+        case .shutterSpeed: return 0xd100
+        case .focusMode: return 0x500a
         default: return nil
         }
     }
@@ -75,7 +75,7 @@ enum CaptureParameter: UInt16, CaseIterable, Hashable, Identifiable, Sendable {
     func standardData(for value: UInt64) -> Data {
         switch self {
         case .shutterSpeed:
-            if value == 0xFFFF_FFFF || value == 0xFFFF_FFFE || value == 0xFFFF_FFFD {
+            if value == 0xffff_ffff || value == 0xffff_fffe || value == 0xffff_fffd {
                 return captureUInt32Data(UInt32(truncatingIfNeeded: value))
             }
             let seconds = Self.shutterSeconds(fromPacked: value)
@@ -114,10 +114,10 @@ enum CaptureParameter: UInt16, CaseIterable, Hashable, Identifiable, Sendable {
 
     func normalizeStandardRead(_ value: UInt64) -> UInt64 {
         if self == .exposureCompensation {
-            return value & 0xFFFF
+            return value & 0xffff
         }
         guard self == .shutterSpeed else { return value }
-        if value == 0xFFFF_FFFF || value == 0xFFFF_FFFE || value == 0xFFFF_FFFD {
+        if value == 0xffff_ffff || value == 0xffff_fffe || value == 0xffff_fffd {
             return value
         }
         if ShutterValue.matchesPackedValue(value) {
@@ -155,7 +155,7 @@ enum CaptureParameter: UInt16, CaseIterable, Hashable, Identifiable, Sendable {
     }
 
     private static func liveViewFocusModeValue(fromLegacy value: UInt64) -> UInt64 {
-        switch value & 0xFFFF {
+        switch value & 0xffff {
         case 0x8010: return 0
         case 0x8011: return 1
         case 0x8013: return 2
@@ -167,8 +167,8 @@ enum CaptureParameter: UInt16, CaseIterable, Hashable, Identifiable, Sendable {
     }
 
     private static func shutterSeconds(fromPacked value: UInt64) -> Double {
-        let numerator = UInt16((value >> 16) & 0xFFFF)
-        let denominator = UInt16(value & 0xFFFF)
+        let numerator = UInt16((value >> 16) & 0xffff)
+        let denominator = UInt16(value & 0xffff)
         guard numerator > 0, denominator > 0 else { return 1 }
         return Double(numerator) / Double(denominator)
     }
@@ -461,15 +461,13 @@ enum CaptureOptionCatalog {
         return "0x" + String(repeating: "0", count: max(0, 4 - hex.count)) + hex
     }
 
-    private static let exposureCompensationOptions: [CaptureOption] = {
-        (-6 ... 6).map { step in
-            let raw = Int16(clamping: Int64((Double(step) * 1_000 / 3).rounded()))
-            let stored = UInt64(UInt16(bitPattern: raw))
-            let value = Double(raw) / 1_000
-            let title = abs(value) < 0.05 ? "±0.0" : String(format: "%+.1f", value)
-            return CaptureOption(rawValue: stored, title: title)
-        }
-    }()
+    private static let exposureCompensationOptions: [CaptureOption] = (-6 ... 6).map { step in
+        let raw = Int16(clamping: Int64((Double(step) * 1_000 / 3).rounded()))
+        let stored = UInt64(UInt16(bitPattern: raw))
+        let value = Double(raw) / 1_000
+        let title = abs(value) < 0.05 ? "±0.0" : String(format: "%+.1f", value)
+        return CaptureOption(rawValue: stored, title: title)
+    }
 
     private static let apertureOptions: [CaptureOption] = [
         1.4, 1.6, 1.8, 2.0, 2.2, 2.5, 2.8, 3.2, 3.5, 4.0, 4.5, 5.0,
@@ -546,11 +544,11 @@ private struct ShutterValue {
     }
 
     static func title(forPacked value: UInt64) -> String {
-        if value == 0xFFFF_FFFF { return "Bulb" }
-        if value == 0xFFFF_FFFE { return "x 200" }
-        if value == 0xFFFF_FFFD { return "TIME" }
-        let numerator = UInt16((value >> 16) & 0xFFFF)
-        let denominator = UInt16(value & 0xFFFF)
+        if value == 0xffff_ffff { return "Bulb" }
+        if value == 0xffff_fffe { return "x 200" }
+        if value == 0xffff_fffd { return "TIME" }
+        let numerator = UInt16((value >> 16) & 0xffff)
+        let denominator = UInt16(value & 0xffff)
         guard numerator > 0, denominator > 0 else { return "--" }
         return title(numerator: numerator, denominator: denominator)
     }
@@ -585,8 +583,8 @@ private struct ShutterValue {
     }
 
     static func matchesPackedValue(_ value: UInt64) -> Bool {
-        let numerator = UInt16((value >> 16) & 0xFFFF)
-        let denominator = UInt16(value & 0xFFFF)
+        let numerator = UInt16((value >> 16) & 0xffff)
+        let denominator = UInt16(value & 0xffff)
         guard numerator > 0, denominator > 0 else { return false }
         if supported.contains(where: { $0.numerator == numerator && $0.denominator == denominator }) {
             return true

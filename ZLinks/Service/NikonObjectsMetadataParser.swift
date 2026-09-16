@@ -57,7 +57,7 @@ enum NikonObjectsMetadataParser {
         var indexedRecords: [(index: Int, record: NikonObjectMetadata)] = []
         indexedRecords.reserveCapacity(count)
 
-        for index in 0..<count {
+        for index in 0 ..< count {
             let offset = headerSize + index * recordSize
             let second = Int(data[offset + 9])
             let minute = Int(data[offset + 10])
@@ -114,7 +114,7 @@ enum NikonObjectsMetadataParser {
         }.map(\.record)
     }
 
-    nonisolated private static func makeDate(
+    private nonisolated static func makeDate(
         year: Int,
         month: Int,
         day: Int,

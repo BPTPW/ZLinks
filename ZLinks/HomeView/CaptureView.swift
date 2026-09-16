@@ -54,7 +54,8 @@ struct CaptureView: View {
                     .allowsHitTesting(editingParameter == nil)
 
                 if let parameter = editingParameter,
-                   let options = editorOptions(for: parameter) {
+                   let options = editorOptions(for: parameter)
+                {
                     Color.black.opacity(0.16)
                         .ignoresSafeArea()
                         .onTapGesture {
@@ -142,8 +143,8 @@ struct CaptureView: View {
                 CaptureLiveViewStatusBar()
                 liveViewPanel(showsPortraitCaptureButton: false)
             }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .layoutPriority(1)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .layoutPriority(1)
 
             CaptureSideRail(
                 title: "对焦 / 监看",
@@ -385,7 +386,7 @@ private struct CaptureFullscreenMonitor: View {
         )
         let availablePreviewHeight = max(0, canvasSize.height)
         let previewWidth = min(availablePreviewWidth, availablePreviewHeight * 4 / 3)
-        let sideColumnWidth = max(sideColumnMinWidth, (canvasSize.width - availablePreviewWidth)/2)
+        let sideColumnWidth = max(sideColumnMinWidth, (canvasSize.width - availablePreviewWidth) / 2)
 
         ZStack {
             VStack(spacing: 8) {
@@ -490,7 +491,7 @@ private struct CaptureFullscreenMonitor: View {
                         .foregroundStyle(.white)
                 }
                 .buttonStyle(.plain)
-                .background(.black.opacity(0.5),in: .circle)
+                .background(.black.opacity(0.5), in: .circle)
                 .accessibilityLabel("退出全屏监看")
 
                 Spacer()
@@ -506,7 +507,7 @@ private struct CaptureFullscreenMonitor: View {
                         .foregroundStyle(.white)
                 }
                 .buttonStyle(.plain)
-                .background(.black.opacity(0.5),in: .circle)
+                .background(.black.opacity(0.5), in: .circle)
                 .accessibilityLabel("更多")
             }
         }
@@ -1175,7 +1176,7 @@ private struct CaptureSliderEditor: View {
             if parameter.usesPresetSelection {
                 ScrollView(.vertical) {
                     presetOptionsView
-                    .padding(2)
+                        .padding(2)
                 }
                 .frame(maxHeight: 220)
                 .disabled(isAutoLocked)
@@ -1183,7 +1184,7 @@ private struct CaptureSliderEditor: View {
                 VStack(spacing: 8) {
                     Slider(
                         value: sliderBinding,
-                        in: 0...Double(max(options.count - 1, 1)),
+                        in: 0 ... Double(max(options.count - 1, 1)),
                         step: 1,
                         onEditingChanged: { isEditing in
                             if !isEditing {
@@ -1460,7 +1461,8 @@ private struct CaptureExposureScale: View {
 
     private var currentIndex: Double {
         guard let rawValue,
-              let index = options.firstIndex(where: { $0.rawValue == rawValue }) else {
+              let index = options.firstIndex(where: { $0.rawValue == rawValue })
+        else {
             return selectedIndex
         }
         return Double(index)
