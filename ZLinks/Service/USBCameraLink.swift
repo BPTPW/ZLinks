@@ -492,17 +492,16 @@ final class USBCameraLink: ObservableObject {
         outgoingData: Data?
     ) async throws -> USBPTPTransactionResult {
         let command = makeCommandContainer(code: code, transactionID: transactionID, parameters: parameters)
-        let dataContainer = outgoingData.map {
-            makeDataContainer(code: code, transactionID: transactionID, payload: $0)
-        }
         let parameterText = parameters.map { String(format: "0x%08X", $0) }.joined(separator: ",")
         log(
             "[usb][ptp] send opcode=0x\(String(format: "%04X", code)) tx=\(transactionID) " +
                 "framing=\(framing.rawValue) params=[\(parameterText)] commandBytes=\(command.count) " +
-                "outBytes=\(outgoingData?.count ?? 0)"
+                "outBytes=\(outgoingData?.count ?? 0) outMode=raw"
         )
         do {
-            let (first, second) = try await device.requestSendPTPCommand(command, outData: dataContainer)
+            // ImageCaptureCore accepts the command container and data-phase dataset separately.
+            // Wrapping outData in another PTP data container corrupts SetDevicePropValue payloads.
+            let (first, second) = try await device.requestSendPTPCommand(command, outData: outgoingData)
             let firstProbe = Self.probeContainer(first)
             let secondProbe = Self.probeContainer(second)
             let result = Self.decodeTransaction(
@@ -547,15 +546,6 @@ final class USBCameraLink: ObservableObject {
         return applyLengthPrefix(to: body)
     }
 
-    private func makeDataContainer(code: UInt16, transactionID: UInt32, payload: Data) -> Data {
-        var body = Data()
-        body.append(uint16Data(USBPTPContainerKind.data.rawValue))
-        body.append(uint16Data(code))
-        body.append(uint32Data(transactionID))
-        body.append(payload)
-        return applyLengthPrefix(to: body)
-    }
-
     private func applyLengthPrefix(to body: Data) -> Data {
         switch framing {
         case .standard:
@@ -578,26 +568,29 @@ final class USBCameraLink: ObservableObject {
         let firstProbe = probeContainer(first)
         let secondProbe = probeContainer(second)
 
-        let firstIsResponse = firstProbe.kind == .response
-        let secondIsResponse = secondProbe.kind == .response
+        // ImageCaptureCore may rewrite transaction IDs, so the response cannot be
+        // validated against the ID sent by the app. Prefer an unambiguous standard
+        // response container before considering the lengthless form.
         var responseContainer: Data?
         var responseOffset = 4
-        if firstIsResponse {
+        var responseIsFirst = false
+        var responseIsSecond = false
+        if firstProbe.kind == .response, firstProbe.offset == 4 {
             responseContainer = first
             responseOffset = firstProbe.offset
-        } else if secondIsResponse {
+            responseIsFirst = true
+        } else if secondProbe.kind == .response, secondProbe.offset == 4 {
             responseContainer = second
             responseOffset = secondProbe.offset
-        }
-
-        var dataContainer: Data?
-        var dataOffset = 4
-        if firstProbe.kind == .data, !firstIsResponse {
-            dataContainer = first
-            dataOffset = firstProbe.offset
-        } else if secondProbe.kind == .data, !secondIsResponse {
-            dataContainer = second
-            dataOffset = secondProbe.offset
+            responseIsSecond = true
+        } else if firstProbe.kind == .response {
+            responseContainer = first
+            responseOffset = firstProbe.offset
+            responseIsFirst = true
+        } else if secondProbe.kind == .response {
+            responseContainer = second
+            responseOffset = secondProbe.offset
+            responseIsSecond = true
         }
 
         var code = fallbackCode
@@ -613,6 +606,27 @@ final class USBCameraLink: ObservableObject {
             }
         }
 
+        // Standard data containers are self-validating through their length field.
+        // A lengthless candidate is accepted only when its transaction ID matches
+        // the ID ImageCaptureCore placed in the response container. This prevents
+        // datasets beginning with an array count of 1, 2, or 3 from being mistaken
+        // for command/data/response containers.
+        var dataContainer: Data?
+        var dataOffset = 4
+        if !responseIsFirst,
+           firstProbe.kind == .data,
+           firstProbe.offset == 4 || first.uint32(at: 4) == transactionID
+        {
+            dataContainer = first
+            dataOffset = firstProbe.offset
+        } else if !responseIsSecond,
+                  secondProbe.kind == .data,
+                  secondProbe.offset == 4 || second.uint32(at: 4) == transactionID
+        {
+            dataContainer = second
+            dataOffset = secondProbe.offset
+        }
+
         var data = Data()
         var dataMode = USBPTPDataMode.none
         if let dataContainer {
@@ -621,10 +635,10 @@ final class USBCameraLink: ObservableObject {
         } else if responseContainer != nil {
             // ImageCaptureCore may strip the inbound data-container header and return only the
             // PTP dataset. Only accept that form when the other value is a valid response.
-            if !firstIsResponse, firstProbe.kind == nil, !first.isEmpty {
+            if !responseIsFirst, !first.isEmpty {
                 data = first
                 dataMode = .raw
-            } else if !secondIsResponse, secondProbe.kind == nil, !second.isEmpty {
+            } else if !responseIsSecond, !second.isEmpty {
                 data = second
                 dataMode = .raw
             }
