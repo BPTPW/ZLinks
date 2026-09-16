@@ -8,6 +8,146 @@ import Foundation
 import Network
 import UIKit
 
+struct LiveViewFocusPoint: Equatable {
+    /// Position and frame size normalized to the currently displayed live-view crop.
+    let position: CGPoint
+    let frameSize: CGSize
+}
+
+struct NikonLiveViewFocusMetadata: Equatable {
+    let wholeSize: CGSize
+    let displayAreaSize: CGSize
+    let displayCenter: CGPoint
+    let focusFrameSize: CGSize
+    let focusFrameCenter: CGPoint
+    let isAFDrivingEnabled: Bool
+
+    init(
+        wholeSize: CGSize,
+        displayAreaSize: CGSize,
+        displayCenter: CGPoint,
+        focusFrameSize: CGSize,
+        focusFrameCenter: CGPoint,
+        isAFDrivingEnabled: Bool
+    ) {
+        self.wholeSize = wholeSize
+        self.displayAreaSize = displayAreaSize
+        self.displayCenter = displayCenter
+        self.focusFrameSize = focusFrameSize
+        self.focusFrameCenter = focusFrameCenter
+        self.isAFDrivingEnabled = isAFDrivingEnabled
+    }
+
+    var isFocusAreaChangeable: Bool {
+        isAFDrivingEnabled
+            && wholeSize.width > 0
+            && wholeSize.height > 0
+            && displayAreaSize.width > 0
+            && displayAreaSize.height > 0
+            && focusFrameSize.width > 0
+            && focusFrameSize.height > 0
+            && focusFrameSize.width <= wholeSize.width
+            && focusFrameSize.height <= wholeSize.height
+    }
+
+    var displayedFocusPoint: LiveViewFocusPoint? {
+        guard displayAreaSize.width > 0,
+              displayAreaSize.height > 0,
+              focusFrameSize.width > 0,
+              focusFrameSize.height > 0
+        else { return nil }
+
+        let origin = CGPoint(
+            x: displayCenter.x - displayAreaSize.width / 2,
+            y: displayCenter.y - displayAreaSize.height / 2
+        )
+        let position = CGPoint(
+            x: (focusFrameCenter.x - origin.x) / displayAreaSize.width,
+            y: (focusFrameCenter.y - origin.y) / displayAreaSize.height
+        )
+        guard (0...1).contains(position.x), (0...1).contains(position.y) else { return nil }
+
+        return LiveViewFocusPoint(
+            position: position,
+            frameSize: CGSize(
+                width: min(focusFrameSize.width / displayAreaSize.width, 1),
+                height: min(focusFrameSize.height / displayAreaSize.height, 1)
+            )
+        )
+    }
+
+    func cameraPoint(forDisplayedPoint point: CGPoint) -> CGPoint {
+        let normalized = CGPoint(
+            x: min(max(point.x, 0), 1),
+            y: min(max(point.y, 0), 1)
+        )
+        let displayOrigin = CGPoint(
+            x: displayCenter.x - displayAreaSize.width / 2,
+            y: displayCenter.y - displayAreaSize.height / 2
+        )
+        let requested = CGPoint(
+            x: displayOrigin.x + normalized.x * displayAreaSize.width,
+            y: displayOrigin.y + normalized.y * displayAreaSize.height
+        )
+        let halfFrame = CGSize(
+            width: focusFrameSize.width / 2,
+            height: focusFrameSize.height / 2
+        )
+        return CGPoint(
+            x: min(max(requested.x, halfFrame.width), wholeSize.width - halfFrame.width),
+            y: min(max(requested.y, halfFrame.height), wholeSize.height - halfFrame.height)
+        )
+    }
+
+    init?(
+        liveViewData data: Data,
+        hasVersion: Bool
+    ) {
+        if hasVersion {
+            guard data.count >= 384 else { return nil }
+            let wholeSize = CGSize(width: data.cgFloat16(at: 16), height: data.cgFloat16(at: 18))
+            let displayAreaSize = CGSize(width: data.cgFloat16(at: 20), height: data.cgFloat16(at: 22))
+            let displayCenter = CGPoint(x: data.cgFloat16(at: 24), y: data.cgFloat16(at: 26))
+            let areaCount = min(Int(data[44]), 42)
+            guard areaCount > 0 else { return nil }
+
+            let selectedFaceIndex = Int(data[45])
+            let areaIndex = selectedFaceIndex < areaCount ? selectedFaceIndex : 0
+            let areaOffset = 48 + areaIndex * 8
+            self.init(
+                wholeSize: wholeSize,
+                displayAreaSize: displayAreaSize,
+                displayCenter: displayCenter,
+                focusFrameSize: CGSize(
+                    width: data.cgFloat16(at: areaOffset),
+                    height: data.cgFloat16(at: areaOffset + 2)
+                ),
+                focusFrameCenter: CGPoint(
+                    x: data.cgFloat16(at: areaOffset + 4),
+                    y: data.cgFloat16(at: areaOffset + 6)
+                ),
+                isAFDrivingEnabled: data[40] == 1
+            )
+        } else {
+            guard data.count >= 50 else { return nil }
+            self.init(
+                wholeSize: CGSize(width: data.cgFloat16(at: 12), height: data.cgFloat16(at: 14)),
+                displayAreaSize: CGSize(width: data.cgFloat16(at: 16), height: data.cgFloat16(at: 18)),
+                displayCenter: CGPoint(x: data.cgFloat16(at: 20), y: data.cgFloat16(at: 22)),
+                focusFrameSize: CGSize(width: data.cgFloat16(at: 24), height: data.cgFloat16(at: 26)),
+                focusFrameCenter: CGPoint(x: data.cgFloat16(at: 28), y: data.cgFloat16(at: 30)),
+                isAFDrivingEnabled: data[49] == 1
+            )
+        }
+
+        guard wholeSize.width > 0,
+              wholeSize.height > 0,
+              displayAreaSize.width > 0,
+              displayAreaSize.height > 0
+        else { return nil }
+    }
+}
+
 @MainActor
 final class CameraConnectionService: ObservableObject {
     static let autoConnectOnLaunchKey = "camera.autoConnectOnLaunch"
@@ -205,6 +345,9 @@ final class CameraConnectionService: ObservableObject {
     @Published private(set) var isLiveViewActive = false
     @Published private(set) var liveViewError: String?
     @Published private(set) var liveViewFrameRate: Double?
+    @Published private(set) var liveViewFocusPoint: LiveViewFocusPoint?
+    @Published private(set) var isLiveViewFocusPointAvailable = false
+    @Published private(set) var isSettingLiveViewFocusPoint = false
     @Published private(set) var captureParameters: [CaptureParameter: UInt64] = [:]
     @Published private(set) var captureParameterOptions: [CaptureParameter: [CaptureOption]] = [:]
     @Published private(set) var isRefreshingCaptureParameters = false
@@ -239,6 +382,7 @@ final class CameraConnectionService: ObservableObject {
     private var liveViewConsumers = 0
     private var liveViewFrameCount = 0
     private var liveViewFrameWindowStart = Date()
+    private var liveViewFocusMetadata: NikonLiveViewFocusMetadata?
     private var lastEndpoint: NWEndpoint?
     private var lastDisplayHost: String?
     private var reconnectTask: Task<Void, Never>?
@@ -1261,6 +1405,10 @@ final class CameraConnectionService: ObservableObject {
         isLiveViewActive = false
         liveViewImage = nil
         liveViewFrameRate = nil
+        liveViewFocusPoint = nil
+        isLiveViewFocusPointAvailable = false
+        isSettingLiveViewFocusPoint = false
+        liveViewFocusMetadata = nil
         liveViewFrameCount = 0
         liveViewFrameWindowStart = Date()
         appendLog("[liveview] 开始启动实时图传 generation=\(generation)")
@@ -1293,6 +1441,10 @@ final class CameraConnectionService: ObservableObject {
         isLiveViewActive = false
         liveViewImage = nil
         liveViewFrameRate = nil
+        liveViewFocusPoint = nil
+        isLiveViewFocusPointAvailable = false
+        isSettingLiveViewFocusPoint = false
+        liveViewFocusMetadata = nil
         liveViewFrameCount = 0
         liveViewFrameWindowStart = Date()
         if !sendEndCommand {
@@ -1406,8 +1558,11 @@ final class CameraConnectionService: ObservableObject {
               let commandConnection
         {
             do {
-                if let frame = try await fetchLiveViewFrame(on: commandConnection) {
-                    liveViewImage = frame
+                if let frame = try await fetchLiveViewFrame(
+                    on: commandConnection,
+                    priority: .background
+                ) {
+                    applyLiveViewFrame(frame)
                     liveViewError = nil
                     consecutiveFailures = 0
                     liveViewFrameCount += 1
@@ -1445,10 +1600,13 @@ final class CameraConnectionService: ObservableObject {
         appendLog("[liveview] 拉流循环结束 generation=\(generation)")
     }
 
-    private func fetchLiveViewFrame(on connection: NWConnection) async throws -> UIImage? {
-        let preferred: [PTPOperationCode] = supportsOperation(.getLiveViewImage)
-            ? [.getLiveViewImage, .getLiveViewImageEx]
-            : [.getLiveViewImageEx, .getLiveViewImage]
+    private func fetchLiveViewFrame(
+        on connection: NWConnection,
+        priority: OperationPriority
+    ) async throws -> LiveViewFrame? {
+        let preferred: [PTPOperationCode] = supportsOperation(.getLiveViewImageEx)
+            ? [.getLiveViewImageEx, .getLiveViewImage]
+            : [.getLiveViewImage, .getLiveViewImageEx]
         var lastCode: UInt16 = 0
         for code in preferred where supportsOperation(code) || code == .getLiveViewImage {
             // Always allow 0x9203 attempt even if DeviceInfo omitted it; some bodies still answer.
@@ -1457,7 +1615,8 @@ final class CameraConnectionService: ObservableObject {
                 parameters: [],
                 dataPhase: .receive,
                 on: connection,
-                logStyle: .silent
+                logStyle: .silent,
+                priority: priority
             )
             lastCode = response.code
             if response.code == PTPResponseCode.deviceBusy.rawValue {
@@ -1468,7 +1627,13 @@ final class CameraConnectionService: ObservableObject {
                 continue
             }
             if let image = decodeLiveViewJPEG(from: data) {
-                return image
+                return LiveViewFrame(
+                    image: image,
+                    focusMetadata: NikonLiveViewFocusMetadata(
+                        liveViewData: data,
+                        hasVersion: code == .getLiveViewImageEx
+                    )
+                )
             }
             appendLog("[liveview] \(code.debugName) 返回数据无法解码 bytes=\(data.count)")
         }
@@ -1476,6 +1641,69 @@ final class CameraConnectionService: ObservableObject {
             throw CameraConnectionError.ptpResponse(lastCode)
         }
         return nil
+    }
+
+    private func applyLiveViewFrame(_ frame: LiveViewFrame) {
+        liveViewImage = frame.image
+        liveViewFocusMetadata = frame.focusMetadata
+        liveViewFocusPoint = frame.focusMetadata?.displayedFocusPoint
+        isLiveViewFocusPointAvailable = supportsOperation(.changeAfArea)
+            && frame.focusMetadata?.isFocusAreaChangeable == true
+    }
+
+    /// Move the Nikon live-view AF area, then read a fresh frame so the UI shows
+    /// the position that the camera actually accepted.
+    @discardableResult
+    func setLiveViewFocusPoint(normalizedToDisplayedImage point: CGPoint) async -> Bool {
+        guard case .connected = state,
+              isLiveViewActive,
+              isLiveViewFocusPointAvailable,
+              !isSettingLiveViewFocusPoint,
+              supportsOperation(.changeAfArea),
+              let commandConnection,
+              let metadata = liveViewFocusMetadata
+        else { return false }
+
+        let cameraPoint = metadata.cameraPoint(forDisplayedPoint: point)
+        isSettingLiveViewFocusPoint = true
+        defer { isSettingLiveViewFocusPoint = false }
+
+        do {
+            let response = try await operation(
+                .changeAfArea,
+                parameters: [
+                    UInt32(cameraPoint.x.rounded()),
+                    UInt32(cameraPoint.y.rounded())
+                ],
+                dataPhase: nil,
+                on: commandConnection,
+                logStyle: .compact,
+                priority: .foreground,
+                timeout: .seconds(5)
+            )
+            guard response.code == PTPResponseCode.ok.rawValue else {
+                throw CameraConnectionError.ptpResponse(response.code)
+            }
+
+            appendLog(
+                "[liveview] ChangeAfArea 成功 x=\(Int(cameraPoint.x.rounded())) " +
+                    "y=\(Int(cameraPoint.y.rounded()))"
+            )
+            for _ in 0..<4 {
+                if let frame = try await fetchLiveViewFrame(
+                    on: commandConnection,
+                    priority: .foreground
+                ) {
+                    applyLiveViewFrame(frame)
+                    return true
+                }
+                try await Task.sleep(for: .milliseconds(60))
+            }
+            return true
+        } catch {
+            appendLog("[liveview] ChangeAfArea 失败 error=\(error.localizedDescription)")
+            return false
+        }
     }
 
     private func decodeLiveViewJPEG(from data: Data) -> UIImage? {
@@ -3079,6 +3307,7 @@ final class CameraConnectionService: ObservableObject {
             ("EndLiveView", PTPOperationCode.endLiveView.rawValue),
             ("GetLiveViewImg", PTPOperationCode.getLiveViewImage.rawValue),
             ("GetLiveViewImageEx", PTPOperationCode.getLiveViewImageEx.rawValue),
+            ("ChangeAfArea", PTPOperationCode.changeAfArea.rawValue),
             ("DeviceReady", PTPOperationCode.deviceReady.rawValue),
             ("ChangeApplicationMode", PTPOperationCode.changeApplicationMode.rawValue)
         ].filter { supportedOperations.contains($0.1) }.map(\.0)
@@ -3203,6 +3432,11 @@ private enum OperationPriority {
     case background
 }
 
+private struct LiveViewFrame {
+    let image: UIImage
+    let focusMetadata: NikonLiveViewFocusMetadata?
+}
+
 private struct PTPResponse {
     let code: UInt16
     let data: Data?
@@ -3276,6 +3510,7 @@ private enum PTPOperationCode: UInt16 {
     case startLiveView = 0x9201
     case endLiveView = 0x9202
     case getLiveViewImage = 0x9203
+    case changeAfArea = 0x9205
     case initiateCaptureRecInMedia = 0x9207
     case getLiveViewImageEx = 0x9428
     case getObjectsMetadata = 0x9434
@@ -3303,6 +3538,7 @@ private enum PTPOperationCode: UInt16 {
         case .startLiveView: return "StartLiveView"
         case .endLiveView: return "EndLiveView"
         case .getLiveViewImage: return "GetLiveViewImg"
+        case .changeAfArea: return "ChangeAfArea"
         case .initiateCaptureRecInMedia: return "InitiateCaptureRecInMedia"
         case .getLiveViewImageEx: return "GetLiveViewImageEx"
         case .getObjectsMetadata: return "GetObjectsMetaData"
@@ -3416,6 +3652,10 @@ private extension Data {
 
     func uint16(at offset: Int) -> UInt16 {
         UInt16(self[offset]) | UInt16(self[offset + 1]) << 8
+    }
+
+    func cgFloat16(at offset: Int) -> CGFloat {
+        CGFloat(Int(uint16(at: offset)))
     }
 
     func uint32(at offset: Int) -> UInt32 {

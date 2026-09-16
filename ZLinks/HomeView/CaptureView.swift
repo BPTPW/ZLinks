@@ -181,12 +181,10 @@ struct CaptureView: View {
             Color.black
 
             if let image = camera.liveViewImage {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .scaleEffect(x: mirrorsPreview ? -1 : 1, y: 1)
-                    .animation(.easeInOut(duration: 0.18), value: mirrorsPreview)
+                CaptureLiveViewImageSurface(
+                    image: image,
+                    mirrorsPreview: mirrorsPreview
+                )
             } else {
                 liveViewPlaceholder
             }
@@ -335,6 +333,98 @@ struct CaptureView: View {
         guard parameter != .exposureMode else { return nil }
         let options = camera.captureOptions(for: parameter)
         return options.isEmpty ? nil : options
+    }
+}
+
+private struct CaptureLiveViewImageSurface: View {
+    @EnvironmentObject private var camera: CameraConnectionService
+    let image: UIImage
+    let mirrorsPreview: Bool
+
+    var body: some View {
+        GeometryReader { proxy in
+            let imageRect = aspectFitRect(for: image.size, in: proxy.size)
+
+            ZStack(alignment: .topLeading) {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: proxy.size.width, height: proxy.size.height)
+                    .scaleEffect(x: mirrorsPreview ? -1 : 1, y: 1)
+                    .animation(.easeInOut(duration: 0.18), value: mirrorsPreview)
+
+                if camera.isLiveViewFocusPointAvailable,
+                   let focusPoint = camera.liveViewFocusPoint
+                {
+                    Rectangle()
+                        .stroke(.red, lineWidth: 2)
+                        .frame(
+                            width: max(18, imageRect.width * focusPoint.frameSize.width),
+                            height: max(18, imageRect.height * focusPoint.frameSize.height)
+                        )
+                        .position(
+                            x: imageRect.minX + imageRect.width * displayedX(focusPoint.position.x),
+                            y: imageRect.minY + imageRect.height * focusPoint.position.y
+                        )
+                        .allowsHitTesting(false)
+                }
+
+                Color.clear
+                    .frame(width: imageRect.width, height: imageRect.height)
+                    .contentShape(Rectangle())
+                    .position(x: imageRect.midX, y: imageRect.midY)
+                    .allowsHitTesting(
+                        camera.isLiveViewFocusPointAvailable
+                            && !camera.isSettingLiveViewFocusPoint
+                    )
+                    .gesture(
+                        SpatialTapGesture()
+                            .onEnded { value in
+                                let displayedPoint = CGPoint(
+                                    x: value.location.x / max(imageRect.width, 1),
+                                    y: value.location.y / max(imageRect.height, 1)
+                                )
+                                let cameraPoint = CGPoint(
+                                    x: mirrorsPreview ? 1 - displayedPoint.x : displayedPoint.x,
+                                    y: displayedPoint.y
+                                )
+                                Task {
+                                    await camera.setLiveViewFocusPoint(
+                                        normalizedToDisplayedImage: cameraPoint
+                                    )
+                                }
+                            }
+                    )
+                    .accessibilityLabel("设置对焦点")
+            }
+        }
+    }
+
+    private func displayedX(_ cameraX: CGFloat) -> CGFloat {
+        mirrorsPreview ? 1 - cameraX : cameraX
+    }
+
+    private func aspectFitRect(for imageSize: CGSize, in containerSize: CGSize) -> CGRect {
+        guard imageSize.width > 0,
+              imageSize.height > 0,
+              containerSize.width > 0,
+              containerSize.height > 0
+        else { return .zero }
+
+        let scale = min(
+            containerSize.width / imageSize.width,
+            containerSize.height / imageSize.height
+        )
+        let fittedSize = CGSize(
+            width: imageSize.width * scale,
+            height: imageSize.height * scale
+        )
+        return CGRect(
+            x: (containerSize.width - fittedSize.width) / 2,
+            y: (containerSize.height - fittedSize.height) / 2,
+            width: fittedSize.width,
+            height: fittedSize.height
+        )
     }
 }
 
@@ -518,12 +608,10 @@ private struct CaptureFullscreenMonitor: View {
             Color.black
 
             if let image = camera.liveViewImage {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .scaleEffect(x: mirrorsPreview ? -1 : 1, y: 1)
-                    .animation(.easeInOut(duration: 0.18), value: mirrorsPreview)
+                CaptureLiveViewImageSurface(
+                    image: image,
+                    mirrorsPreview: mirrorsPreview
+                )
             } else {
                 VStack(spacing: 10) {
                     ProgressView()
