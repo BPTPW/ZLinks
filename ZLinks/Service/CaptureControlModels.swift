@@ -72,6 +72,12 @@ enum CaptureParameter: UInt16, CaseIterable, Hashable, Identifiable, Sendable {
         }
     }
 
+    static func matching(propertyCode: UInt16) -> CaptureParameter? {
+        allCases.first {
+            $0.rawValue == propertyCode || $0.fallbackPropertyCode == propertyCode
+        }
+    }
+
     func standardData(for value: UInt64) -> Data {
         switch self {
         case .shutterSpeed:

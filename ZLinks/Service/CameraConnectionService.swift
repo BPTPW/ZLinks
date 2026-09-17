@@ -454,6 +454,8 @@ final class CameraConnectionService: ObservableObject {
     private var connectionGeneration = UUID()
     private var pendingCaptureWrites: [CaptureParameter: UInt64] = [:]
     private var captureWriteTask: Task<Void, Never>?
+    private var pendingCapturePropertyRefreshes: [CaptureParameter: UInt16] = [:]
+    private var capturePropertyRefreshTask: Task<Void, Never>?
     private var capturePropertyDescriptions: [CaptureParameter: CapturePropertyDescription] = [:]
     private var foregroundObserver: NSObjectProtocol?
 
@@ -730,6 +732,9 @@ final class CameraConnectionService: ObservableObject {
         pendingCaptureWrites = [:]
         captureWriteTask?.cancel()
         captureWriteTask = nil
+        pendingCapturePropertyRefreshes = [:]
+        capturePropertyRefreshTask?.cancel()
+        capturePropertyRefreshTask = nil
         activeCaptureWrite = nil
         isRefreshingCaptureParameters = false
         isRefreshingCaptureParameterCapabilities = false
@@ -897,16 +902,13 @@ final class CameraConnectionService: ObservableObject {
         on connection: any PTPChannel,
         connectionGeneration: UUID
     ) {
-        guard let handle = event.parameters.first else {
-            appendLog("[event] \(event.debugName) 缺少 ObjectHandle")
-            return
-        }
-
-        let revision = (galleryEventRevisions[handle] ?? 0) &+ 1
-        galleryEventRevisions[handle] = revision
-
         switch PTPEventCode(rawValue: event.code) {
         case .objectAdded:
+            guard let handle = event.parameters.first else {
+                appendLog("[event] \(event.debugName) 缺少 ObjectHandle")
+                return
+            }
+            let revision = nextGalleryEventRevision(for: handle)
             Task { [weak self] in
                 await self?.applyObjectAdded(
                     handle: handle,
@@ -916,9 +918,97 @@ final class CameraConnectionService: ObservableObject {
                 )
             }
         case .objectRemoved:
+            guard let handle = event.parameters.first else {
+                appendLog("[event] \(event.debugName) 缺少 ObjectHandle")
+                return
+            }
+            _ = nextGalleryEventRevision(for: handle)
             applyObjectRemoved(handle: handle)
+        case .devicePropChanged:
+            guard let rawPropertyCode = event.parameters.first,
+                  let propertyCode = UInt16(exactly: rawPropertyCode)
+            else {
+                appendLog("[event] \(event.debugName) 缺少有效的 DevicePropCode")
+                return
+            }
+            guard let parameter = CaptureParameter.matching(propertyCode: propertyCode) else {
+                return
+            }
+            queueCapturePropertyRefresh(
+                parameter,
+                propertyCode: propertyCode,
+                on: connection,
+                connectionGeneration: connectionGeneration
+            )
         case nil:
             break
+        }
+    }
+
+    private func nextGalleryEventRevision(for handle: UInt32) -> UInt64 {
+        let revision = (galleryEventRevisions[handle] ?? 0) &+ 1
+        galleryEventRevisions[handle] = revision
+        return revision
+    }
+
+    private func queueCapturePropertyRefresh(
+        _ parameter: CaptureParameter,
+        propertyCode: UInt16,
+        on connection: any PTPChannel,
+        connectionGeneration: UUID
+    ) {
+        pendingCapturePropertyRefreshes[parameter] = propertyCode
+        guard capturePropertyRefreshTask == nil else { return }
+
+        capturePropertyRefreshTask = Task { [weak self] in
+            await self?.drainCapturePropertyRefreshes(
+                on: connection,
+                connectionGeneration: connectionGeneration
+            )
+        }
+    }
+
+    private func drainCapturePropertyRefreshes(
+        on connection: any PTPChannel,
+        connectionGeneration: UUID
+    ) async {
+        defer {
+            if self.connectionGeneration == connectionGeneration {
+                capturePropertyRefreshTask = nil
+            }
+        }
+
+        while !Task.isCancelled, let next = pendingCapturePropertyRefreshes.first {
+            guard self.connectionGeneration == connectionGeneration,
+                  case .connected = state,
+                  commandChannel === connection
+            else {
+                if self.connectionGeneration == connectionGeneration {
+                    pendingCapturePropertyRefreshes = [:]
+                }
+                return
+            }
+
+            pendingCapturePropertyRefreshes.removeValue(forKey: next.key)
+            if activeCaptureWrite == next.key {
+                continue
+            }
+
+            guard let rawValue = await readDeviceProperty(next.value, on: connection) else {
+                appendLog(
+                    "[capture][event] 属性回读失败 name=\(next.key.title) code=0x" +
+                        String(format: "%04X", next.value)
+                )
+                continue
+            }
+            guard self.connectionGeneration == connectionGeneration else { return }
+
+            let value = next.key.normalizeRead(rawValue, from: next.value)
+            captureParameters[next.key] = value
+            appendLog(
+                "[capture][event] 属性已更新 name=\(next.key.title) code=0x" +
+                    String(format: "%04X", next.value) + " raw=\(value)"
+            )
         }
     }
 

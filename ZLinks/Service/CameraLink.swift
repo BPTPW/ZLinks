@@ -384,11 +384,13 @@ struct PTPEvent: Equatable, Sendable {
 enum PTPEventCode: UInt16 {
     case objectAdded = 0x4002
     case objectRemoved = 0x4003
+    case devicePropChanged = 0x4006
 
     var debugName: String {
         switch self {
         case .objectAdded: return "ObjectAdded"
         case .objectRemoved: return "ObjectRemoved"
+        case .devicePropChanged: return "DevicePropChanged"
         }
     }
 }

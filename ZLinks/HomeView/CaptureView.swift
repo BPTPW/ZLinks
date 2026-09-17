@@ -114,7 +114,7 @@ struct CaptureView: View {
 
             await withTaskCancellationHandler {
                 while !Task.isCancelled {
-                    try? await Task.sleep(for: .seconds(1))
+                    try? await Task.sleep(for: .seconds(5))
                     if Task.isCancelled { break }
                     await camera.refreshCaptureParameters()
                 }
