@@ -164,7 +164,7 @@ struct CaptureView: View {
             )
 
             VStack(spacing: 8) {
-                CaptureLiveViewStatusBar()
+                CaptureLiveViewStatusBar(onSelectMode: { openEditor(.exposureMode) })
                 liveViewPanel(showsPortraitCaptureButton: false)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -186,7 +186,7 @@ struct CaptureView: View {
     private var portraitWorkspace: some View {
         ScrollView {
             VStack(spacing: 14) {
-                CaptureLiveViewStatusBar()
+                CaptureLiveViewStatusBar(onSelectMode: { openEditor(.exposureMode) })
                 liveViewPanel(showsPortraitCaptureButton: true)
 
                 CapturePortraitKeyDeck(
@@ -232,19 +232,27 @@ struct CaptureView: View {
                     Spacer()
                     HStack {
                         if showsPortraitCaptureButton {
-                            Button {
-                                Task { await camera.initiateCaptureRecInMedia() }
-                            } label: {
-                                Circle()
-                                    .fill(.white)
-                                    .frame(width: 34, height: 34)
-                                    .padding(8)
+                            HStack(spacing: 6) {
+                                Button {
+                                    Task { await camera.initiateCaptureRecInMedia() }
+                                } label: {
+                                    Circle()
+                                        .fill(.white)
+                                        .frame(width: 34, height: 34)
+                                        .padding(8)
+                                }
+                                .buttonStyle(.plain)
+                                .background(.black.opacity(0.34), in: Circle())
+                                .disabled(
+                                    !isConnected
+                                        || camera.isInitiatingCapture
+                                        || camera.isInitiatingAutoFocus
+                                )
+                                .opacity(isConnected ? 1 : 0.42)
+                                .accessibilityLabel("拍摄")
+
+                                CaptureFocusButton(size: 34, isConnected: isConnected)
                             }
-                            .buttonStyle(.plain)
-                            .background(.black.opacity(0.34), in: Circle())
-                            .disabled(!isConnected || camera.isInitiatingCapture)
-                            .opacity(isConnected ? 1 : 0.42)
-                            .accessibilityLabel("拍摄")
                         }
 
                         Spacer()
@@ -367,7 +375,6 @@ struct CaptureView: View {
     }
 
     private func editorOptions(for parameter: CaptureParameter) -> [CaptureOption]? {
-        guard parameter != .exposureMode else { return nil }
         let options = camera.captureOptions(for: parameter)
         return options.isEmpty ? nil : options
     }
@@ -597,7 +604,7 @@ private struct CaptureFullscreenMonitor: View {
     }
 
     private var fullscreenRightControls: some View {
-        HStack(spacing: 14) {
+        ZStack {
             Button {
                 Task { await camera.initiateCaptureRecInMedia() }
             } label: {
@@ -606,38 +613,49 @@ private struct CaptureFullscreenMonitor: View {
                     .frame(width: 56, height: 56)
             }
             .buttonStyle(.plain)
-            .disabled(!isConnected || camera.isInitiatingCapture)
+            .disabled(
+                !isConnected
+                    || camera.isInitiatingCapture
+                    || camera.isInitiatingAutoFocus
+            )
             .opacity(isConnected ? 1 : 0.42)
             .accessibilityLabel("拍摄")
 
-            VStack {
-                Button(action: onDismiss) {
-                    Image(systemName: "xmark")
-                        .font(.subheadline.bold())
-                        .frame(width: 38, height: 38)
-                        .foregroundStyle(.white)
-                }
-                .buttonStyle(.plain)
-                .background(.black.opacity(0.5), in: .circle)
-                .accessibilityLabel("退出全屏监看")
+            CaptureFocusButton(size: 38, isConnected: isConnected)
+                .offset(y: 60)
 
+            HStack {
                 Spacer()
-
-                Button {
-                    withAnimation(.easeInOut(duration: 0.18)) {
-                        showsMoreOptions.toggle()
+                VStack {
+                    Button(action: onDismiss) {
+                        Image(systemName: "xmark")
+                            .font(.subheadline.bold())
+                            .frame(width: 38, height: 38)
+                            .foregroundStyle(.white)
                     }
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.headline.weight(.bold))
-                        .frame(width: 38, height: 38)
-                        .foregroundStyle(.white)
+                    .buttonStyle(.plain)
+                    .background(.black.opacity(0.5), in: .circle)
+                    .accessibilityLabel("退出全屏监看")
+
+                    Spacer()
+
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.18)) {
+                            showsMoreOptions.toggle()
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis")
+                            .font(.headline.weight(.bold))
+                            .frame(width: 38, height: 38)
+                            .foregroundStyle(.white)
+                    }
+                    .buttonStyle(.plain)
+                    .background(.black.opacity(0.5), in: .circle)
+                    .accessibilityLabel("更多")
                 }
-                .buttonStyle(.plain)
-                .background(.black.opacity(0.5), in: .circle)
-                .accessibilityLabel("更多")
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var fullscreenVideoSurface: some View {
@@ -680,7 +698,6 @@ private struct CaptureFullscreenMonitor: View {
 
     private func openEditor(_ parameter: CaptureParameter) {
         guard camera.canOpenCaptureParameterEditor(parameter) else { return }
-        guard parameter != .exposureMode else { return }
         let options = camera.captureOptions(for: parameter)
         guard !options.isEmpty else { return }
         let current = camera.captureParameters[parameter]
@@ -1486,23 +1503,12 @@ private struct CaptureSliderEditor: View {
                 }
             }
         } else if parameter == .exposureMode {
-            Grid(horizontalSpacing: 10, verticalSpacing: 10) {
-                GridRow {
-                    ForEach(options.prefix(2)) { option in
-                        presetOptionButton(option, isCircular: true)
-                    }
-                }
-
-                GridRow {
-                    ForEach(options.dropFirst(2).prefix(2)) { option in
-                        presetOptionButton(option, isCircular: true)
-                    }
-                }
-
-                if options.count > 4 {
-                    GridRow {
-                        presetOptionButton(options[4], isCircular: true)
-                    }
+            LazyVGrid(
+                columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 4),
+                spacing: 10
+            ) {
+                ForEach(options) { option in
+                    presetOptionButton(option, isCircular: true)
                 }
             }
         } else {
@@ -1610,6 +1616,7 @@ private struct CaptureGridOverlay: View {
 
 private struct CaptureLiveViewStatusBar: View {
     @EnvironmentObject private var camera: CameraConnectionService
+    let onSelectMode: () -> Void
 
     private var connectionTitle: String {
         switch camera.state {
@@ -1674,7 +1681,14 @@ private struct CaptureLiveViewStatusBar: View {
             Spacer(minLength: 12)
 
             HStack(spacing: 16) {
-                CaptureLiveViewMetric(title: "模式", value: exposureModeText)
+                Button(action: onSelectMode) {
+                    CaptureLiveViewMetric(title: "模式", value: exposureModeText)
+                }
+                .buttonStyle(.plain)
+                .disabled(!camera.canOpenCaptureParameterEditor(.exposureMode))
+                .accessibilityLabel("模式，\(exposureModeText)")
+                .accessibilityHint("打开模式设置")
+
                 CaptureLiveViewMetric(title: "帧率", value: frameRateText)
                 CaptureLiveViewMetric(title: "电量", value: batteryText)
             }
@@ -1682,6 +1696,44 @@ private struct CaptureLiveViewStatusBar: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 4)
         .frame(maxWidth: .infinity)
+    }
+}
+
+// 对焦按钮
+
+private struct CaptureFocusButton: View {
+    @EnvironmentObject private var camera: CameraConnectionService
+    let size: CGFloat
+    let isConnected: Bool
+
+    var body: some View {
+        Button {
+            Task { await camera.initiateAutoFocus() }
+        } label: {
+            ZStack {
+                Circle()
+                    .fill(.white)
+
+                if camera.isInitiatingAutoFocus {
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(.black)
+                } else {
+                    Image(systemName: "camera.metering.partial")
+                        .font(.system(size: size * 0.42, weight: .semibold))
+                        .foregroundStyle(.black)
+                }
+            }
+            .frame(width: size, height: size)
+        }
+        .buttonStyle(.plain)
+        .disabled(
+            !isConnected
+                || camera.isInitiatingAutoFocus
+                || camera.isInitiatingCapture
+        )
+        .opacity(isConnected ? 1 : 0.42)
+        .accessibilityLabel("对焦")
     }
 }
 

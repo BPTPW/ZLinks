@@ -433,6 +433,7 @@ enum PTPResponseCode: UInt16 {
     case sessionAlreadyOpen = 0x201e
     case deviceBusy = 0x2019
     case invalidParameter = 0x201d
+    case nikonOutOfFocus = 0xa002
 }
 
 extension UInt16 {

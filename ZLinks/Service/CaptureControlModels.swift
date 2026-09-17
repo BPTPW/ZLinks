@@ -59,7 +59,8 @@ enum CaptureParameter: UInt16, CaseIterable, Hashable, Identifiable, Sendable {
         .focusMode,
         .iso,
         .whiteBalance,
-        .meteringMode
+        .meteringMode,
+        .exposureMode
     ]
 
     /// Alternate property used when the preferred code is not writable.

@@ -403,6 +403,7 @@ final class CameraConnectionService: ObservableObject {
     @Published private(set) var activeCaptureWrite: CaptureParameter?
     @Published private(set) var captureControlError: String?
     @Published private(set) var isInitiatingCapture = false
+    @Published private(set) var isInitiatingAutoFocus = false
 
     var isCaptureControlBusy: Bool {
         activeCaptureWrite != nil || captureWriteTask != nil
@@ -739,6 +740,7 @@ final class CameraConnectionService: ObservableObject {
         isRefreshingCaptureParameters = false
         isRefreshingCaptureParameterCapabilities = false
         isInitiatingCapture = false
+        isInitiatingAutoFocus = false
         captureControlError = nil
         stopLiveViewInternal(sendEndCommand: false)
         isUSBPTPReady = false
@@ -1965,6 +1967,81 @@ final class CameraConnectionService: ObservableObject {
             appendLog("[capture] InitiateCaptureRecInMedia 失败 error=\(error.localizedDescription)")
             return false
         }
+    }
+
+    /// Drive Nikon autofocus. AfDrive uses no parameters and no data phase.
+    @discardableResult
+    func initiateAutoFocus() async -> Bool {
+        guard case .connected = state, let channel = commandChannel else {
+            captureControlError = "相机未连接。"
+            return false
+        }
+        guard !isInitiatingAutoFocus, !isInitiatingCapture else { return false }
+
+        isInitiatingAutoFocus = true
+        captureControlError = nil
+        defer { isInitiatingAutoFocus = false }
+
+        do {
+            let response = try await operation(
+                .autoFocusDrive,
+                parameters: [],
+                dataPhase: nil,
+                on: channel,
+                logStyle: .compact,
+                priority: .foreground,
+                timeout: .seconds(8)
+            )
+            guard response.code == PTPResponseCode.ok.rawValue else {
+                throw CameraConnectionError.ptpResponse(response.code)
+            }
+
+            appendLog("[focus] AfDrive 成功")
+            return await waitForAutoFocusCompletion(on: channel)
+        } catch {
+            captureControlError = "对焦失败：\(error.localizedDescription)"
+            appendLog("[focus] AfDrive 失败 error=\(error.localizedDescription)")
+            return false
+        }
+    }
+
+    private func waitForAutoFocusCompletion(on connection: any PTPChannel) async -> Bool {
+        guard supportsOperation(.deviceReady) else { return true }
+
+        for attempt in 1...10 {
+            do {
+                let response = try await operation(
+                    .deviceReady,
+                    parameters: [],
+                    dataPhase: nil,
+                    on: connection,
+                    logStyle: .silent,
+                    priority: .foreground,
+                    timeout: .seconds(5)
+                )
+                switch response.code {
+                case PTPResponseCode.ok.rawValue:
+                    appendLog("[focus] DeviceReady OK attempt=\(attempt)")
+                    return true
+                case PTPResponseCode.deviceBusy.rawValue:
+                    try? await Task.sleep(for: .milliseconds(500))
+                case PTPResponseCode.nikonOutOfFocus.rawValue:
+                    captureControlError = "相机未能合焦。"
+                    appendLog("[focus] DeviceReady 未合焦 attempt=\(attempt)")
+                    return false
+                default:
+                    throw CameraConnectionError.ptpResponse(response.code)
+                }
+            } catch {
+                captureControlError = "对焦失败：\(error.localizedDescription)"
+                appendLog("[focus] 等待对焦完成失败 error=\(error.localizedDescription)")
+                return false
+            }
+        }
+
+        captureControlError = "等待相机对焦超时。"
+        appendLog("[focus] 等待对焦完成超时")
+        return false
     }
 
     private func logParameters(_ parameters: [UInt32]) -> String {
@@ -4196,6 +4273,7 @@ enum PTPOperationCode: UInt16 {
     case getDevicePropDesc = 0x1014
     case setDevicePropValue = 0x1016
     case getObjectPropValue = 0x9803
+    case autoFocusDrive = 0x90c1
     case deviceReady = 0x90c8
     case getPreviewImage = 0x9200
     case startLiveView = 0x9201
@@ -4224,6 +4302,7 @@ enum PTPOperationCode: UInt16 {
         case .getDevicePropDesc: return "GetDevicePropDesc"
         case .setDevicePropValue: return "SetDevicePropValue"
         case .getObjectPropValue: return "GetObjectPropValue"
+        case .autoFocusDrive: return "AfDrive"
         case .deviceReady: return "DeviceReady"
         case .getPreviewImage: return "GetPreviewImg"
         case .startLiveView: return "StartLiveView"
