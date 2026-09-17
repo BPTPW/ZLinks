@@ -1299,7 +1299,7 @@ private struct CaptureRefreshIntervalEditor: View {
                 .foregroundStyle(.secondary)
             }
 
-            Text("画面的拉取间隔，不代表实际帧率。")
+            Text("实际帧率受相机与连接速度影响。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)

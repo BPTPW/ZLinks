@@ -10,41 +10,74 @@ import Network
 import UIKit
 
 enum LiveViewRefreshInterval: String, CaseIterable {
-    case hz60
-    case hz30
-    case hz10
-    case hz5
-    case hz1
-    case seconds2
-    case seconds3
     case seconds5
+    case seconds3
+    case seconds2
+    case hz1
+    case hz5
+    case hz10
+    case hz30
+    case hz60
 
     static let defaultValue: Self = .hz30
 
     var title: String {
         switch self {
-        case .hz60: return "60Hz"
-        case .hz30: return "30Hz"
-        case .hz10: return "10Hz"
-        case .hz5: return "5Hz"
-        case .hz1: return "1Hz"
-        case .seconds2: return "2s"
-        case .seconds3: return "3s"
         case .seconds5: return "5s"
+        case .seconds3: return "3s"
+        case .seconds2: return "2s"
+        case .hz1: return "1s"
+        case .hz5: return "5fps"
+        case .hz10: return "10fps"
+        case .hz30: return "30fps"
+        case .hz60: return "60fps"
         }
     }
 
-    var duration: Duration {
+    var targetFrameRate: Double? {
         switch self {
-        case .hz60: return .nanoseconds(16_666_667)
-        case .hz30: return .nanoseconds(33_333_333)
-        case .hz10: return .milliseconds(100)
-        case .hz5: return .milliseconds(200)
-        case .hz1: return .seconds(1)
-        case .seconds2: return .seconds(2)
-        case .seconds3: return .seconds(3)
-        case .seconds5: return .seconds(5)
+        case .hz5: return 5
+        case .hz10: return 10
+        case .hz30: return 30
+        case .hz60: return 60
+        case .hz1, .seconds2, .seconds3, .seconds5: return nil
         }
+    }
+
+    var initialRequestInterval: TimeInterval {
+        if let targetFrameRate {
+            return 1 / targetFrameRate
+        }
+        switch self {
+        case .hz1: return 1
+        case .seconds2: return 2
+        case .seconds3: return 3
+        case .seconds5: return 5
+        case .hz5, .hz10, .hz30, .hz60:
+            preconditionFailure("Dynamic frame-rate options have a target frame rate")
+        }
+    }
+
+    func adjustedRequestInterval(
+        current: TimeInterval,
+        actualFrameRate: Double
+    ) -> TimeInterval {
+        guard let targetFrameRate, actualFrameRate.isFinite else {
+            return initialRequestInterval
+        }
+
+        let errorRatio = (actualFrameRate - targetFrameRate) / targetFrameRate
+        guard abs(errorRatio) > 0.02 else { return current }
+
+        let targetPeriod = 1 / targetFrameRate
+        let proportionalStep = targetPeriod * errorRatio * 0.5
+        let maximumStep = targetPeriod * 0.2
+        let boundedStep = min(max(proportionalStep, -maximumStep), maximumStep)
+        return min(max(current + boundedStep, 0), targetPeriod * 2)
+    }
+
+    func sleepDuration(requestInterval: TimeInterval) -> Duration {
+        .nanoseconds(Int64((max(requestInterval, 0) * 1_000_000_000).rounded()))
     }
 }
 
@@ -2346,12 +2379,23 @@ final class CameraConnectionService: ObservableObject {
     private func runLiveViewLoop(generation: Int) async {
         appendLog("[liveview] 拉流循环开始 generation=\(generation)")
         var consecutiveFailures = 0
+        var appliedRefreshInterval = liveViewRefreshInterval
+        var requestInterval = appliedRefreshInterval.initialRequestInterval
+        liveViewFrameCount = 0
+        liveViewFrameWindowStart = Date()
         while !Task.isCancelled,
               generation == liveViewGeneration,
               liveViewConsumers > 0,
               case .connected = state,
               let channel = commandChannel
         {
+            if appliedRefreshInterval != liveViewRefreshInterval {
+                appliedRefreshInterval = liveViewRefreshInterval
+                requestInterval = appliedRefreshInterval.initialRequestInterval
+                liveViewFrameCount = 0
+                liveViewFrameWindowStart = Date()
+            }
+
             do {
                 if let frame = try await fetchLiveViewFrame(
                     on: channel,
@@ -2364,7 +2408,12 @@ final class CameraConnectionService: ObservableObject {
                     let now = Date()
                     let elapsed = now.timeIntervalSince(liveViewFrameWindowStart)
                     if elapsed >= 1 {
-                        liveViewFrameRate = Double(liveViewFrameCount) / elapsed
+                        let measuredFrameRate = Double(liveViewFrameCount) / elapsed
+                        liveViewFrameRate = measuredFrameRate
+                        requestInterval = appliedRefreshInterval.adjustedRequestInterval(
+                            current: requestInterval,
+                            actualFrameRate: measuredFrameRate
+                        )
                         liveViewFrameCount = 0
                         liveViewFrameWindowStart = now
                     }
@@ -2387,7 +2436,9 @@ final class CameraConnectionService: ObservableObject {
                 continue
             }
             // Yield the command channel so gallery/status requests can interleave.
-            try? await Task.sleep(for: liveViewRefreshInterval.duration)
+            try? await Task.sleep(
+                for: appliedRefreshInterval.sleepDuration(requestInterval: requestInterval)
+            )
         }
         if generation == liveViewGeneration {
             isLiveViewActive = false
