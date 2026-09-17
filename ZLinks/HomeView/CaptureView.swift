@@ -32,6 +32,7 @@ struct CaptureView: View {
     @State private var isRefreshIntervalEditorPresented = false
     @State private var refreshIntervalSliderIndex = 0.0
     @State private var isFullscreenPresented = false
+    @State private var isMonitoringEnabled = true
 
     private let leftRailParameters: [CaptureParameter] = [
         .exposureCompensation,
@@ -107,23 +108,24 @@ struct CaptureView: View {
         }
         .animation(.spring(response: 0.34, dampingFraction: 0.86), value: editingParameter)
         .animation(.spring(response: 0.34, dampingFraction: 0.86), value: isRefreshIntervalEditorPresented)
-        .task(id: liveViewSessionKey) {
+        .task(id: "\(liveViewSessionKey):\(isMonitoringEnabled)") {
+            guard isMonitoringEnabled else { return }
             await camera.startLiveView()
+
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+            }
+            await camera.stopLiveView()
+        }
+        .task(id: camera.state) {
             await camera.refreshCaptureParameterCapabilities()
             await camera.refreshCaptureParameters()
 
-            await withTaskCancellationHandler {
-                while !Task.isCancelled {
-                    try? await Task.sleep(for: .seconds(5))
-                    if Task.isCancelled { break }
-                    await camera.refreshCaptureParameters()
-                }
-            } onCancel: {
-                Task { @MainActor in
-                    await camera.stopLiveView()
-                }
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                if Task.isCancelled { break }
+                await camera.refreshCaptureParameters()
             }
-            await camera.stopLiveView()
         }
         .task(id: camera.state) {
             await camera.refreshCameraStatusPeriodically()
@@ -209,10 +211,32 @@ struct CaptureView: View {
                 stream: camera.liveViewStream,
                 mirrorsPreview: mirrorsPreview
             ) {
-                liveViewPlaceholder
+                if isMonitoringEnabled {
+                    liveViewPlaceholder
+                }
             }
 
-            if showsGrid {
+            if !isMonitoringEnabled {
+                Color.black
+            }
+
+            if showsPortraitCaptureButton {
+                Button {
+                    isMonitoringEnabled.toggle()
+                } label: {
+                    Image(systemName: isMonitoringEnabled ? "eye.slash" : "eye")
+                        .font(.subheadline.bold())
+                        .frame(width: 34, height: 34)
+                        .foregroundStyle(.primary)
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: .circle)
+                .accessibilityLabel(isMonitoringEnabled ? "停止监看" : "开启监看")
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .padding(12)
+            }
+
+            if showsGrid && isMonitoringEnabled {
                 CaptureGridOverlay()
                     .allowsHitTesting(false)
             }
@@ -231,7 +255,7 @@ struct CaptureView: View {
                 VStack {
                     Spacer()
                     HStack {
-                        if showsPortraitCaptureButton {
+                        if showsPortraitCaptureButton && isMonitoringEnabled {
                             HStack(spacing: 6) {
                                 Button {
                                     Task { await camera.initiateCaptureRecInMedia() }
@@ -257,17 +281,19 @@ struct CaptureView: View {
 
                         Spacer()
 
-                        Button {
-                            isFullscreenPresented = true
-                        } label: {
-                            Image(systemName: "arrow.up.left.and.arrow.down.right")
-                                .font(.subheadline.bold())
-                                .frame(width: 34, height: 34)
-                                .foregroundStyle(.primary)
+                        if isMonitoringEnabled {
+                            Button {
+                                isFullscreenPresented = true
+                            } label: {
+                                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                                    .font(.subheadline.bold())
+                                    .frame(width: 34, height: 34)
+                                    .foregroundStyle(.primary)
+                            }
+                            .buttonStyle(.plain)
+                            .glassEffect(.regular.interactive(), in: .circle)
+                            .accessibilityLabel("全屏监看")
                         }
-                        .buttonStyle(.plain)
-                        .glassEffect(.regular.interactive(), in: .circle)
-                        .accessibilityLabel("全屏监看")
                     }
                 }
                 .padding(12)
