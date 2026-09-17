@@ -77,7 +77,7 @@ enum LiveViewRefreshInterval: String, CaseIterable {
     }
 
     func sleepDuration(requestInterval: TimeInterval) -> Duration {
-        .nanoseconds(Int64((max(requestInterval, 0) * 1_000_000_000).rounded()))
+        .nanoseconds(Int64((max(requestInterval, 0) * 1000000000).rounded()))
     }
 }
 
@@ -422,6 +422,7 @@ final class CameraConnectionService: ObservableObject {
         get { liveViewStream.image }
         set { liveViewStream.setImage(newValue) }
     }
+
     @Published private(set) var isLiveViewActive = false
     @Published private(set) var liveViewError: String?
     @Published private(set) var liveViewFrameRate: Double?
@@ -904,7 +905,9 @@ final class CameraConnectionService: ObservableObject {
         galleryLoadGeneration &+= 1
         galleryEnrichmentTask?.cancel()
         galleryEnrichmentTask = nil
-        for task in metadataInfoTasks.values { task.cancel() }
+        for task in metadataInfoTasks.values {
+            task.cancel()
+        }
         metadataInfoTasks = [:]
         metadataRecordsByHandle = [:]
         metadataResolvedItems = [:]
@@ -1081,17 +1084,20 @@ final class CameraConnectionService: ObservableObject {
 
         guard self.connectionGeneration == connectionGeneration,
               galleryEventRevisions[handle] == revision,
-              let info else {
+              let info
+        else {
             appendLog("[图库][event] ObjectAdded 无法取得对象信息 handle=0x\(String(format: "%08X", handle))")
             return
         }
         guard !isAssociationObject(objectFormat: info.objectFormat),
-              isGalleryMedia(objectFormat: info.objectFormat, filename: info.filename) else {
+              isGalleryMedia(objectFormat: info.objectFormat, filename: info.filename)
+        else {
             appendLog("[图库][event] ObjectAdded 跳过非媒体 handle=0x\(String(format: "%08X", handle))")
             return
         }
         guard let directory = galleryDirectories.first(where: { $0.id == selectedGalleryDirectoryID }),
-              await object(info, belongsTo: directory, on: connection) else {
+              await object(info, belongsTo: directory, on: connection)
+        else {
             appendLog(
                 "[图库][event] ObjectAdded 不属于当前目录 handle=0x\(String(format: "%08X", handle)) " +
                     "parent=0x\(String(format: "%08X", info.parentObject))"
@@ -1139,7 +1145,7 @@ final class CameraConnectionService: ObservableObject {
         var visited = Set<UInt32>()
         for _ in 0..<32 {
             if parent == directory.handle { return true }
-            if parent == 0 || parent == 0xffff_ffff || !visited.insert(parent).inserted {
+            if parent == 0 || parent == 0xffffffff || !visited.insert(parent).inserted {
                 return false
             }
             guard let parentInfo = try? await fetchObjectInfo(
@@ -1507,7 +1513,7 @@ final class CameraConnectionService: ObservableObject {
             let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
             appendLog(
                 "[图库] 目录媒体完成 dir=\(directory.pickerTitle) photos=\(photos) videos=\(videos) " +
-                "total=\(items.count) elapsedMs=\(elapsedMs)"
+                    "total=\(items.count) elapsedMs=\(elapsedMs)"
             )
             return true
         } catch {

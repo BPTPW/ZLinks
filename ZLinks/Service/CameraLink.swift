@@ -332,7 +332,7 @@ final class PTPIPTCPChannel: PTPChannel {
             throw CameraConnectionError.malformedPacket
         }
 
-        let nameData = data[20..<nameEnd]
+        let nameData = data[20 ..< nameEnd]
         let name = String(data: nameData, encoding: .utf16LittleEndian) ?? ""
         let protocolVersion = data.uint32(at: protocolVersionOffset)
         logHandler?(

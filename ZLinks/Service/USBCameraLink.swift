@@ -722,7 +722,7 @@ final class USBCameraLink: ObservableObject {
     var batteryLevel: Int? {
         guard let device = activeDevice, device.batteryLevelAvailable else { return nil }
         let level = device.batteryLevel
-        return (0...100).contains(level) ? level : nil
+        return (0 ... 100).contains(level) ? level : nil
     }
 
     private func makeCatalogSnapshot(_ device: ICCameraDevice) -> USBCameraCatalog {
