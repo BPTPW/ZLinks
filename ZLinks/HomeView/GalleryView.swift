@@ -288,11 +288,15 @@ struct GalleryView: View {
                                 galleryCell(for: item)
                             }
                         }
+                        // ObjectAdded/ObjectRemoved update the published item order immediately;
+                        // animate that order change so the grid reflows instead of snapping.
+                        .animation(.snappy(duration: 0.42, extraBounce: 0.04), value: section.items.map(\.id))
                     }
                 }
                 .padding(.horizontal, spacing)
                 .padding(.top, spacing)
                 .padding(.bottom, 24)
+                .animation(.snappy(duration: 0.42, extraBounce: 0.04), value: camera.galleryItems.map(\.id))
             }
             .refreshable {
                 await reloadGallery(force: true)
@@ -400,6 +404,12 @@ struct GalleryView: View {
         .aspectRatio(1, contentMode: .fit)
         .clipped()
         .contentShape(Rectangle())
+        .transition(
+            .asymmetric(
+                insertion: .offset(y: -24).combined(with: .opacity),
+                removal: .scale(scale: 0.82).combined(with: .opacity)
+            )
+        )
         .matchedTransitionSource(id: item.handle, in: galleryTransition)
         .onTapGesture {
             if isSelectionMode {
