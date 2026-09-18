@@ -1240,7 +1240,7 @@ private struct CapturePortraitKeyDeck: View {
                     }
 
                     CaptureGlassKey(
-                        title: "图传刷新频率",
+                        title: "图传最高帧率",
                         symbol: "arrow.triangle.2.circlepath",
                         value: camera.liveViewRefreshInterval.title,
                         style: .tile,
