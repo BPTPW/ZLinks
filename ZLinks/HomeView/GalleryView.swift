@@ -992,7 +992,7 @@ private struct GalleryPreviewView: View {
                                 VStack(alignment: .leading, spacing: 8) {
                                     Button { dismiss() } label: {
                                         Image(systemName: "chevron.left")
-                                            .font(.title3.weight(.semibold))
+                                            .font(.title3)
                                             .frame(width: 32, height: 32)
                                             .foregroundStyle(.primary)
                                     }
@@ -1063,10 +1063,11 @@ private struct GalleryPreviewView: View {
                                     } label: {
                                         Image(systemName: isAnyDownloadQueued ? "square.and.arrow.down.badge.clock" : "square.and.arrow.down")
                                             .foregroundStyle(.primary)
+                                            .font(.title2)
                                             .contentTransition(.symbolEffect(.replace.magic(fallback: .downUp.byLayer), options: .nonRepeating))
                                     }
                                     .buttonStyle(.plain)
-                                    .frame(width: 42, height: 42)
+                                    .frame(width: 50, height: 50)
                                     .glassEffect(.regular.interactive(), in: .circle)
                                 }
                                 Spacer()
@@ -1080,10 +1081,11 @@ private struct GalleryPreviewView: View {
                                         } else {
                                             Image(systemName: "trash")
                                                 .foregroundStyle(.red)
+                                                .font(.title2)
                                         }
                                     }
                                     .buttonStyle(.plain)
-                                    .frame(width: 42, height: 42)
+                                    .frame(width: 50, height: 50)
                                     .glassEffect(.regular.interactive(), in: .circle)
                                     .disabled(isDeleting || isProtected || isProtectionChanging)
                                     .accessibilityLabel("删除照片")
@@ -1096,12 +1098,12 @@ private struct GalleryPreviewView: View {
                                         if isProtectionChanging {
                                             ProgressView()
                                                 .tint(.primary)
-                                                .frame(width: 42, height: 42)
+                                                .frame(width: 50, height: 50)
                                         } else {
                                             Image(systemName: isProtected ? "heart.fill" : "heart")
-                                                .font(.body.weight(.semibold))
+                                                .font(.title2)
                                                 .foregroundStyle(.primary)
-                                                .frame(width: 42, height: 42)
+                                                .frame(width: 50, height: 50)
                                                 .contentTransition(.symbolEffect(.replace))
                                         }
                                     }
@@ -1112,10 +1114,10 @@ private struct GalleryPreviewView: View {
                                     Button {
                                         isMetadataPresented = true
                                     } label: {
-                                        Image(systemName: "info")
-                                            .font(.body.weight(.semibold))
+                                        Image(systemName: "info.circle")
+                                            .font(.title2)
                                             .foregroundStyle(.primary)
-                                            .frame(width: 42, height: 42)
+                                            .frame(width: 50, height: 50)
                                     }
                                     .buttonStyle(.plain)
                                     .accessibilityLabel("照片信息")
@@ -1123,8 +1125,7 @@ private struct GalleryPreviewView: View {
                                 .glassEffect(.regular.interactive(), in: .capsule)
                             }
                         }
-                        .padding(.horizontal, 16)
-                        .padding(.bottom, 12)
+                        .padding(.horizontal, 20)
                     }
                     .transition(.opacity)
                 }
