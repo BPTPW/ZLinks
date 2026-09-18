@@ -403,6 +403,7 @@ struct GalleryView: View {
         .frame(maxWidth: .infinity)
         .aspectRatio(1, contentMode: .fit)
         .clipped()
+        .opacity(isSelectionMode && item.isProtected ? 0.42 : 1)
         .contentShape(Rectangle())
         .transition(
             .asymmetric(
@@ -413,7 +414,7 @@ struct GalleryView: View {
         .matchedTransitionSource(id: item.handle, in: galleryTransition)
         .onTapGesture {
             if isSelectionMode {
-                if item.isVideo { return }
+                if item.isVideo || item.isProtected { return }
                 if selectedHandles.contains(item.handle) {
                     selectedHandles.remove(item.handle)
                 } else {
@@ -428,6 +429,7 @@ struct GalleryView: View {
                 Button { enterSelectionMode(selecting: item.handle) } label: {
                     Label("多选", systemImage: "checkmark.circle")
                 }
+                .disabled(item.isProtected)
             }
             if let format = item.photoFormat {
                 if format.supportsRAW {
@@ -451,6 +453,7 @@ struct GalleryView: View {
                 } label: {
                     Label("删除", systemImage: "trash")
                 }
+                .disabled(item.isProtected)
             }
         }
         .onAppear {
@@ -528,7 +531,7 @@ struct GalleryView: View {
 
     private func selectableHandles(in section: GalleryTimeSection) -> [UInt32] {
         section.items.compactMap { item in
-            item.isVideo ? nil : item.handle
+            item.isVideo || item.isProtected ? nil : item.handle
         }
     }
 
@@ -556,7 +559,9 @@ struct GalleryView: View {
 
     private func exitSelectionMode() { isSelectionMode = false; selectedHandles.removeAll() }
     private var selectedPhotoItems: [CameraConnectionService.GalleryItem] {
-        camera.galleryItems.filter { selectedHandles.contains($0.handle) && !$0.isVideo }
+        camera.galleryItems.filter {
+            selectedHandles.contains($0.handle) && !$0.isVideo && !$0.isProtected
+        }
     }
 
     private var multiDownloadOptions: [MultiDownloadOption] {
@@ -740,6 +745,8 @@ struct GalleryView: View {
             [item.handle, item.rawHandle, item.jpegHandle].compactMap { $0 }
         })
         selectedHandles.formIntersection(validHandles)
+        let protectedHandles = Set(items.filter(\.isProtected).map(\.handle))
+        selectedHandles.subtract(protectedHandles)
         visibleHandles.formIntersection(validHandles)
         failedThumbnails.formIntersection(validObjectHandles)
         thumbnailImages = thumbnailImages.filter { validHandles.contains($0.key) }
@@ -957,6 +964,9 @@ private struct GalleryPreviewView: View {
     @State private var isMetadataLoading = false
     @State private var isDeleteConfirmationPresented = false
     @State private var isDeleting = false
+    @State private var protectionOverride: Bool?
+    @State private var isProtectionChanging = false
+    @State private var protectionError: String?
 
     var body: some View {
         GeometryReader { proxy in
@@ -1034,59 +1044,83 @@ private struct GalleryPreviewView: View {
                             .accessibilityLabel("查看原图")
                             .padding(.bottom, 10)
                         }
-                        HStack {
-                            if let format = item.photoFormat {
-                                Menu {
-                                    if format.supportsRAW {
-                                        Button { onDownload(.raw) } label: {
-                                            Label("下载 RAW", systemImage: "r.square")
+                        ZStack {
+                            HStack {
+                                if let format = item.photoFormat {
+                                    Menu {
+                                        if format.supportsRAW {
+                                            Button { onDownload(.raw) } label: {
+                                                Label("下载 RAW", systemImage: "r.square")
+                                            }
+                                            .disabled(isDownloadQueued(.raw))
                                         }
-                                        .disabled(isDownloadQueued(.raw))
-                                    }
-                                    if format.supportsJPEG {
-                                        Button { onDownload(.jpeg) } label: {
-                                            Label("下载 JPEG", systemImage: "j.square")
+                                        if format.supportsJPEG {
+                                            Button { onDownload(.jpeg) } label: {
+                                                Label("下载 JPEG", systemImage: "j.square")
+                                            }
+                                            .disabled(isDownloadQueued(.jpeg))
                                         }
-                                        .disabled(isDownloadQueued(.jpeg))
+                                    } label: {
+                                        Image(systemName: isAnyDownloadQueued ? "square.and.arrow.down.badge.clock" : "square.and.arrow.down")
+                                            .foregroundStyle(.primary)
+                                            .contentTransition(.symbolEffect(.replace.magic(fallback: .downUp.byLayer), options: .nonRepeating))
                                     }
-                                } label: {
-                                    Image(systemName: isAnyDownloadQueued ? "square.and.arrow.down.badge.clock" : "square.and.arrow.down")
-                                        .foregroundStyle(.primary)
-                                        .contentTransition(.symbolEffect(.replace.magic(fallback: .downUp.byLayer), options: .nonRepeating))
+                                    .buttonStyle(.plain)
+                                    .frame(width: 42, height: 42)
+                                    .glassEffect(.regular.interactive(), in: .circle)
                                 }
-                                .buttonStyle(.plain)
-                                .frame(width: 42, height: 42)
-                                .glassEffect(.regular.interactive(), in: .circle)
+                                Spacer()
+                                if !item.isVideo {
+                                    Button {
+                                        isDeleteConfirmationPresented = true
+                                    } label: {
+                                        if isDeleting {
+                                            ProgressView()
+                                                .tint(.primary)
+                                        } else {
+                                            Image(systemName: "trash")
+                                                .foregroundStyle(.red)
+                                        }
+                                    }
+                                    .buttonStyle(.plain)
+                                    .frame(width: 42, height: 42)
+                                    .glassEffect(.regular.interactive(), in: .circle)
+                                    .disabled(isDeleting || isProtected || isProtectionChanging)
+                                    .accessibilityLabel("删除照片")
+                                }
                             }
-                            Spacer()
+
                             if !item.isVideo {
-                                Button {
-                                    isMetadataPresented = true
-                                } label: {
-                                    Image(systemName: "info")
-                                        .font(.body.weight(.semibold))
-                                        .foregroundStyle(.primary)
-                                }
-                                .buttonStyle(.plain)
-                                .frame(width: 42, height: 42)
-                                .glassEffect(.regular.interactive(), in: .circle)
-                                .accessibilityLabel("照片信息")
-                                Button {
-                                    isDeleteConfirmationPresented = true
-                                } label: {
-                                    if isDeleting {
-                                        ProgressView()
-                                            .tint(.primary)
-                                    } else {
-                                        Image(systemName: "trash")
-                                            .foregroundStyle(.red)
+                                HStack(spacing: 0) {
+                                    Button(action: toggleProtection) {
+                                        if isProtectionChanging {
+                                            ProgressView()
+                                                .tint(.primary)
+                                                .frame(width: 42, height: 42)
+                                        } else {
+                                            Image(systemName: isProtected ? "heart.fill" : "heart")
+                                                .font(.body.weight(.semibold))
+                                                .foregroundStyle(.primary)
+                                                .frame(width: 42, height: 42)
+                                                .contentTransition(.symbolEffect(.replace))
+                                        }
                                     }
+                                    .buttonStyle(.plain)
+                                    .disabled(isProtectionChanging || isDeleting)
+                                    .accessibilityLabel(isProtected ? "解锁照片" : "锁定照片")
+
+                                    Button {
+                                        isMetadataPresented = true
+                                    } label: {
+                                        Image(systemName: "info")
+                                            .font(.body.weight(.semibold))
+                                            .foregroundStyle(.primary)
+                                            .frame(width: 42, height: 42)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .accessibilityLabel("照片信息")
                                 }
-                                .buttonStyle(.plain)
-                                .frame(width: 42, height: 42)
-                                .glassEffect(.regular.interactive(), in: .circle)
-                                .disabled(isDeleting)
-                                .accessibilityLabel("删除照片")
+                                .glassEffect(.regular.interactive(), in: .capsule)
                             }
                         }
                         .padding(.horizontal, 16)
@@ -1110,6 +1144,9 @@ private struct GalleryPreviewView: View {
             }
             .statusBarHidden(isImmersive)
             .onAppear { loadFullImage() }
+            .onChange(of: item.isProtected) { _, newValue in
+                protectionOverride = newValue
+            }
             .animation(.easeInOut(duration: 0.2), value: controlsVisible)
             .animation(.interactiveSpring(response: 0.28, dampingFraction: 0.82), value: dragOffset)
             .onChange(of: proxy.size) { _, _ in clampOffset() }
@@ -1133,10 +1170,40 @@ private struct GalleryPreviewView: View {
                 }
                 Button("取消", role: .cancel) {}
             }
+            .alert("无法更改锁定状态", isPresented: protectionErrorPresented) {
+                Button("好", role: .cancel) { protectionError = nil }
+            } message: {
+                Text(protectionError ?? "相机未能更改照片的锁定状态。")
+            }
         }
     }
 
     private var isImmersive: Bool { scale > 1.01 || !controlsVisible }
+    private var isProtected: Bool { protectionOverride ?? item.isProtected }
+    private var protectionErrorPresented: Binding<Bool> {
+        Binding(
+            get: { protectionError != nil },
+            set: { if !$0 { protectionError = nil } }
+        )
+    }
+
+    private func toggleProtection() {
+        guard !isProtectionChanging else { return }
+        let requestedState = !isProtected
+        isProtectionChanging = true
+        Task {
+            do {
+                protectionOverride = try await camera.setGalleryItemProtection(
+                    item,
+                    isProtected: requestedState
+                )
+            } catch {
+                protectionError = error.localizedDescription
+            }
+            isProtectionChanging = false
+        }
+    }
+
     private var isAnyDownloadQueued: Bool {
         guard let format = item.photoFormat else { return false }
         return (format.supportsRAW && isDownloadQueued(.raw)) || (format.supportsJPEG && isDownloadQueued(.jpeg))
@@ -1700,6 +1767,11 @@ private struct GalleryThumbnailCell: View {
                     thumbnailBadge(symbol: symbol, color: format == .raw ? .orange : .white)
                 }
             }
+            .overlay(alignment: .topTrailing) {
+                if !item.isVideo && item.isProtected {
+                    thumbnailBadge(symbol: "heart.fill", color: .white)
+                }
+            }
             .overlay {
                 if selectionMode && isSelected {
                     Color.white.opacity(0.42)
@@ -1719,7 +1791,6 @@ private struct GalleryThumbnailCell: View {
             .font(.system(size: 14, weight: .semibold))
             .foregroundStyle(color)
             .frame(width: 24, height: 24)
-            .background(Color.black.opacity(0.28), in: RoundedRectangle(cornerRadius: 4))
             .shadow(color: .black.opacity(0.3), radius: 1, y: 1)
             .padding(5)
     }
@@ -1729,7 +1800,7 @@ private struct GalleryThumbnailCell: View {
             return "视频 \(item.filename)"
         }
         let format = item.photoFormat?.title ?? "照片"
-        return "\(format) \(item.filename)"
+        return "\(format) \(item.filename)" + (item.isProtected ? "，已锁定" : "")
     }
 }
 

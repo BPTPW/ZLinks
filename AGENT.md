@@ -33,6 +33,7 @@ Verified against Nikon Z5 (`FriendlyName=Z5_2_8064268`, firmware string `V1.20`)
 链路选择与降级：
 
 - `CameraConnectionService.linkKind` 记录当前链路，`isUSBPTPReady` 表示 USB 上的 PTP 直通是否可用。
+- USB 连接在绝大多数受支持的相机与系统组合上默认提供 PTP 直通；新增相机控制功能时应优先复用现有 `USBPTPChannel`，不要把 USB 预设为只能访问内容目录。
 - 相机不提供 PTP 直通时仍可用 USB 目录模式浏览与下载照片：相机信息来自 `ICDevice`（名称 / 序列号），电量来自 `ICCameraDevice.batteryLevel`，实时图传与参数控制不可用。
 - USB 断线由 ImageCaptureCore 回调通知（`didCloseSessionWithError` / `didRemove`），不参与 PTP/IP 自动重连；`beginAutomaticReconnect` 只处理 Wi-Fi。
 - USB 快速连接默认开启并通过 `camera.usbFastConnect` 持久化。关闭时沿用系统内容目录优先；开启时连接不等待内容目录，图库优先走 PTP，只有 PTP 刷新失败才等待并读取系统内容目录兜底。
@@ -240,6 +241,8 @@ Gallery browsing uses standard PTP operations after an existing session is open:
 2. `GetObjectInfo` (`0x1008`) to filter media and sort by capture/modification date (newest first)
 3. `GetThumb` (`0x100A`) for JPEG thumbnails
 4. Optional MTP `GetObjectPropValue` (`0x9803`) with Duration `0xDC89` for video length
+
+`GetObjectInfo` 的 offset `6` 是 `ProtectionStatus`。图库把非零值视为已锁定；切换状态使用标准 `SetObjectProtection` (`0x1012`) 并对 RAW+JPEG 配对对象的两个 handle 同步设置，随后通过 `GetObjectInfo` 回读。
 
 Folders/associations are skipped. Image/video detection uses ObjectFormat plus filename extension (JPG/NEF/MOV/MP4, etc.). Thumbnail and duration requests share the command connection through a serial operation gate so concurrent cell loads cannot interleave PTP/IP transactions.
 

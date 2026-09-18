@@ -63,6 +63,7 @@ struct USBCameraCatalog {
         let captureDate: Date?
         let isRAW: Bool
         let isVideo: Bool
+        let isProtected: Bool
     }
 
     struct Folder: Equatable {
@@ -740,7 +741,8 @@ final class USBCameraLink: ObservableObject {
                 fileSize: UInt64(max(file.fileSize, 0)),
                 captureDate: file.creationDate ?? file.fileCreationDate,
                 isRAW: file.isRaw || Self.looksLikeRAW(filename),
-                isVideo: Self.looksLikeVideo(filename: filename, uti: file.uti)
+                isVideo: Self.looksLikeVideo(filename: filename, uti: file.uti),
+                isProtected: file.isLocked
             )
         }
 

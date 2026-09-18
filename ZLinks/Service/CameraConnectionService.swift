@@ -360,6 +360,7 @@ final class CameraConnectionService: ObservableObject {
         var fileSize: UInt64
         var isVideo: Bool
         var captureDate: Date?
+        var protectionStatus: UInt16 = 0
         var rawHandle: UInt32?
         var rawFilename: String?
         var rawFileSize: UInt64?
@@ -384,6 +385,10 @@ final class CameraConnectionService: ObservableObject {
         /// Full-screen previews prefer the paired JPEG because RAW objects are much larger.
         var previewHandle: UInt32 {
             jpegHandle ?? rawHandle ?? handle
+        }
+
+        nonisolated var isProtected: Bool {
+            protectionStatus != 0
         }
     }
 
@@ -1396,6 +1401,7 @@ final class CameraConnectionService: ObservableObject {
                     fileSize: entry.fileSize,
                     isVideo: isVideo,
                     captureDate: entry.captureDate,
+                    protectionStatus: entry.isProtected ? 1 : 0,
                     rawHandle: isRAW ? entry.handle : nil,
                     rawFilename: isRAW ? entry.filename : nil,
                     rawFileSize: isRAW ? entry.fileSize : nil,
@@ -1633,6 +1639,9 @@ final class CameraConnectionService: ObservableObject {
         guard case .connected = state else {
             throw CameraConnectionError.connectionCancelled
         }
+        guard items.allSatisfy({ !$0.isProtected }) else {
+            throw CameraConnectionError.ptpResponse(0x200d)
+        }
         guard let channel = commandChannel else {
             throw CameraConnectionError.usbUnavailable("当前 USB 连接未提供 PTP 直通，暂不支持删除相机内文件")
         }
@@ -1668,6 +1677,70 @@ final class CameraConnectionService: ObservableObject {
             }
             appendLog("[图库] 删除成功 handle=0x\(String(format: "%08X", handle))")
         }
+    }
+
+    /// Applies standard PTP object protection to every object represented by a gallery item.
+    /// RAW+JPEG pairs are kept in sync and then read back through GetObjectInfo.
+    func setGalleryItemProtection(_ item: GalleryItem, isProtected: Bool) async throws -> Bool {
+        guard case .connected = state else {
+            throw CameraConnectionError.connectionCancelled
+        }
+        guard !item.isVideo else { return false }
+        guard let channel = commandChannel else {
+            throw CameraConnectionError.usbUnavailable("当前 USB 连接未提供 PTP 直通，暂不支持设置照片保护状态")
+        }
+
+        var handles = Set<UInt32>()
+        if let rawHandle = item.rawHandle { handles.insert(rawHandle) }
+        if let jpegHandle = item.jpegHandle { handles.insert(jpegHandle) }
+        if handles.isEmpty { handles.insert(item.handle) }
+
+        for handle in handles.sorted() {
+            let response = try await operation(
+                .setObjectProtection,
+                parameters: [handle, isProtected ? 1 : 0],
+                dataPhase: nil,
+                on: channel,
+                logStyle: .compact,
+                priority: .foreground
+            )
+            guard response.code == PTPResponseCode.ok.rawValue else {
+                appendLog(
+                    "[图库] 设置保护状态失败 handle=0x\(String(format: "%08X", handle)) " +
+                        "protected=\(isProtected) code=0x\(String(format: "%04X", response.code))"
+                )
+                throw CameraConnectionError.ptpResponse(response.code)
+            }
+        }
+
+        var readBackStatuses: [UInt32: UInt16] = [:]
+        for handle in handles {
+            if let info = try? await fetchObjectInfo(handle: handle, on: channel, priority: .foreground) {
+                readBackStatuses[handle] = info.protectionStatus
+            }
+        }
+        let effectiveProtection = readBackStatuses.count == handles.count
+            ? readBackStatuses.values.contains(where: { $0 != 0 })
+            : isProtected
+
+        galleryItems = galleryItems.map { current in
+            let currentHandles = Set([current.handle, current.rawHandle, current.jpegHandle].compactMap { $0 })
+            guard !currentHandles.isDisjoint(with: handles) else { return current }
+            var updated = current
+            updated.protectionStatus = effectiveProtection ? 1 : 0
+            return updated
+        }
+        for handle in handles {
+            guard var resolved = metadataResolvedItems[handle] else { continue }
+            resolved.protectionStatus = readBackStatuses[handle] ?? (isProtected ? 1 : 0)
+            metadataResolvedItems[handle] = resolved
+        }
+        metadataRevision &+= 1
+        appendLog(
+            "[图库] 设置保护状态成功 handles=\(handles.sorted().map { String(format: "0x%08X", $0) }.joined(separator: ",")) " +
+                "protected=\(effectiveProtection)"
+        )
+        return effectiveProtection
     }
 
     /// Loads the fastest usable full-screen image. Nikon preview is attempted only when
@@ -3296,10 +3369,11 @@ final class CameraConnectionService: ObservableObject {
             id: handle,
             filename: info.filename,
             objectFormat: info.objectFormat,
-            fileSize: info.fileSize,
-            isVideo: isVideo,
-            captureDate: record.captureDate ?? info.captureDate ?? info.modificationDate,
-            rawHandle: isRAW ? handle : nil,
+                    fileSize: info.fileSize,
+                    isVideo: isVideo,
+                    captureDate: record.captureDate ?? info.captureDate ?? info.modificationDate,
+                    protectionStatus: info.protectionStatus,
+                    rawHandle: isRAW ? handle : nil,
             rawFilename: isRAW ? info.filename : nil,
             rawFileSize: isRAW ? info.fileSize : nil,
             jpegHandle: !isVideo && !isRAW ? handle : nil,
@@ -3402,6 +3476,7 @@ final class CameraConnectionService: ObservableObject {
                         fileSize: info.fileSize,
                         isVideo: isVideo,
                         captureDate: info.captureDate ?? info.modificationDate,
+                        protectionStatus: info.protectionStatus,
                         rawHandle: isRAW ? handle : nil,
                         rawFilename: isRAW ? info.filename : nil,
                         rawFileSize: isRAW ? info.fileSize : nil,
@@ -3565,6 +3640,7 @@ final class CameraConnectionService: ObservableObject {
             fileSize: (rawItem.rawFileSize ?? 0) + (jpegItem.jpegFileSize ?? 0),
             isVideo: false,
             captureDate: captureDate,
+            protectionStatus: lhs.isProtected || rhs.isProtected ? 1 : 0,
             rawHandle: rawItem.rawHandle,
             rawFilename: rawItem.rawFilename,
             rawFileSize: rawItem.rawFileSize,
@@ -3655,6 +3731,7 @@ final class CameraConnectionService: ObservableObject {
     private struct ParsedObjectInfo: Sendable {
         var storageID: UInt32
         var objectFormat: UInt16
+        var protectionStatus: UInt16
         var fileSize: UInt64
         var parentObject: UInt32
         var filename: String
@@ -3702,6 +3779,7 @@ final class CameraConnectionService: ObservableObject {
         return ParsedObjectInfo(
             storageID: data.uint32(at: 0),
             objectFormat: objectFormat,
+            protectionStatus: data.uint16(at: 6),
             fileSize: fileSize,
             parentObject: data.uint32(at: 38),
             filename: filename.value,
@@ -3720,6 +3798,7 @@ final class CameraConnectionService: ObservableObject {
             fileSize: info.fileSize,
             isVideo: isVideo,
             captureDate: info.captureDate ?? info.modificationDate,
+            protectionStatus: info.protectionStatus,
             rawHandle: isRAW ? handle : nil,
             rawFilename: isRAW ? info.filename : nil,
             rawFileSize: isRAW ? info.fileSize : nil,
@@ -4325,6 +4404,7 @@ enum PTPOperationCode: UInt16 {
     case getObject = 0x1009
     case getThumb = 0x100a
     case deleteObject = 0x100b
+    case setObjectProtection = 0x1012
     case getPartialObject = 0x101b
     case getDevicePropValue = 0x1015
     case getDevicePropDesc = 0x1014
@@ -4354,6 +4434,7 @@ enum PTPOperationCode: UInt16 {
         case .getObject: return "GetObject"
         case .getThumb: return "GetThumb"
         case .deleteObject: return "DeleteObject"
+        case .setObjectProtection: return "SetObjectProtection"
         case .getPartialObject: return "GetPartialObject"
         case .getDevicePropValue: return "GetDevicePropValue"
         case .getDevicePropDesc: return "GetDevicePropDesc"

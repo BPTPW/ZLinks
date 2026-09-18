@@ -463,6 +463,8 @@ enum CameraConnectionError: LocalizedError {
             switch code {
             case 0x200a:
                 return "当前相机或拍摄模式不支持该参数。"
+            case 0x200d:
+                return "照片已锁定，无法执行删除操作。"
             case 0x2019:
                 return "相机正忙，请稍后重试。"
             case 0x201a:
