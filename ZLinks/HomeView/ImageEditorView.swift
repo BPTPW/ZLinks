@@ -3,9 +3,9 @@
 //  ZLinks
 //
 
-import ImageIO
 import CoreImage
 import CoreImage.CIFilterBuiltins
+import ImageIO
 import MetalKit
 import SwiftUI
 import UIKit
@@ -232,7 +232,7 @@ private struct HistogramCanvas: View {
 
 private enum HistogramCalculator {
     // CIContext is thread-safe and reusing it avoids initialization on every slider tick.
-    nonisolated private static let context = CIContext(options: [.cacheIntermediates: false])
+    private nonisolated static let context = CIContext(options: [.cacheIntermediates: false])
 
     nonisolated static func calculate(
         image: UIImage,
@@ -243,7 +243,7 @@ private enum HistogramCalculator {
         guard let source = ImageEditPipeline.sourceImage(
             uiImage: image,
             sourceURL: sourceURL,
-            maximumPixelSize: 1_024
+            maximumPixelSize: 1024
         ) else { return .empty }
 
         let adjusted = ImageEditPipeline.adjustedImage(source, recipe: recipe, rawDefaults: rawDefaults)
@@ -570,6 +570,7 @@ private enum AdjustmentSection: String, CaseIterable, Identifiable {
         case .color: return "颜色"
         }
     }
+
     var systemImage: String {
         switch self {
         case .brightness: return "lightbulb.max"
@@ -1228,7 +1229,7 @@ struct ImageEditorView: View {
                   [
                       kCGImageSourceCreateThumbnailFromImageAlways: true,
                       kCGImageSourceCreateThumbnailWithTransform: true,
-                      kCGImageSourceThumbnailMaxPixelSize: 4_096
+                      kCGImageSourceThumbnailMaxPixelSize: 4096
                   ] as CFDictionary
               )
         else { return nil }

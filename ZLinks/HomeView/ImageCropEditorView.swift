@@ -73,7 +73,7 @@ struct ImageCropEditorView: View {
             Path { path in
                 guard !cropFrame.isEmpty else { return }
                 path.addRect(cropFrame)
-                for step in 1...2 {
+                for step in 1 ... 2 {
                     let fraction = CGFloat(step) / 3
                     let x = cropFrame.minX + cropFrame.width * fraction
                     let y = cropFrame.minY + cropFrame.height * fraction
