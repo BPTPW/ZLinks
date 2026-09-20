@@ -160,20 +160,15 @@ private enum ImageEditPipeline {
         controls.saturation = 1
         result = controls.outputImage ?? result
 
-        if abs(recipe.contrastBase) > 0.001 || abs(recipe.whites) > 0.001 || abs(recipe.blacks) > 0.001 {
+        if abs(recipe.contrastBase) > 0.001 {
             let curve = CIFilter.toneCurve()
             curve.inputImage = result
-            let base = CGFloat(recipe.contrastBase) / 200
-            let black = max(CGFloat.zero, min(1, CGFloat(recipe.blacks) / 200))
-            let white = max(CGFloat.zero, min(1, 1 + CGFloat(recipe.whites) / 200))
-            let point1 = max(CGFloat.zero, min(1, 0.25 + base * 0.5 + black))
-            let point2 = max(CGFloat.zero, min(1, 0.5 + base))
-            let point3 = max(CGFloat.zero, min(1, 0.75 + base * 0.5))
-            curve.point0 = CGPoint(x: 0, y: black)
-            curve.point1 = CGPoint(x: 0.25, y: point1)
-            curve.point2 = CGPoint(x: 0.5, y: point2)
-            curve.point3 = CGPoint(x: 0.75, y: point3)
-            curve.point4 = CGPoint(x: 1, y: white)
+            let amount = CGFloat(recipe.contrastBase) / 100 * 0.15
+            curve.point0 = CGPoint(x: 0, y: 0)
+            curve.point1 = CGPoint(x: 0.25, y: 0.25 - amount)
+            curve.point2 = CGPoint(x: 0.5, y: 0.5)
+            curve.point3 = CGPoint(x: 0.75, y: 0.75 + amount)
+            curve.point4 = CGPoint(x: 1, y: 1)
             result = curve.outputImage ?? result
         }
 
@@ -183,6 +178,26 @@ private enum ImageEditPipeline {
             filter.highlightAmount = max(0, min(1, 1 - recipe.highlights / 100))
             filter.shadowAmount = max(-1, min(1, recipe.shadows / 100))
             result = filter.outputImage ?? result
+        }
+
+        // Whites and blacks are endpoint tonal-range controls rather than
+        // white/black point clipping. Moving the inner quarter points makes
+        // both directions useful while keeping most midtones unchanged.
+        if abs(recipe.whites) > 0.001 || abs(recipe.blacks) > 0.001 {
+            let curve = CIFilter.toneCurve()
+            curve.inputImage = result
+
+            let whites = CGFloat(max(-100, min(100, recipe.whites))) / 100
+            let blacks = CGFloat(max(-100, min(100, recipe.blacks))) / 100
+            let blackEndpoint = max(0, blacks) * 0.08
+            let whiteEndpoint = 1 + min(0, whites) * 0.08
+
+            curve.point0 = CGPoint(x: 0, y: blackEndpoint)
+            curve.point1 = CGPoint(x: 0.25, y: 0.25 + blacks * 0.18)
+            curve.point2 = CGPoint(x: 0.5, y: 0.5)
+            curve.point3 = CGPoint(x: 0.75, y: 0.75 + whites * 0.18)
+            curve.point4 = CGPoint(x: 1, y: whiteEndpoint)
+            result = curve.outputImage ?? result
         }
 
         let neutralTemperature = rawDefaults?.temperature ?? 6500
