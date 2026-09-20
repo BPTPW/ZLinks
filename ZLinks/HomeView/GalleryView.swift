@@ -967,6 +967,10 @@ private struct GalleryPreviewView: View {
     @State private var protectionOverride: Bool?
     @State private var isProtectionChanging = false
     @State private var protectionError: String?
+    @State private var isEditOriginalTransferring = false
+    @State private var editTransferProgress: Double?
+    @State private var editAsset: ImageEditorAsset?
+    @State private var editError: String?
 
     var body: some View {
         GeometryReader { proxy in
@@ -1121,6 +1125,29 @@ private struct GalleryPreviewView: View {
                                     }
                                     .buttonStyle(.plain)
                                     .accessibilityLabel("照片信息")
+
+                                    Button(action: beginEditing) {
+                                        if isEditOriginalTransferring {
+                                            if let editTransferProgress {
+                                                ProgressView(value: editTransferProgress)
+                                                    .progressViewStyle(.circular)
+                                                    .tint(.primary)
+                                                    .frame(width: 50, height: 50)
+                                            } else {
+                                                ProgressView()
+                                                    .tint(.primary)
+                                                    .frame(width: 50, height: 50)
+                                            }
+                                        } else {
+                                            Image(systemName: "slider.horizontal.3")
+                                                .font(.title2)
+                                                .foregroundStyle(.primary)
+                                                .frame(width: 50, height: 50)
+                                        }
+                                    }
+                                    .buttonStyle(.plain)
+                                    .disabled(isEditOriginalTransferring || isDeleting)
+                                    .accessibilityLabel(isEditOriginalTransferring ? "正在传输原图" : "编辑照片")
                                 }
                                 .glassEffect(.regular.interactive(), in: .capsule)
                             }
@@ -1160,6 +1187,12 @@ private struct GalleryPreviewView: View {
                 .presentationDragIndicator(.visible)
                 .task { await loadMetadata() }
             }
+            .fullScreenCover(item: $editAsset) { asset in
+                ImageEditorView(
+                    asset: asset,
+                    fallbackImage: image ?? thumbnail
+                )
+            }
             .alert("从相机删除1张照片", isPresented: $isDeleteConfirmationPresented) {
                 Button("删除", role: .destructive) {
                     isDeleteConfirmationPresented = false
@@ -1176,6 +1209,11 @@ private struct GalleryPreviewView: View {
             } message: {
                 Text(protectionError ?? "相机未能更改照片的锁定状态。")
             }
+            .alert("无法打开编辑器", isPresented: editErrorPresented) {
+                Button("好", role: .cancel) { editError = nil }
+            } message: {
+                Text(editError ?? "原图传输失败，请稍后重试。")
+            }
         }
     }
 
@@ -1185,6 +1223,13 @@ private struct GalleryPreviewView: View {
         Binding(
             get: { protectionError != nil },
             set: { if !$0 { protectionError = nil } }
+        )
+    }
+
+    private var editErrorPresented: Binding<Bool> {
+        Binding(
+            get: { editError != nil },
+            set: { if !$0 { editError = nil } }
         )
     }
 
@@ -1203,6 +1248,60 @@ private struct GalleryPreviewView: View {
             }
             isProtectionChanging = false
         }
+    }
+
+    private func beginEditing() {
+        guard !isEditOriginalTransferring else { return }
+
+        let source: (handle: UInt32, filename: String)?
+        if let handle = item.rawHandle, let filename = item.rawFilename {
+            source = (handle, filename)
+        } else if let handle = item.jpegHandle, let filename = item.jpegFilename {
+            source = (handle, filename)
+        } else {
+            source = nil
+        }
+
+        guard let source else {
+            editError = "这张照片没有可传输的原始文件。"
+            return
+        }
+
+        isEditOriginalTransferring = true
+        editTransferProgress = nil
+
+        Task {
+            do {
+                let data = try await camera.objectData(for: source.handle) { received, total in
+                    guard total > 0 else { return }
+                    editTransferProgress = min(Double(received) / Double(total), 1)
+                }
+                let url = try saveEditOriginal(
+                    data,
+                    handle: source.handle,
+                    filename: source.filename
+                )
+                isEditOriginalTransferring = false
+                editTransferProgress = nil
+                editAsset = ImageEditorAsset(url: url)
+            } catch {
+                isEditOriginalTransferring = false
+                editTransferProgress = nil
+                editError = error.localizedDescription
+            }
+        }
+    }
+
+    private func saveEditOriginal(_ data: Data, handle: UInt32, filename: String) throws -> URL {
+        let fileManager = FileManager.default
+        let directory = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("GalleryEdits", isDirectory: true)
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let safeFilename = URL(fileURLWithPath: filename).lastPathComponent
+        let url = directory.appendingPathComponent("\(handle)-\(safeFilename)")
+        try data.write(to: url, options: .atomic)
+        return url
     }
 
     private var isAnyDownloadQueued: Bool {
