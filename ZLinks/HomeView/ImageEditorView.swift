@@ -16,14 +16,289 @@ struct ImageEditorAsset: Identifiable {
 }
 
 private extension URL {
-    var isRawImage: Bool {
+    nonisolated var isRawImage: Bool {
         ["nef", "nrw", "arw", "cr2", "cr3", "dng", "raf", "orf", "rw2"].contains(pathExtension.lowercased())
     }
 }
 
-private struct RawAdjustmentDefaults: Equatable {
+private struct RawAdjustmentDefaults: Sendable {
     let temperature: Float
     let tint: Float
+}
+
+private struct HistogramData: Equatable, Sendable {
+    nonisolated static let empty = HistogramData(red: [], green: [], blue: [], luminance: [])
+
+    let red: [Float]
+    let green: [Float]
+    let blue: [Float]
+    let luminance: [Float]
+
+    var isEmpty: Bool { red.isEmpty }
+}
+
+private enum HistogramChannel: CaseIterable {
+    case red
+    case green
+    case blue
+    case luminance
+    case all
+
+    var title: String {
+        switch self {
+        case .red: return "红"
+        case .green: return "绿"
+        case .blue: return "蓝"
+        case .luminance: return "RGB"
+        case .all: return "全部"
+        }
+    }
+
+    var next: HistogramChannel {
+        switch self {
+        case .all: return .red
+        case .red: return .green
+        case .green: return .blue
+        case .blue: return .luminance
+        case .luminance: return .all
+        }
+    }
+}
+
+private struct HistogramRequest: Equatable {
+    let imageID: ObjectIdentifier
+    let revision: Int
+    let recipe: EditRecipe
+    let sourcePath: String?
+}
+
+private struct HistogramCalculationInput: @unchecked Sendable {
+    let image: UIImage
+    let sourceURL: URL?
+    let recipe: EditRecipe
+    let rawDefaults: RawAdjustmentDefaults?
+}
+
+private actor HistogramProcessor {
+    private var pendingInput: HistogramCalculationInput?
+    private var isProcessing = false
+
+    func submit(
+        _ input: HistogramCalculationInput,
+        onResult: @MainActor @Sendable @escaping (HistogramData) -> Void
+    ) async {
+        pendingInput = input
+        guard !isProcessing else { return }
+
+        isProcessing = true
+        while let nextInput = pendingInput {
+            pendingInput = nil
+            let result = HistogramCalculator.calculate(
+                image: nextInput.image,
+                sourceURL: nextInput.sourceURL,
+                recipe: nextInput.recipe,
+                rawDefaults: nextInput.rawDefaults
+            )
+            await onResult(result)
+        }
+        isProcessing = false
+    }
+}
+
+private struct HistogramOverlay: View {
+    let image: UIImage
+    let sourceURL: URL?
+    let recipe: EditRecipe
+    let rawDefaults: RawAdjustmentDefaults?
+    let revision: Int
+
+    @State private var data = HistogramData.empty
+    @State private var channel: HistogramChannel = .all
+    @State private var isLarge = false
+    @State private var processor = HistogramProcessor()
+
+    private var canvasSize: CGSize {
+        isLarge
+            ? CGSize(width: 224, height: 142)
+            : CGSize(width: 148, height: 92)
+    }
+
+    private var request: HistogramRequest {
+        HistogramRequest(
+            imageID: ObjectIdentifier(image),
+            revision: revision,
+            recipe: recipe,
+            sourcePath: sourceURL?.path
+        )
+    }
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            Button {
+                channel = channel.next
+            } label: {
+                HistogramCanvas(data: data, channel: channel)
+                    .frame(width: canvasSize.width, height: canvasSize.height)
+                    .padding(8)
+                    .background(.black.opacity(0.64), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .stroke(.white.opacity(0.16), lineWidth: 0.5)
+                    }
+                    .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("切换直方图通道")
+            .accessibilityValue(channel.title)
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    isLarge.toggle()
+                }
+            } label: {
+                Image(systemName: isLarge
+                    ? "arrow.down.right.and.arrow.up.left"
+                    : "arrow.up.left.and.arrow.down.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 32, height: 32)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(isLarge ? "缩小直方图" : "放大直方图")
+            .padding(1)
+        }
+        .task(id: request) {
+            let input = HistogramCalculationInput(
+                image: image,
+                sourceURL: sourceURL,
+                recipe: recipe,
+                rawDefaults: rawDefaults
+            )
+            await processor.submit(input) { result in
+                data = result
+            }
+        }
+    }
+}
+
+private struct HistogramCanvas: View {
+    let data: HistogramData
+    let channel: HistogramChannel
+
+    var body: some View {
+        Canvas { context, size in
+            guard !data.isEmpty else { return }
+
+            let plotRect = CGRect(x: 0, y: 0, width: size.width, height: size.height)
+            let curves: [(values: [Float], color: Color)]
+            switch channel {
+            case .red:
+                curves = [(data.red, .red)]
+            case .green:
+                curves = [(data.green, .green)]
+            case .blue:
+                curves = [(data.blue, .blue)]
+            case .luminance:
+                curves = [(data.luminance, .white)]
+            case .all:
+                curves = [(data.red, .red), (data.green, .green), (data.blue, .blue), (data.luminance, .white)]
+            }
+
+            let populatedBins = curves
+                .flatMap(\.values)
+                .filter { $0 > 0 }
+                .sorted()
+            let scaleIndex = Int((Double(max(populatedBins.count - 1, 0)) * 0.99).rounded(.down))
+            let maximum = max(populatedBins.isEmpty ? 1 : populatedBins[scaleIndex], 0.000001)
+            for curve in curves {
+                var path = Path()
+                for (index, value) in curve.values.enumerated() {
+                    let x = plotRect.minX + plotRect.width * CGFloat(index) / CGFloat(max(curve.values.count - 1, 1))
+                    let normalized = min(1, CGFloat(value / maximum))
+                    let y = plotRect.maxY - normalized * plotRect.height
+                    if index == 0 {
+                        path.move(to: CGPoint(x: x, y: y))
+                    } else {
+                        path.addLine(to: CGPoint(x: x, y: y))
+                    }
+                }
+                context.stroke(path, with: .color(curve.color), style: StrokeStyle(lineWidth: 1.55, lineCap: .round, lineJoin: .round))
+            }
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+private enum HistogramCalculator {
+    // CIContext is thread-safe and reusing it avoids initialization on every slider tick.
+    nonisolated private static let context = CIContext(options: [.cacheIntermediates: false])
+
+    nonisolated static func calculate(
+        image: UIImage,
+        sourceURL: URL?,
+        recipe: EditRecipe,
+        rawDefaults: RawAdjustmentDefaults?
+    ) -> HistogramData {
+        guard let source = ImageEditPipeline.sourceImage(
+            uiImage: image,
+            sourceURL: sourceURL,
+            maximumPixelSize: 1_024
+        ) else { return .empty }
+
+        let adjusted = ImageEditPipeline.adjustedImage(source, recipe: recipe, rawDefaults: rawDefaults)
+        let extent = adjusted.extent.integral
+        guard extent.width > 0, extent.height > 0 else { return .empty }
+
+        let sampleLongEdge: CGFloat = 512
+        let scale = min(1, sampleLongEdge / max(extent.width, extent.height))
+        let width = max(1, Int((extent.width * scale).rounded(.up)))
+        let height = max(1, Int((extent.height * scale).rounded(.up)))
+        let sampleBounds = CGRect(x: 0, y: 0, width: width, height: height)
+        let sampledImage = adjusted
+            .transformed(by: CGAffineTransform(translationX: -extent.minX, y: -extent.minY))
+            .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+            .cropped(to: sampleBounds)
+
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        pixels.withUnsafeMutableBytes { buffer in
+            guard let baseAddress = buffer.baseAddress else { return }
+            context.render(
+                sampledImage,
+                toBitmap: baseAddress,
+                rowBytes: width * 4,
+                bounds: sampleBounds,
+                format: .RGBA8,
+                colorSpace: CGColorSpaceCreateDeviceRGB()
+            )
+        }
+
+        let count = 256
+        var red = [Float](repeating: 0, count: count)
+        var green = red
+        var blue = red
+        var luminance = red
+        for offset in stride(from: 0, to: pixels.count, by: 4) {
+            let alpha = pixels[offset + 3]
+            guard alpha > 0 else { continue }
+
+            let redValue = pixels[offset]
+            let greenValue = pixels[offset + 1]
+            let blueValue = pixels[offset + 2]
+            let luminanceValue = Int(
+                (Float(redValue) * 0.2126
+                    + Float(greenValue) * 0.7152
+                    + Float(blueValue) * 0.0722).rounded()
+            )
+
+            let weight = Float(alpha) / 255
+            red[Int(redValue)] += weight
+            green[Int(greenValue)] += weight
+            blue[Int(blueValue)] += weight
+            luminance[min(255, luminanceValue)] += weight
+        }
+        return HistogramData(red: red, green: green, blue: blue, luminance: luminance)
+    }
 }
 
 private struct AdjustmentPreview: UIViewRepresentable {
@@ -129,7 +404,7 @@ private struct AdjustmentPreview: UIViewRepresentable {
 }
 
 private enum ImageEditPipeline {
-    static func sourceImage(uiImage: UIImage, sourceURL: URL?, maximumPixelSize: CGFloat) -> CIImage? {
+    nonisolated static func sourceImage(uiImage: UIImage, sourceURL: URL?, maximumPixelSize: CGFloat) -> CIImage? {
         if let sourceURL, sourceURL.isRawImage, let raw = CIRAWFilter(imageURL: sourceURL) {
             raw.isDraftModeEnabled = true
             let nativeLongEdge = max(raw.nativeSize.width, raw.nativeSize.height)
@@ -139,7 +414,7 @@ private enum ImageEditPipeline {
         return CIImage(image: uiImage, options: [.applyOrientationProperty: true])
     }
 
-    static func adjustedImage(
+    nonisolated static func adjustedImage(
         _ image: CIImage,
         recipe: EditRecipe,
         rawDefaults: RawAdjustmentDefaults?
@@ -175,9 +450,26 @@ private enum ImageEditPipeline {
         if abs(recipe.highlights) > 0.001 || abs(recipe.shadows) > 0.001 {
             let filter = CIFilter.highlightShadowAdjust()
             filter.inputImage = result
-            filter.highlightAmount = max(0, min(1, 1 - recipe.highlights / 100))
+            // Core Image's highlightAmount only supports reducing highlights
+            // from its identity value of 1. Positive values are lifted below.
+            let highlights = recipe.highlights / 100
+            filter.highlightAmount = highlights < 0
+                ? max(0.3, 1 + highlights * 0.7)
+                : 1
             filter.shadowAmount = max(-1, min(1, recipe.shadows / 100))
             result = filter.outputImage ?? result
+
+            if recipe.highlights > 0.001 {
+                let curve = CIFilter.toneCurve()
+                curve.inputImage = result
+                let amount = CGFloat(min(100, recipe.highlights)) / 100 * 0.12
+                curve.point0 = CGPoint(x: 0, y: 0)
+                curve.point1 = CGPoint(x: 0.25, y: 0.25)
+                curve.point2 = CGPoint(x: 0.5, y: 0.5)
+                curve.point3 = CGPoint(x: 0.75, y: 0.75 + amount)
+                curve.point4 = CGPoint(x: 1, y: 1 + amount * 0.35)
+                result = curve.outputImage ?? result
+            }
         }
 
         // Whites and blacks are endpoint tonal-range controls rather than
@@ -221,7 +513,7 @@ private enum ImageEditPipeline {
         return result
     }
 
-    static func previewImage(_ image: CIImage, drawableSize: CGSize) -> CIImage {
+    nonisolated static func previewImage(_ image: CIImage, drawableSize: CGSize) -> CIImage {
         let bounds = CGRect(origin: .zero, size: drawableSize).integral
         let extent = image.extent.integral
         guard extent.width > 0, extent.height > 0 else { return image }
@@ -253,7 +545,7 @@ private enum ImageEditPipeline {
 
 /// The complete edit state. Values exposed to the controls use the familiar
 /// -100...100 range; the renderer maps them to Core Image's native ranges.
-struct EditRecipe: Codable, Equatable {
+struct EditRecipe: Codable, Equatable, Sendable {
     var exposure: Float = 0
     var brightness: Float = 0
     var contrast: Float = 0
@@ -430,13 +722,27 @@ struct ImageEditorView: View {
                 )
                 .transition(.opacity)
             } else if selectedTool == .adjustments {
-                AdjustmentPreview(
-                    image: croppedPreview ?? image,
-                    sourceURL: usesRawSource && croppedPreview == nil ? asset.url : nil,
-                    recipe: editRecipe,
-                    rawDefaults: rawAdjustmentDefaults
-                )
-                .padding(.horizontal, 18)
+                let previewImage = croppedPreview ?? image
+                let previewSourceURL = usesRawSource && croppedPreview == nil ? asset.url : nil
+                ZStack(alignment: .topLeading) {
+                    AdjustmentPreview(
+                        image: previewImage,
+                        sourceURL: previewSourceURL,
+                        recipe: editRecipe,
+                        rawDefaults: rawAdjustmentDefaults
+                    )
+                    .padding(.horizontal, 18)
+
+                    HistogramOverlay(
+                        image: previewImage,
+                        sourceURL: previewSourceURL,
+                        recipe: editRecipe,
+                        rawDefaults: rawAdjustmentDefaults,
+                        revision: cropRevision
+                    )
+                    .padding(.leading, 27)
+                    .padding(.top, 16)
+                }
                 .transition(.opacity)
             } else {
                 Image(uiImage: croppedPreview ?? ImageEditRenderer.crop(image, to: normalizedCrop))
