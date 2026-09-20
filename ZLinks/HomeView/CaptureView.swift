@@ -527,18 +527,22 @@ private struct CaptureFullscreenMonitor: View {
                     .ignoresSafeArea()
 
                 fullscreenCanvas(for: proxy.size)
-                    .frame(width: proxy.size.height, height: proxy.size.width)
-                    .rotationEffect(.degrees(90))
                     .frame(width: proxy.size.width, height: proxy.size.height)
             }
         }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
+        .onAppear {
+            AppOrientationController.allow(.landscape)
+        }
+        .onDisappear {
+            AppOrientationController.allow(.portrait)
+        }
     }
 
     @ViewBuilder
     private func fullscreenCanvas(for screenSize: CGSize) -> some View {
-        let canvasSize = CGSize(width: screenSize.height, height: screenSize.width)
+        let canvasSize = screenSize
         let sideColumnMinWidth: CGFloat = 120
         let availablePreviewWidth = max(
             0,
