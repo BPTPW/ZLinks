@@ -1,3 +1,9 @@
 {
-    "conventionalCommits.scopes": ["有线连接", "我的相机", "图库", "拍摄"]
+    "conventionalCommits.scopes": [
+        "有线连接",
+        "我的相机",
+        "图库",
+        "拍摄",
+        "图像编辑"
+    ]
 }
