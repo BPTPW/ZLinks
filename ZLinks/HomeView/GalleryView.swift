@@ -21,6 +21,7 @@ struct GalleryView: View {
     @State private var thumbnailImages: [UInt32: UIImage] = [:]
     @State private var thumbnailSourceHandles: [UInt32: UInt32] = [:]
     @State private var failedThumbnails: Set<UInt32> = []
+    @State private var forceRefreshThumbnailHandles: Set<UInt32> = []
     @State private var visibleHandles: Set<UInt32> = []
     @State private var isThumbnailPumpRunning = false
     @State private var selectedDirectoryID: UInt32?
@@ -706,10 +707,13 @@ struct GalleryView: View {
             thumbnailSourceHandles = [:]
             failedThumbnails = []
             visibleHandles = []
+            forceRefreshThumbnailHandles = []
             selectedDirectoryID = nil
             loadError = nil
             return
         }
+
+        ThumbnailCacheService.shared.prepareForThumbnailWork()
 
         if !force, !camera.galleryItems.isEmpty, !camera.galleryDirectories.isEmpty {
             selectedDirectoryID = camera.selectedGalleryDirectoryID
@@ -721,14 +725,25 @@ struct GalleryView: View {
         thumbnailImages = [:]
         thumbnailSourceHandles = [:]
         failedThumbnails = []
+        forceRefreshThumbnailHandles = []
+        if force {
+            camera.invalidateThumbnailMemoryCache()
+        }
 
         await camera.refreshGallery(selectingDirectoryID: selectedDirectoryID)
         selectedDirectoryID = camera.selectedGalleryDirectoryID
+
+        if force {
+            forceRefreshThumbnailHandles = Set(
+                camera.galleryItems.map(\.thumbnailHandle)
+            )
+        }
 
         let validHandles = Set(camera.galleryItems.flatMap { item in
             [item.handle, item.rawHandle, item.jpegHandle].compactMap { $0 }
         })
         visibleHandles = visibleHandles.filter { validHandles.contains($0) }
+        forceRefreshThumbnailHandles.formIntersection(validHandles)
 
         if camera.galleryDirectories.isEmpty {
             loadError = nil
@@ -772,6 +787,7 @@ struct GalleryView: View {
         thumbnailSourceHandles = [:]
         failedThumbnails = []
         visibleHandles = []
+        forceRefreshThumbnailHandles = []
 
         await camera.selectGalleryDirectory(id: directoryID)
         selectedDirectoryID = camera.selectedGalleryDirectoryID
@@ -824,7 +840,8 @@ struct GalleryView: View {
             if thumbnailSourceHandles[readyItem.handle] == sourceHandle
                 || failedThumbnails.contains(sourceHandle) { continue }
 
-            if let image = await camera.thumbnailImage(for: sourceHandle) {
+            let forceRefresh = forceRefreshThumbnailHandles.contains(sourceHandle)
+            if let image = await camera.thumbnailImage(for: sourceHandle, forceRefresh: forceRefresh) {
                 guard !isRefreshing, !isDeletingGallery else { break }
                 guard let current = camera.galleryItems.first(where: { $0.handle == readyItem.handle }),
                       current.thumbnailHandle == sourceHandle,
@@ -833,9 +850,11 @@ struct GalleryView: View {
                     thumbnailImages[current.handle] = image
                     thumbnailSourceHandles[current.handle] = sourceHandle
                 }
+                forceRefreshThumbnailHandles.remove(sourceHandle)
                 await Task.yield()
             } else if visibleHandles.contains(readyItem.handle) {
                 failedThumbnails.insert(sourceHandle)
+                forceRefreshThumbnailHandles.remove(sourceHandle)
             }
         }
     }
@@ -1928,6 +1947,7 @@ private final class GalleryDownloadStore: ObservableObject {
     struct TaskItem: Identifiable {
         let id: String
         let handle: UInt32
+        let thumbnailHandle: UInt32
         let filename: String
         var fileSize: UInt64
         let format: GalleryDownloadFormat
@@ -1943,6 +1963,7 @@ private final class GalleryDownloadStore: ObservableObject {
     private struct PersistedTask: Codable {
         let id: String
         let handle: UInt32
+        let thumbnailHandle: UInt32
         let filename: String
         let fileSize: UInt64
         let format: GalleryDownloadFormat
@@ -1955,6 +1976,7 @@ private final class GalleryDownloadStore: ObservableObject {
         init(
             id: String,
             handle: UInt32,
+            thumbnailHandle: UInt32,
             filename: String,
             fileSize: UInt64,
             format: GalleryDownloadFormat,
@@ -1966,6 +1988,7 @@ private final class GalleryDownloadStore: ObservableObject {
         ) {
             self.id = id
             self.handle = handle
+            self.thumbnailHandle = thumbnailHandle
             self.filename = filename
             self.fileSize = fileSize
             self.format = format
@@ -1980,6 +2003,7 @@ private final class GalleryDownloadStore: ObservableObject {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             id = try container.decode(String.self, forKey: .id)
             handle = try container.decode(UInt32.self, forKey: .handle)
+            thumbnailHandle = try container.decodeIfPresent(UInt32.self, forKey: .thumbnailHandle) ?? handle
             filename = try container.decode(String.self, forKey: .filename)
             fileSize = try container.decode(UInt64.self, forKey: .fileSize)
             format = try container.decode(GalleryDownloadFormat.self, forKey: .format)
@@ -2020,9 +2044,16 @@ private final class GalleryDownloadStore: ObservableObject {
         self.camera = camera
         for download in downloads where !contains(handle: download.handle, format: download.format) {
             let thumbnailURL = await saveThumbnail(for: download, camera: camera)
+            if thumbnailURL != nil {
+                ThumbnailCacheService.shared.registerOwner(
+                    handle: download.thumbnailHandle,
+                    ownerID: "download:\(download.id)"
+                )
+            }
             items.append(TaskItem(
                 id: download.id,
                 handle: download.handle,
+                thumbnailHandle: download.thumbnailHandle,
                 filename: download.filename,
                 fileSize: download.fileSize,
                 format: download.format,
@@ -2067,7 +2098,10 @@ private final class GalleryDownloadStore: ObservableObject {
     func delete(_ id: String) {
         guard let index = items.firstIndex(where: { $0.id == id }) else { return }
         items[index].task?.cancel()
-        if let url = items[index].thumbnailURL { try? FileManager.default.removeItem(at: url) }
+        ThumbnailCacheService.shared.unregisterOwner(
+            handle: items[index].thumbnailHandle,
+            ownerID: "download:\(items[index].id)"
+        )
         items.remove(at: index)
         persistTasks()
     }
@@ -2153,14 +2187,16 @@ private final class GalleryDownloadStore: ObservableObject {
     }
 
     private func saveThumbnail(for download: GalleryDownload, camera: CameraConnectionService) async -> URL? {
+        ThumbnailCacheService.shared.prepareForThumbnailWork()
         guard let image = await camera.thumbnailImage(for: download.thumbnailHandle),
               let data = image.jpegData(compressionQuality: 0.82)
         else { return nil }
-        let directory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("GalleryDownloadThumbnails", isDirectory: true)
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let url = directory.appendingPathComponent(download.id.replacingOccurrences(of: "/", with: "_") + ".jpg")
-        do { try data.write(to: url, options: .atomic); return url } catch { return nil }
+        return ThumbnailCacheService.shared.storeThumbnail(
+            data,
+            handle: download.thumbnailHandle,
+            ownerID: "download:\(download.id)",
+            persistWhenDisabled: true
+        )
     }
 
     private func loadPersistedTasks() {
@@ -2170,17 +2206,43 @@ private final class GalleryDownloadStore: ObservableObject {
 
         let expiration = Date().addingTimeInterval(-7 * 24 * 60 * 60)
         items = saved.compactMap { task in
+            let ownerID = "download:\(task.id)"
             if task.status == .completed && task.addedAt < expiration {
-                if let path = task.thumbnailPath { try? FileManager.default.removeItem(atPath: path) }
+                ThumbnailCacheService.shared.unregisterOwner(handle: task.thumbnailHandle, ownerID: ownerID)
+                if let path = task.thumbnailPath, !ThumbnailCacheService.shared.isManagedURL(URL(fileURLWithPath: path)) {
+                    try? FileManager.default.removeItem(atPath: path)
+                }
                 return nil
+            }
+
+            var thumbnailURL = task.thumbnailPath.map(URL.init(fileURLWithPath:))
+            if let legacyURL = thumbnailURL,
+               !ThumbnailCacheService.shared.isManagedURL(legacyURL),
+               let data = try? Data(contentsOf: legacyURL),
+               let migratedURL = ThumbnailCacheService.shared.storeThumbnail(
+                   data,
+                   handle: task.thumbnailHandle,
+                   ownerID: ownerID,
+                   persistWhenDisabled: true
+               )
+            {
+                thumbnailURL = migratedURL
+                try? FileManager.default.removeItem(at: legacyURL)
+            } else {
+                ThumbnailCacheService.shared.registerOwner(
+                    handle: task.thumbnailHandle,
+                    ownerID: ownerID,
+                    url: thumbnailURL
+                )
             }
             return TaskItem(
                 id: task.id,
                 handle: task.handle,
+                thumbnailHandle: task.thumbnailHandle,
                 filename: task.filename,
                 fileSize: task.fileSize,
                 format: task.format,
-                thumbnailURL: task.thumbnailPath.map(URL.init(fileURLWithPath:)),
+                thumbnailURL: thumbnailURL,
                 status: task.status == .downloading ? .waiting : task.status,
                 receivedBytes: task.status == .downloading ? 0 : task.receivedBytes,
                 addedAt: task.addedAt,
@@ -2201,6 +2263,7 @@ private final class GalleryDownloadStore: ObservableObject {
             PersistedTask(
                 id: $0.id,
                 handle: $0.handle,
+                thumbnailHandle: $0.thumbnailHandle,
                 filename: $0.filename,
                 fileSize: $0.fileSize,
                 format: $0.format,

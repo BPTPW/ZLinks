@@ -1529,15 +1529,30 @@ final class CameraConnectionService: ObservableObject {
         }
     }
 
-    func thumbnailImage(for handle: UInt32) async -> UIImage? {
-        if let cached = thumbnailCache[handle], let image = UIImage(data: cached) {
+    func invalidateThumbnailMemoryCache() {
+        thumbnailCache = [:]
+    }
+
+    func thumbnailImage(for handle: UInt32, forceRefresh: Bool = false) async -> UIImage? {
+        if !forceRefresh,
+           let cached = thumbnailCache[handle],
+           let image = UIImage(data: cached)
+        {
+            return image
+        }
+
+        if !forceRefresh,
+           let cached = ThumbnailCacheService.shared.loadThumbnail(handle: handle),
+           let image = UIImage(data: cached)
+        {
+            thumbnailCache[handle] = cached
             return image
         }
 
         if linkKind == .usb, usbLink.hasObject(handle: handle) {
             do {
                 if let data = try await usbLink.thumbnailData(forHandle: handle) {
-                    thumbnailCache[handle] = data
+                    cacheThumbnailData(data, handle: handle)
                     return UIImage(data: data)
                 }
                 appendLog("[图库] USB 缩略图为空 handle=0x\(String(format: "%08X", handle))")
@@ -1570,11 +1585,18 @@ final class CameraConnectionService: ObservableObject {
                 )
                 return nil
             }
-            thumbnailCache[handle] = data
+            cacheThumbnailData(data, handle: handle)
             return UIImage(data: data)
         } catch {
             appendLog("[图库] 缩略图异常 \(galleryItemLabel(handle: handle, filename: filename)) error=\(error.localizedDescription)")
             return nil
+        }
+    }
+
+    private func cacheThumbnailData(_ data: Data, handle: UInt32) {
+        thumbnailCache[handle] = data
+        if ThumbnailCacheService.shared.isEnabled {
+            _ = ThumbnailCacheService.shared.storeThumbnail(data, handle: handle)
         }
     }
 
@@ -3369,11 +3391,11 @@ final class CameraConnectionService: ObservableObject {
             id: handle,
             filename: info.filename,
             objectFormat: info.objectFormat,
-                    fileSize: info.fileSize,
-                    isVideo: isVideo,
-                    captureDate: record.captureDate ?? info.captureDate ?? info.modificationDate,
-                    protectionStatus: info.protectionStatus,
-                    rawHandle: isRAW ? handle : nil,
+            fileSize: info.fileSize,
+            isVideo: isVideo,
+            captureDate: record.captureDate ?? info.captureDate ?? info.modificationDate,
+            protectionStatus: info.protectionStatus,
+            rawHandle: isRAW ? handle : nil,
             rawFilename: isRAW ? info.filename : nil,
             rawFileSize: isRAW ? info.fileSize : nil,
             jpegHandle: !isVideo && !isRAW ? handle : nil,
