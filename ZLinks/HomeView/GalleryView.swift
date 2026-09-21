@@ -15,6 +15,7 @@ import UniformTypeIdentifiers
 struct GalleryView: View {
     @EnvironmentObject private var camera: CameraConnectionService
     @StateObject private var downloadStore = GalleryDownloadStore()
+    @ObservedObject private var editedStore = EditedImageStore.shared
 
     @State private var isRefreshing = false
     @State private var loadError: String?
@@ -187,7 +188,7 @@ struct GalleryView: View {
                         Task { await startTransfer(item: item, format: format) }
                     },
                     isDownloadQueued: { format in
-                        downloadStore.contains(handle: item.handle, format: format)
+                        downloadStore.contains(item: item, format: format)
                     },
                     onDelete: {
                         await deleteGalleryItems([item], dismissPreview: true)
@@ -447,6 +448,14 @@ struct GalleryView: View {
                         Label("下载 JPEG", systemImage: "j.square")
                     }
                 }
+                if editedRecord(for: item) != nil {
+                    Button {
+                        Task { await startTransfer(item: item, format: .editedJPEG) }
+                    } label: {
+                        Label("保存调整后JPEG", systemImage: "pencil.circle")
+                    }
+                    .disabled(downloadStore.contains(item: item, format: .editedJPEG))
+                }
             }
             if !item.isVideo {
                 Button(role: .destructive) {
@@ -609,6 +618,10 @@ struct GalleryView: View {
         format: GalleryDownloadFormat,
         fallbackToOtherFormat: Bool
     ) -> GalleryDownload? {
+        if format == .editedJPEG {
+            return makeEditedJPEGDownload(for: item)
+        }
+
         var requestedFormat = format
         if requestedFormat == .raw && item.rawHandle == nil {
             guard fallbackToOtherFormat, item.jpegHandle != nil else { return nil }
@@ -632,6 +645,8 @@ struct GalleryView: View {
             handle = jpegHandle
             filename = jpegFilename
             fileSize = item.jpegFileSize ?? 0
+        case .editedJPEG:
+            return nil
         }
 
         return GalleryDownload(
@@ -641,6 +656,49 @@ struct GalleryView: View {
             format: requestedFormat,
             thumbnailHandle: item.thumbnailHandle
         )
+    }
+
+    private func makeEditedJPEGDownload(
+        for item: CameraConnectionService.GalleryItem
+    ) -> GalleryDownload? {
+        let source: (handle: UInt32, filename: String, fileSize: UInt64, record: EditedImageRecord)?
+        if let handle = item.rawHandle, let filename = item.rawFilename,
+           let record = editedStore.record(handle: handle, filename: filename) {
+            source = (handle, filename, item.rawFileSize ?? 0, record)
+        } else if let handle = item.jpegHandle, let filename = item.jpegFilename,
+                  let record = editedStore.record(handle: handle, filename: filename) {
+            source = (handle, filename, item.jpegFileSize ?? 0, record)
+        } else {
+            source = nil
+        }
+
+        guard let source else { return nil }
+        return GalleryDownload(
+            handle: source.handle,
+            filename: adjustedJPEGFilename(for: source.filename),
+            fileSize: source.fileSize,
+            format: .editedJPEG,
+            thumbnailHandle: item.thumbnailHandle,
+            sourceFilename: source.filename,
+            editState: source.record.state
+        )
+    }
+
+    private func editedRecord(for item: CameraConnectionService.GalleryItem) -> EditedImageRecord? {
+        if let handle = item.rawHandle, let filename = item.rawFilename,
+           let record = editedStore.record(handle: handle, filename: filename) {
+            return record
+        }
+        if let handle = item.jpegHandle, let filename = item.jpegFilename {
+            return editedStore.record(handle: handle, filename: filename)
+        }
+        return nil
+    }
+
+    private func adjustedJPEGFilename(for sourceFilename: String) -> String {
+        let sourceURL = URL(fileURLWithPath: sourceFilename)
+        let baseName = sourceURL.deletingPathExtension().lastPathComponent
+        return (baseName.isEmpty ? "调整后照片" : baseName) + ".jpg"
     }
 
     private func startTransfer(downloads: [GalleryDownload], requiresConfirmation: Bool) {
@@ -908,14 +966,35 @@ private struct GalleryTimeSection: Identifiable, Equatable {
 private enum GalleryDownloadFormat: String, Hashable, Codable {
     case raw
     case jpeg
+    case editedJPEG
 }
 
-private struct GalleryDownload: Identifiable, Hashable {
+private struct GalleryDownload: Identifiable {
     let handle: UInt32
     let filename: String
     let fileSize: UInt64
     let format: GalleryDownloadFormat
     let thumbnailHandle: UInt32
+    let sourceFilename: String?
+    let editState: ImageEditingState?
+
+    init(
+        handle: UInt32,
+        filename: String,
+        fileSize: UInt64,
+        format: GalleryDownloadFormat,
+        thumbnailHandle: UInt32,
+        sourceFilename: String? = nil,
+        editState: ImageEditingState? = nil
+    ) {
+        self.handle = handle
+        self.filename = filename
+        self.fileSize = fileSize
+        self.format = format
+        self.thumbnailHandle = thumbnailHandle
+        self.sourceFilename = sourceFilename
+        self.editState = editState
+    }
 
     var id: String {
         "\(handle)-\(format.rawValue)"
@@ -1107,6 +1186,12 @@ private struct GalleryPreviewView: View {
                                                 Label("下载 JPEG", systemImage: "j.square")
                                             }
                                             .disabled(isDownloadQueued(.jpeg))
+                                        }
+                                        if editedRecord != nil {
+                                            Button { onDownload(.editedJPEG) } label: {
+                                                Label("保存调整后JPEG", systemImage: "pencil.circle")
+                                            }
+                                            .disabled(isDownloadQueued(.editedJPEG))
                                         }
                                     } label: {
                                         Image(systemName: isAnyDownloadQueued ? "square.and.arrow.down.badge.clock" : "square.and.arrow.down")
@@ -1387,7 +1472,9 @@ private struct GalleryPreviewView: View {
 
     private var isAnyDownloadQueued: Bool {
         guard let format = item.photoFormat else { return false }
-        return (format.supportsRAW && isDownloadQueued(.raw)) || (format.supportsJPEG && isDownloadQueued(.jpeg))
+        return (format.supportsRAW && isDownloadQueued(.raw))
+            || (format.supportsJPEG && isDownloadQueued(.jpeg))
+            || (editedRecord != nil && isDownloadQueued(.editedJPEG))
     }
 
     @ViewBuilder
@@ -2031,8 +2118,10 @@ private final class GalleryDownloadStore: ObservableObject {
         let handle: UInt32
         let thumbnailHandle: UInt32
         let filename: String
+        let sourceFilename: String?
         var fileSize: UInt64
         let format: GalleryDownloadFormat
+        let editState: ImageEditingState?
         let thumbnailURL: URL?
         var status: Status
         var receivedBytes: UInt64 = 0
@@ -2047,8 +2136,10 @@ private final class GalleryDownloadStore: ObservableObject {
         let handle: UInt32
         let thumbnailHandle: UInt32
         let filename: String
+        let sourceFilename: String?
         let fileSize: UInt64
         let format: GalleryDownloadFormat
+        let editState: ImageEditingState?
         let thumbnailPath: String?
         let status: Status
         let receivedBytes: UInt64
@@ -2060,8 +2151,10 @@ private final class GalleryDownloadStore: ObservableObject {
             handle: UInt32,
             thumbnailHandle: UInt32,
             filename: String,
+            sourceFilename: String?,
             fileSize: UInt64,
             format: GalleryDownloadFormat,
+            editState: ImageEditingState?,
             thumbnailPath: String?,
             status: Status,
             receivedBytes: UInt64,
@@ -2072,8 +2165,10 @@ private final class GalleryDownloadStore: ObservableObject {
             self.handle = handle
             self.thumbnailHandle = thumbnailHandle
             self.filename = filename
+            self.sourceFilename = sourceFilename
             self.fileSize = fileSize
             self.format = format
+            self.editState = editState
             self.thumbnailPath = thumbnailPath
             self.status = status
             self.receivedBytes = receivedBytes
@@ -2087,8 +2182,10 @@ private final class GalleryDownloadStore: ObservableObject {
             handle = try container.decode(UInt32.self, forKey: .handle)
             thumbnailHandle = try container.decodeIfPresent(UInt32.self, forKey: .thumbnailHandle) ?? handle
             filename = try container.decode(String.self, forKey: .filename)
+            sourceFilename = try container.decodeIfPresent(String.self, forKey: .sourceFilename)
             fileSize = try container.decode(UInt64.self, forKey: .fileSize)
             format = try container.decode(GalleryDownloadFormat.self, forKey: .format)
+            editState = try container.decodeIfPresent(ImageEditingState.self, forKey: .editState)
             thumbnailPath = try container.decodeIfPresent(String.self, forKey: .thumbnailPath)
             status = try container.decode(Status.self, forKey: .status)
             receivedBytes = try container.decode(UInt64.self, forKey: .receivedBytes)
@@ -2122,6 +2219,29 @@ private final class GalleryDownloadStore: ObservableObject {
         items.contains { $0.handle == handle && $0.format == format && $0.status != .completed }
     }
 
+    func contains(
+        item: CameraConnectionService.GalleryItem,
+        format: GalleryDownloadFormat
+    ) -> Bool {
+        let handles: Set<UInt32>
+        switch format {
+        case .raw:
+            handles = item.rawHandle.map { Set([$0]) } ?? []
+        case .jpeg:
+            handles = item.jpegHandle.map { Set([$0]) } ?? []
+        case .editedJPEG:
+            handles = Set([
+                item.rawHandle,
+                item.jpegHandle
+            ].compactMap { $0 })
+        }
+        return items.contains {
+            handles.contains($0.handle)
+                && $0.format == format
+                && $0.status != .completed
+        }
+    }
+
     func enqueue(downloads: [GalleryDownload], camera: CameraConnectionService) async {
         self.camera = camera
         for download in downloads where !contains(handle: download.handle, format: download.format) {
@@ -2137,8 +2257,10 @@ private final class GalleryDownloadStore: ObservableObject {
                 handle: download.handle,
                 thumbnailHandle: download.thumbnailHandle,
                 filename: download.filename,
+                sourceFilename: download.sourceFilename,
                 fileSize: download.fileSize,
                 format: download.format,
+                editState: download.editState,
                 thumbnailURL: thumbnailURL,
                 status: .waiting,
                 addedAt: Date(),
@@ -2218,15 +2340,30 @@ private final class GalleryDownloadStore: ObservableObject {
         persistTasks()
     }
 
+    private enum ExportError: LocalizedError {
+        case missingEditState
+        case renderedImageUnavailable
+
+        var errorDescription: String? {
+            switch self {
+            case .missingEditState:
+                return "找不到照片的编辑数据。"
+            case .renderedImageUnavailable:
+                return "无法按照编辑数据渲染照片。"
+            }
+        }
+    }
+
     private func process(index: Int, camera: CameraConnectionService) async {
         guard items.indices.contains(index) else { return }
         items[index].status = .downloading
         items[index].receivedBytes = 0
         items[index].errorMessage = nil
+        let taskItem = items[index]
         let started = Date()
-        let id = items[index].id
+        let id = taskItem.id
         do {
-            let data = try await camera.objectData(for: items[index].handle) { [weak self] received, total in
+            let data = try await camera.objectData(for: taskItem.handle) { [weak self] received, total in
                 guard let self, let current = self.items.firstIndex(where: { $0.id == id }) else { return }
                 self.items[current].receivedBytes = received
                 self.items[current].speed = Date().timeIntervalSince(started) > 0
@@ -2237,10 +2374,39 @@ private final class GalleryDownloadStore: ObservableObject {
                 }
                 self.persistTasksIfNeeded()
             }
-            let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + "-" + items[index].filename)
-            try data.write(to: url, options: .atomic)
-            try await saveToPhotos(url: url)
-            try? FileManager.default.removeItem(at: url)
+
+            try Task.checkCancellation()
+            let sourceURL = temporaryURL(for: taskItem.sourceFilename ?? taskItem.filename)
+            try data.write(to: sourceURL, options: .atomic)
+            defer { try? FileManager.default.removeItem(at: sourceURL) }
+
+            if taskItem.format == .editedJPEG {
+                guard let editState = taskItem.editState else {
+                    throw ExportError.missingEditState
+                }
+
+                let jpegData = await Task.detached(priority: .userInitiated) { () -> Data? in
+                    guard let image = ImageEditRenderer.editedExport(
+                        sourceURL: sourceURL,
+                        state: editState
+                    ) else {
+                        return nil
+                    }
+                    return image.jpegData(compressionQuality: 0.95)
+                }.value
+                try Task.checkCancellation()
+                guard let jpegData else {
+                    throw ExportError.renderedImageUnavailable
+                }
+
+                let outputURL = temporaryURL(for: taskItem.filename)
+                try jpegData.write(to: outputURL, options: .atomic)
+                defer { try? FileManager.default.removeItem(at: outputURL) }
+                try await saveToPhotos(url: outputURL)
+            } else {
+                try await saveToPhotos(url: sourceURL)
+            }
+
             if let current = items.firstIndex(where: { $0.id == id }) {
                 items[current].receivedBytes = items[current].fileSize
                 items[current].status = .completed
@@ -2266,6 +2432,13 @@ private final class GalleryDownloadStore: ObservableObject {
                 persistTasks()
             }
         }
+    }
+
+    private func temporaryURL(for filename: String) -> URL {
+        let safeFilename = URL(fileURLWithPath: filename).lastPathComponent
+        let name = safeFilename.isEmpty ? "download" : safeFilename
+        return FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString + "-" + name)
     }
 
     private func saveThumbnail(for download: GalleryDownload, camera: CameraConnectionService) async -> URL? {
@@ -2322,8 +2495,10 @@ private final class GalleryDownloadStore: ObservableObject {
                 handle: task.handle,
                 thumbnailHandle: task.thumbnailHandle,
                 filename: task.filename,
+                sourceFilename: task.sourceFilename,
                 fileSize: task.fileSize,
                 format: task.format,
+                editState: task.editState,
                 thumbnailURL: thumbnailURL,
                 status: task.status == .downloading ? .waiting : task.status,
                 receivedBytes: task.status == .downloading ? 0 : task.receivedBytes,
@@ -2347,8 +2522,10 @@ private final class GalleryDownloadStore: ObservableObject {
                 handle: $0.handle,
                 thumbnailHandle: $0.thumbnailHandle,
                 filename: $0.filename,
+                sourceFilename: $0.sourceFilename,
                 fileSize: $0.fileSize,
                 format: $0.format,
+                editState: $0.editState,
                 thumbnailPath: $0.thumbnailURL?.path,
                 status: $0.status,
                 receivedBytes: $0.receivedBytes,

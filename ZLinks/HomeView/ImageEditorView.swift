@@ -7,6 +7,7 @@ import CoreImage
 import CoreImage.CIFilterBuiltins
 import ImageIO
 import MetalKit
+import Photos
 import SwiftUI
 import UIKit
 
@@ -27,6 +28,20 @@ struct ImageEditorAsset: Identifiable {
         self.filename = filename ?? url.lastPathComponent
         self.thumbnailHandle = thumbnailHandle
         self.thumbnailData = thumbnailData
+    }
+}
+
+private enum ImageEditorExportError: LocalizedError {
+    case photoLibraryAccessDenied
+    case renderFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .photoLibraryAccessDenied:
+            return "没有相册写入权限。"
+        case .renderFailed:
+            return "无法按照编辑数据导出 JPEG。"
+        }
     }
 }
 
@@ -912,6 +927,26 @@ enum ImageEditPipeline {
 }
 
 extension ImageEditRenderer {
+    /// Renders a saved edit at the source image's native pixel size for export.
+    nonisolated static func editedExport(sourceURL: URL, state: ImageEditingState) -> UIImage? {
+        let maximumPixelSize: Int
+        if let source = CGImageSourceCreateWithURL(sourceURL as CFURL, nil),
+           let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any]
+        {
+            let width = (properties[kCGImagePropertyPixelWidth as String] as? NSNumber)?.intValue ?? 0
+            let height = (properties[kCGImagePropertyPixelHeight as String] as? NSNumber)?.intValue ?? 0
+            maximumPixelSize = max(width, height, 16_384)
+        } else {
+            maximumPixelSize = 16_384
+        }
+
+        return editedPreview(
+            sourceURL: sourceURL,
+            state: state,
+            maximumPixelSize: maximumPixelSize
+        )
+    }
+
     nonisolated static func editedPreview(sourceURL: URL, state: ImageEditingState, maximumPixelSize: Int = 2048) -> UIImage? {
         guard let source = CGImageSourceCreateWithURL(sourceURL as CFURL, nil),
               let cgImage = CGImageSourceCreateThumbnailAtIndex(
@@ -1111,6 +1146,7 @@ struct ImageEditorView: View {
     @State private var usesRawSource = false
     @State private var transformOperations: [ImageTransformOperation] = []
     @State private var saveError: String?
+    @State private var isExporting = false
 
     var body: some View {
         GeometryReader { proxy in
@@ -1244,6 +1280,7 @@ struct ImageEditorView: View {
                     .padding(.vertical, 4)
                     .glassEffect(.regular.interactive(), in: .capsule)
                     .accessibilityLabel("取消编辑")
+                    .disabled(isExporting)
 
                 Spacer()
 
@@ -1251,17 +1288,26 @@ struct ImageEditorView: View {
                     Button { saveEdits() } label: {
                         Label("保存", systemImage: "checkmark")
                     }
-                    Button { saveEdits() } label: {
+                    Button { saveEditsAndExport() } label: {
                         Label("保存并导出", systemImage: "square.and.arrow.up")
                     }
+                    .disabled(isExporting)
                 } label: {
-                    Text("保存")
-                        .font(.subheadline.bold())
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 18)
-                        .padding(.vertical, 4)
-                        .glassEffect(.regular.interactive().tint(.blue), in: .capsule)
+                    Group {
+                        if isExporting {
+                            ProgressView()
+                                .tint(.white)
+                        } else {
+                            Text("保存")
+                                .font(.subheadline.bold())
+                        }
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 4)
+                    .glassEffect(.regular.interactive().tint(.blue), in: .capsule)
                 }
+                .disabled(isExporting)
                 .accessibilityLabel("保存编辑")
             }
             .padding(.horizontal, 48)
@@ -1737,6 +1783,44 @@ struct ImageEditorView: View {
     }
 
     private func saveEdits() {
+        _ = persistEdits()
+        dismiss()
+    }
+
+    private func saveEditsAndExport() {
+        guard !isExporting else { return }
+        let state = persistEdits()
+        isExporting = true
+
+        Task { @MainActor in
+            do {
+                let jpegData = await Task.detached(priority: .userInitiated) { () -> Data? in
+                    guard let image = ImageEditRenderer.editedExport(
+                        sourceURL: asset.url,
+                        state: state
+                    ) else {
+                        return nil
+                    }
+                    return image.jpegData(compressionQuality: 0.95)
+                }.value
+
+                try Task.checkCancellation()
+                guard let jpegData else {
+                    throw ImageEditorExportError.renderFailed
+                }
+                try await saveJPEGToPhotos(jpegData)
+                isExporting = false
+                dismiss()
+            } catch is CancellationError {
+                isExporting = false
+            } catch {
+                isExporting = false
+                saveError = error.localizedDescription
+            }
+        }
+    }
+
+    private func persistEdits() -> ImageEditingState {
         let state = ImageEditingState(
             recipe: editRecipe,
             normalizedCrop: NormalizedImageRect(normalizedCrop),
@@ -1749,7 +1833,28 @@ struct ImageEditorView: View {
             thumbnailHandle: asset.thumbnailHandle,
             thumbnailData: asset.thumbnailData
         )
-        dismiss()
+        return state
+    }
+
+    private func saveJPEGToPhotos(_ data: Data) async throws {
+        let authorization = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+        guard authorization == .authorized || authorization == .limited else {
+            throw ImageEditorExportError.photoLibraryAccessDenied
+        }
+
+        let filename = URL(fileURLWithPath: asset.filename)
+            .deletingPathExtension()
+            .lastPathComponent
+        let outputName = (filename.isEmpty ? "调整后照片" : filename) + ".jpg"
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString + "-" + outputName)
+        try data.write(to: outputURL, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: outputURL) }
+
+        try await PHPhotoLibrary.shared().performChanges {
+            let request = PHAssetCreationRequest.forAsset()
+            request.addResource(with: .photo, fileURL: outputURL, options: nil)
+        }
     }
 
     private func rawDefaults(for url: URL) -> RawAdjustmentDefaults? {
