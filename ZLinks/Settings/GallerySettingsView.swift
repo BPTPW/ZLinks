@@ -43,10 +43,86 @@ struct GallerySettingsView: View {
                 }
                 .disabled(thumbnailCache.cachedSize == 0)
             }
+
+            Section("编辑") {
+                NavigationLink {
+                    EditedImageListView()
+                } label: {
+                    Text("已编辑的项目")
+                }
+            }
         }
         .navigationTitle("图库")
         .onAppear {
             thumbnailCache.refreshStats()
+        }
+    }
+}
+
+private struct EditedImageListView: View {
+    @ObservedObject private var store = EditedImageStore.shared
+
+    var body: some View {
+        Group {
+            if store.records.isEmpty {
+                ContentUnavailableView("没有已编辑的项目", systemImage: "slider.horizontal.3")
+            } else {
+                List {
+                    ForEach(store.records) { record in
+                        EditedImageRow(record: record)
+                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                Button(role: .destructive) {
+                                    store.delete(record)
+                                } label: {
+                                    Label("删除", systemImage: "trash")
+                                }
+                            }
+                    }
+                }
+                .listStyle(.plain)
+            }
+        }
+        .navigationTitle("已编辑的项目")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+private struct EditedImageRow: View {
+    let record: EditedImageRecord
+    @State private var thumbnail: UIImage?
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Group {
+                if let thumbnail {
+                    Image(uiImage: thumbnail)
+                        .resizable()
+                        .scaledToFill()
+                } else {
+                    Image(systemName: "photo")
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+            .frame(width: 58, height: 58)
+            .background(Color.secondary.opacity(0.12))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text(record.filename)
+                    .font(.body)
+                    .lineLimit(1)
+                Text(record.editedAt.formatted(
+                    .dateTime.year().month().day().hour().minute()
+                        .locale(Locale(identifier: "zh_Hans_CN"))
+                ))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 4)
+        .task {
+            thumbnail = EditedImageStore.shared.thumbnail(for: record)
         }
     }
 }

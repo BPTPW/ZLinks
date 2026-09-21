@@ -1,0 +1,15 @@
+<svg 
+ xmlns="http://www.w3.org/2000/svg"
+ xmlns:xlink="http://www.w3.org/1999/xlink"
+ width="732px" height="731px">
+<path fill-rule="evenodd"  stroke="rgb(0, 0, 0)" stroke-width="60px" stroke-linecap="round" stroke-linejoin="round" fill="rgb(255, 255, 255)"
+ d="M60.1000,61.000 L60.1000,59.1000 L641.000,59.1000 L641.000,61.000 L60.1000,61.000 Z"/>
+<path fill-rule="evenodd"  stroke="rgb(0, 0, 0)" stroke-width="60px" stroke-linecap="round" stroke-linejoin="round" fill="rgb(255, 255, 255)"
+ d="M60.1000,641.000 L60.1000,639.1000 L641.000,639.1000 L641.000,641.000 L60.1000,641.000 Z"/>
+<path fill-rule="evenodd"  stroke="rgb(0, 0, 0)" stroke-width="60px" stroke-linecap="round" stroke-linejoin="round" fill="rgb(245, 245, 245)"
+ d="M640.166,60.127 L640.873,60.834 L61.087,640.620 L60.380,639.913 L640.166,60.127 Z"/>
+<path fill-rule="evenodd"  stroke="rgb(0, 0, 0)" stroke-width="60px" stroke-linecap="round" stroke-linejoin="round" fill="rgb(245, 245, 245)"
+ d="M59.1000,59.1000 L61.000,59.1000 L61.000,165.000 L59.1000,165.000 L59.1000,59.1000 Z"/>
+<path fill-rule="evenodd"  stroke="rgb(0, 0, 0)" stroke-width="60px" stroke-linecap="round" stroke-linejoin="round" fill="rgb(245, 245, 245)"
+ d="M640.1000,534.1000 L642.000,534.1000 L642.000,640.000 L640.1000,640.000 L640.1000,534.1000 Z"/>
+</svg>

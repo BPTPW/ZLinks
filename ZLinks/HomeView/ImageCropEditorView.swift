@@ -15,6 +15,9 @@ struct ImageCropEditorView: View {
     let previewScaleX: CGFloat
     let previewScaleY: CGFloat
     let imageOpacity: Double
+    let recipe: EditRecipe
+    let rawDefaults: RawAdjustmentDefaults?
+    let sourceURL: URL?
 
     @State private var imageFrame: CGRect = .zero
     @State private var cropFrame: CGRect = .zero
@@ -30,8 +33,12 @@ struct ImageCropEditorView: View {
             ZStack {
                 Color.clear
 
-                Image(uiImage: image)
-                    .resizable()
+                AdjustmentPreview(
+                    image: image,
+                    sourceURL: sourceURL,
+                    recipe: recipe,
+                    rawDefaults: rawDefaults
+                )
                     .frame(width: imageFrame.width, height: imageFrame.height)
                     .position(x: imageFrame.midX, y: imageFrame.midY)
                     .rotationEffect(previewRotation)
@@ -373,7 +380,7 @@ private extension CGRect {
 }
 
 enum ImageEditRenderer {
-    static func crop(_ image: UIImage, to normalizedRect: CGRect) -> UIImage {
+    nonisolated static func crop(_ image: UIImage, to normalizedRect: CGRect) -> UIImage {
         let normalized = normalizedImage(image)
         guard let cgImage = normalized.cgImage else { return normalized }
         let rect = CGRect(
@@ -386,7 +393,7 @@ enum ImageEditRenderer {
         return UIImage(cgImage: cropped, scale: normalized.scale, orientation: .up)
     }
 
-    static func rotateRight(_ image: UIImage) -> UIImage {
+    nonisolated static func rotateRight(_ image: UIImage) -> UIImage {
         let source = normalizedImage(image)
         let size = CGSize(width: source.size.height, height: source.size.width)
         return render(size: size, scale: source.scale) { context in
@@ -396,7 +403,7 @@ enum ImageEditRenderer {
         }
     }
 
-    static func mirrorHorizontally(_ image: UIImage) -> UIImage {
+    nonisolated static func mirrorHorizontally(_ image: UIImage) -> UIImage {
         let source = normalizedImage(image)
         return render(size: source.size, scale: source.scale) { context in
             context.translateBy(x: source.size.width, y: 0)
@@ -405,7 +412,7 @@ enum ImageEditRenderer {
         }
     }
 
-    static func mirrorVertically(_ image: UIImage) -> UIImage {
+    nonisolated static func mirrorVertically(_ image: UIImage) -> UIImage {
         let source = normalizedImage(image)
         return render(size: source.size, scale: source.scale) { context in
             context.translateBy(x: 0, y: source.size.height)
@@ -414,14 +421,14 @@ enum ImageEditRenderer {
         }
     }
 
-    private static func normalizedImage(_ image: UIImage) -> UIImage {
+    nonisolated private static func normalizedImage(_ image: UIImage) -> UIImage {
         guard image.imageOrientation != .up else { return image }
         return render(size: image.size, scale: image.scale) { _ in
             image.draw(in: CGRect(origin: .zero, size: image.size))
         }
     }
 
-    private static func render(
+    nonisolated private static func render(
         size: CGSize,
         scale: CGFloat,
         drawing: (CGContext) -> Void

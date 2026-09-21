@@ -967,7 +967,10 @@ private struct GalleryPreviewView: View {
     let onDelete: () async -> Bool
 
     @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var editedStore = EditedImageStore.shared
     @State private var image: UIImage?
+    @State private var editedImage: UIImage?
+    @State private var showsEdits = true
     @State private var isLoading = false
     @State private var isHighQualityPreview = false
     @State private var isOriginalImageLoading = false
@@ -1036,11 +1039,33 @@ private struct GalleryPreviewView: View {
                                 Spacer()
                             }
                             captureTimestampView
+                            if editedRecord != nil {
+                                HStack {
+                                    Spacer()
+                                    Button {
+                                        withAnimation(.easeInOut(duration: 0.16)) {
+                                            showsEdits = !showsEdits
+                                        }
+                                    } label: {
+                                        Label("已编辑", systemImage: showsEdits ? "pencil" : "pencil.slash")
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(.primary)
+                                            .padding(.horizontal, 10)
+                                            .padding(.vertical, 5)
+                                            .contentShape(Capsule())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .glassEffect(.regular.interactive(), in: .capsule)
+                                    .opacity(showsEdits ? 1 : 0.45)
+                                    .accessibilityLabel(showsEdits ? "显示编辑前照片" : "显示编辑后照片")
+                                }
+                                .padding(.top, 50)
+                            }
                         }
                         .padding(.horizontal, 16)
                         .padding(.top, 8)
                         Spacer()
-                        if isHighQualityPreview {
+                        if isHighQualityPreview && !(showsEdits && editedRecord != nil) {
                             Button(action: loadOriginalImage) {
                                 VStack(spacing: 2) {
                                     Text("高清预览")
@@ -1176,10 +1201,10 @@ private struct GalleryPreviewView: View {
                     .transition(.opacity)
                 }
 
-                if isLoading {
+                if isLoading && editedImage == nil {
                     ProgressView()
                         .tint(isImmersive ? .white : nil)
-                } else if hasLoadFailed && image == nil {
+                } else if hasLoadFailed && image == nil && (!showsEdits || editedImage == nil) {
                     VStack(spacing: 10) {
                         Image(systemName: "photo.badge.exclamationmark")
                             .font(.largeTitle)
@@ -1190,7 +1215,22 @@ private struct GalleryPreviewView: View {
                 }
             }
             .statusBarHidden(isImmersive)
-            .onAppear { loadFullImage() }
+            .onAppear {
+                showsEdits = true
+                loadFullImage()
+            }
+            .task(id: editedRecord?.editedAt) {
+                editedImage = nil
+                guard let record = editedRecord else { return }
+                let preview = await Task.detached(priority: .userInitiated) {
+                    ImageEditRenderer.editedPreview(
+                        sourceURL: URL(fileURLWithPath: record.sourcePath),
+                        state: record.state
+                    )
+                }.value
+                guard !Task.isCancelled else { return }
+                editedImage = preview
+            }
             .onChange(of: item.isProtected) { _, newValue in
                 protectionOverride = newValue
             }
@@ -1237,6 +1277,16 @@ private struct GalleryPreviewView: View {
     }
 
     private var isImmersive: Bool { scale > 1.01 || !controlsVisible }
+    private var editedRecord: EditedImageRecord? {
+        if let handle = item.rawHandle, let filename = item.rawFilename,
+           let record = editedStore.record(handle: handle, filename: filename) {
+            return record
+        }
+        if let handle = item.jpegHandle, let filename = item.jpegFilename {
+            return editedStore.record(handle: handle, filename: filename)
+        }
+        return nil
+    }
     private var isProtected: Bool { protectionOverride ?? item.isProtected }
     private var protectionErrorPresented: Binding<Bool> {
         Binding(
@@ -1300,9 +1350,21 @@ private struct GalleryPreviewView: View {
                     handle: source.handle,
                     filename: source.filename
                 )
+                let originalThumbnailData: Data?
+                if let thumbnail {
+                    originalThumbnailData = thumbnail.jpegData(compressionQuality: 0.86)
+                } else {
+                    originalThumbnailData = await camera.thumbnailImage(for: item.thumbnailHandle)?
+                        .jpegData(compressionQuality: 0.86)
+                }
                 isEditOriginalTransferring = false
                 editTransferProgress = nil
-                editAsset = ImageEditorAsset(url: url)
+                editAsset = ImageEditorAsset(
+                    url: url,
+                    filename: source.filename,
+                    thumbnailHandle: item.thumbnailHandle,
+                    thumbnailData: originalThumbnailData
+                )
             } catch {
                 isEditOriginalTransferring = false
                 editTransferProgress = nil
@@ -1392,7 +1454,10 @@ private struct GalleryPreviewView: View {
 
     @ViewBuilder
     private var previewImage: some View {
-        if let image {
+        if showsEdits, let editedImage, editedRecord != nil {
+            renderedImage(editedImage)
+                .transition(.opacity)
+        } else if let image {
             renderedImage(image)
                 .transition(.opacity)
         } else if let thumbnail {
@@ -1855,6 +1920,7 @@ private struct GalleryThumbnailCell: View {
     let hasFailed: Bool
     let isSelected: Bool
     let selectionMode: Bool
+    @ObservedObject private var editedStore = EditedImageStore.shared
 
     var body: some View {
         Rectangle()
@@ -1887,6 +1953,11 @@ private struct GalleryThumbnailCell: View {
                 }
             }
             .overlay(alignment: .topTrailing) {
+                if editedRecord != nil {
+                    thumbnailBadge(symbol: "pencil", color: .white)
+                }
+            }
+            .overlay(alignment: .bottomLeading) {
                 if !item.isVideo && item.isProtected {
                     thumbnailBadge(symbol: "heart.fill", color: .white)
                 }
@@ -1920,6 +1991,17 @@ private struct GalleryThumbnailCell: View {
         }
         let format = item.photoFormat?.title ?? "照片"
         return "\(format) \(item.filename)" + (item.isProtected ? "，已锁定" : "")
+    }
+
+    private var editedRecord: EditedImageRecord? {
+        if let handle = item.rawHandle, let filename = item.rawFilename,
+           let record = editedStore.record(handle: handle, filename: filename) {
+            return record
+        }
+        if let handle = item.jpegHandle, let filename = item.jpegFilename {
+            return editedStore.record(handle: handle, filename: filename)
+        }
+        return nil
     }
 }
 

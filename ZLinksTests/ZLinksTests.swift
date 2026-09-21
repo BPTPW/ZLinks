@@ -7,9 +7,44 @@
 
 import Foundation
 import Testing
+import UIKit
 @testable import ZLinks
 
 struct ZLinksTests {
+    @Test @MainActor func editStateRoundTripsCropTransformsAndAdjustments() throws {
+        var recipe = EditRecipe()
+        recipe.exposure = 23
+        recipe.curveRed = [CurvePoint(x: 0, y: 0.1), CurvePoint(x: 1, y: 0.9)]
+        let state = ImageEditingState(
+            recipe: recipe,
+            normalizedCrop: NormalizedImageRect(CGRect(x: 0.1, y: 0.2, width: 0.7, height: 0.6)),
+            transformOperations: [.rotateRight, .mirrorHorizontally]
+        )
+
+        let decoded = try JSONDecoder().decode(ImageEditingState.self, from: JSONEncoder().encode(state))
+        #expect(decoded == state)
+    }
+
+    @Test @MainActor func editedPreviewAppliesRotationAndCrop() throws {
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let source = UIGraphicsImageRenderer(size: CGSize(width: 40, height: 20), format: format).image { context in
+            UIColor.red.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 40, height: 20))
+        }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".png")
+        try #require(source.pngData()).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let state = ImageEditingState(
+            recipe: EditRecipe(),
+            normalizedCrop: NormalizedImageRect(CGRect(x: 0, y: 0, width: 0.5, height: 1)),
+            transformOperations: [.rotateRight]
+        )
+        let output = try #require(ImageEditRenderer.editedPreview(sourceURL: url, state: state))
+        #expect(output.size == CGSize(width: 10, height: 40))
+    }
+
     @Test func shutterSpeedsBelowOneSecondUseReducedFractions() {
         #expect(shutterTitle(numerator: 1, denominator: 125) == "1/125")
         #expect(shutterTitle(numerator: 2, denominator: 5) == "2/5")

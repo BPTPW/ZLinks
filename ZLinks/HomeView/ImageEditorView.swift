@@ -13,6 +13,21 @@ import UIKit
 struct ImageEditorAsset: Identifiable {
     let id = UUID()
     let url: URL
+    let filename: String
+    let thumbnailHandle: UInt32?
+    let thumbnailData: Data?
+
+    init(
+        url: URL,
+        filename: String? = nil,
+        thumbnailHandle: UInt32? = nil,
+        thumbnailData: Data? = nil
+    ) {
+        self.url = url
+        self.filename = filename ?? url.lastPathComponent
+        self.thumbnailHandle = thumbnailHandle
+        self.thumbnailData = thumbnailData
+    }
 }
 
 private extension URL {
@@ -21,9 +36,14 @@ private extension URL {
     }
 }
 
-private struct RawAdjustmentDefaults: Sendable {
+struct RawAdjustmentDefaults: Sendable {
     let temperature: Float
     let tint: Float
+
+    nonisolated init(temperature: Float, tint: Float) {
+        self.temperature = temperature
+        self.tint = tint
+    }
 }
 
 private struct HistogramData: Equatable, Sendable {
@@ -41,7 +61,7 @@ struct CurvePoint: Codable, Equatable, Sendable {
     var x: Float
     var y: Float
 
-    static let identity: [CurvePoint] = [
+    nonisolated static let identity: [CurvePoint] = [
         CurvePoint(x: 0, y: 0),
         CurvePoint(x: 1, y: 1)
     ]
@@ -606,7 +626,7 @@ private enum HistogramCalculator {
     }
 }
 
-private struct AdjustmentPreview: UIViewRepresentable {
+struct AdjustmentPreview: UIViewRepresentable {
     let image: UIImage
     let sourceURL: URL?
     let recipe: EditRecipe
@@ -708,7 +728,7 @@ private struct AdjustmentPreview: UIViewRepresentable {
     }
 }
 
-private enum ImageEditPipeline {
+enum ImageEditPipeline {
     nonisolated static func sourceImage(uiImage: UIImage, sourceURL: URL?, maximumPixelSize: CGFloat) -> CIImage? {
         if let sourceURL, sourceURL.isRawImage, let raw = CIRAWFilter(imageURL: sourceURL) {
             raw.isDraftModeEnabled = true
@@ -891,6 +911,51 @@ private enum ImageEditPipeline {
     }
 }
 
+extension ImageEditRenderer {
+    nonisolated static func editedPreview(sourceURL: URL, state: ImageEditingState, maximumPixelSize: Int = 2048) -> UIImage? {
+        guard let source = CGImageSourceCreateWithURL(sourceURL as CFURL, nil),
+              let cgImage = CGImageSourceCreateThumbnailAtIndex(
+                  source,
+                  0,
+                  [
+                      kCGImageSourceCreateThumbnailFromImageAlways: true,
+                      kCGImageSourceCreateThumbnailWithTransform: true,
+                      kCGImageSourceThumbnailMaxPixelSize: maximumPixelSize
+                  ] as CFDictionary
+              )
+        else { return nil }
+
+        var image = UIImage(cgImage: cgImage)
+        for operation in state.transformOperations {
+            switch operation {
+            case .rotateRight: image = rotateRight(image)
+            case .mirrorHorizontally: image = mirrorHorizontally(image)
+            case .mirrorVertically: image = mirrorVertically(image)
+            }
+        }
+        image = crop(image, to: state.normalizedCrop.cgRect)
+
+        guard let input = ImageEditPipeline.sourceImage(
+            uiImage: image,
+            sourceURL: nil,
+            maximumPixelSize: CGFloat(maximumPixelSize)
+        ) else { return image }
+        let rawDefaults: RawAdjustmentDefaults?
+        if sourceURL.isRawImage, let raw = CIRAWFilter(imageURL: sourceURL) {
+            rawDefaults = RawAdjustmentDefaults(
+                temperature: raw.neutralTemperature > 0 ? raw.neutralTemperature : 6500,
+                tint: raw.neutralTint
+            )
+        } else {
+            rawDefaults = nil
+        }
+        let adjusted = ImageEditPipeline.adjustedImage(input, recipe: state.recipe, rawDefaults: rawDefaults)
+        let context = CIContext(options: [.cacheIntermediates: false])
+        guard let output = context.createCGImage(adjusted, from: adjusted.extent) else { return image }
+        return UIImage(cgImage: output)
+    }
+}
+
 /// The complete edit state. Values exposed to the controls use the familiar
 /// -100...100 range; the renderer maps them to Core Image's native ranges.
 struct EditRecipe: Codable, Equatable, Sendable {
@@ -1044,6 +1109,8 @@ struct ImageEditorView: View {
     @State private var rawAdjustmentDefaults: RawAdjustmentDefaults?
     @State private var selectedAdjustmentSection: AdjustmentSection = .brightness
     @State private var usesRawSource = false
+    @State private var transformOperations: [ImageTransformOperation] = []
+    @State private var saveError: String?
 
     var body: some View {
         GeometryReader { proxy in
@@ -1079,12 +1146,35 @@ struct ImageEditorView: View {
                 cropRevision += 1
                 usesRawSource = asset.url.isRawImage
                 rawAdjustmentDefaults = asset.url.isRawImage ? rawDefaults(for: asset.url) : nil
-                editRecipe = EditRecipe()
+                let savedRecord = EditedImageStore.shared.record(for: asset.url)
+                editRecipe = savedRecord?.state.recipe ?? EditRecipe()
+                normalizedCrop = savedRecord?.state.normalizedCrop.cgRect ?? CGRect(x: 0, y: 0, width: 1, height: 1)
+                transformOperations = savedRecord?.state.transformOperations ?? []
                 if let rawAdjustmentDefaults {
-                    editRecipe.temperature = rawAdjustmentDefaults.temperature
-                    editRecipe.tint = rawAdjustmentDefaults.tint
+                    if savedRecord == nil {
+                        editRecipe.temperature = rawAdjustmentDefaults.temperature
+                        editRecipe.tint = rawAdjustmentDefaults.tint
+                    }
+                }
+                if savedRecord != nil {
+                    for operation in transformOperations {
+                        switch operation {
+                        case .rotateRight: image = ImageEditRenderer.rotateRight(image ?? loaded)
+                        case .mirrorHorizontally: image = ImageEditRenderer.mirrorHorizontally(image ?? loaded)
+                        case .mirrorVertically: image = ImageEditRenderer.mirrorVertically(image ?? loaded)
+                        }
+                    }
+                    usesRawSource = asset.url.isRawImage && transformOperations.isEmpty
+                    if let image {
+                        isPortraitRatio = image.size.height > image.size.width
+                    }
                 }
             }
+        }
+        .alert("无法保存编辑", isPresented: saveErrorPresented) {
+            Button("好", role: .cancel) { saveError = nil }
+        } message: {
+            Text(saveError ?? "编辑数据保存失败。")
         }
     }
 
@@ -1100,7 +1190,10 @@ struct ImageEditorView: View {
                     previewRotation: previewRotation,
                     previewScaleX: previewScaleX,
                     previewScaleY: previewScaleY,
-                    imageOpacity: previewOpacity
+                    imageOpacity: previewOpacity,
+                    recipe: editRecipe,
+                    rawDefaults: rawAdjustmentDefaults,
+                    sourceURL: usesRawSource ? asset.url : nil
                 )
                 .transition(.opacity)
             } else if selectedTool == .adjustments {
@@ -1154,14 +1247,22 @@ struct ImageEditorView: View {
 
                 Spacer()
 
-                Button("导出", action: {})
-                    .buttonStyle(.plain)
-                    .font(.subheadline.bold())
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 18)
-                    .padding(.vertical, 4)
-                    .glassEffect(.regular.interactive().tint(.blue), in: .capsule)
-                    .accessibilityLabel("导出照片")
+                Menu {
+                    Button { saveEdits() } label: {
+                        Label("保存", systemImage: "checkmark")
+                    }
+                    Button { saveEdits() } label: {
+                        Label("保存并导出", systemImage: "square.and.arrow.up")
+                    }
+                } label: {
+                    Text("保存")
+                        .font(.subheadline.bold())
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 4)
+                        .glassEffect(.regular.interactive().tint(.blue), in: .capsule)
+                }
+                .accessibilityLabel("保存编辑")
             }
             .padding(.horizontal, 48)
             .frame(height: max(safeAreaTop, 44))
@@ -1510,6 +1611,7 @@ struct ImageEditorView: View {
         Task {
             try? await Task.sleep(for: .milliseconds(200))
             self.image = ImageEditRenderer.rotateRight(image)
+            transformOperations.append(.rotateRight)
             usesRawSource = false
             normalizedCrop = CGRect(
                 x: 1 - normalizedCrop.maxY,
@@ -1541,6 +1643,7 @@ struct ImageEditorView: View {
         Task {
             try? await Task.sleep(for: .milliseconds(180))
             self.image = ImageEditRenderer.mirrorHorizontally(image)
+            transformOperations.append(.mirrorHorizontally)
             usesRawSource = false
             normalizedCrop.origin.x = 1 - normalizedCrop.maxX
             croppedPreview = nil
@@ -1563,6 +1666,7 @@ struct ImageEditorView: View {
         Task {
             try? await Task.sleep(for: .milliseconds(180))
             self.image = ImageEditRenderer.mirrorVertically(image)
+            transformOperations.append(.mirrorVertically)
             usesRawSource = false
             normalizedCrop.origin.y = 1 - normalizedCrop.maxY
             croppedPreview = nil
@@ -1587,6 +1691,7 @@ struct ImageEditorView: View {
             image = originalImage
             usesRawSource = asset.url.isRawImage
             editRecipe = EditRecipe()
+            transformOperations = []
             if let rawAdjustmentDefaults {
                 editRecipe.temperature = rawAdjustmentDefaults.temperature
                 editRecipe.tint = rawAdjustmentDefaults.tint
@@ -1622,6 +1727,29 @@ struct ImageEditorView: View {
         else { return nil }
 
         return UIImage(cgImage: cgImage)
+    }
+
+    private var saveErrorPresented: Binding<Bool> {
+        Binding(
+            get: { saveError != nil },
+            set: { if !$0 { saveError = nil } }
+        )
+    }
+
+    private func saveEdits() {
+        let state = ImageEditingState(
+            recipe: editRecipe,
+            normalizedCrop: NormalizedImageRect(normalizedCrop),
+            transformOperations: transformOperations
+        )
+        _ = EditedImageStore.shared.save(
+            sourceURL: asset.url,
+            filename: asset.filename,
+            state: state,
+            thumbnailHandle: asset.thumbnailHandle,
+            thumbnailData: asset.thumbnailData
+        )
+        dismiss()
     }
 
     private func rawDefaults(for url: URL) -> RawAdjustmentDefaults? {
