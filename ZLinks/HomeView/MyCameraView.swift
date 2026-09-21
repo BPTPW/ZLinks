@@ -9,7 +9,8 @@ import UIKit
 struct MyCameraView: View {
     @EnvironmentObject private var camera: CameraConnectionService
     @State private var isConnectionSheetPresented = false
-    @State private var isDebugLogPresented = false
+    @State private var isShareSheetPresented = false
+    @State private var exportedLogURL: URL?
 
     var body: some View {
         NavigationStack {
@@ -18,6 +19,7 @@ struct MyCameraView: View {
                     cameraStatusCard
                     storageInfoCard
                     lensInfoCard
+                    exportLogButton
                 }
                 .padding(.horizontal, 20)
                 .padding(.top, 16)
@@ -27,13 +29,13 @@ struct MyCameraView: View {
             .navigationBarTitleDisplayMode(.large)
             .toolbar {
                 ToolbarItemGroup(placement: .topBarTrailing) {
-                    Button {
-                        isDebugLogPresented = true
+                    NavigationLink {
+                        SettingsView(camera: camera)
                     } label: {
-                        Image(systemName: "info.circle")
+                        Image(systemName: "gearshape")
                             .font(.body.weight(.semibold))
                     }
-                    .accessibilityLabel("连接日志")
+                    .accessibilityLabel("设置")
 
                     Button {
                         Task { await camera.refreshCameraStatus() }
@@ -51,14 +53,51 @@ struct MyCameraView: View {
                     .presentationDragIndicator(.visible)
                     .presentationCornerRadius(28)
             }
-            .fullScreenCover(isPresented: $isDebugLogPresented) {
-                CameraDebugLogView(camera: camera)
+            .sheet(isPresented: $isShareSheetPresented) {
+                if let exportedLogURL {
+                    ActivityViewController(activityItems: [exportedLogURL])
+                        .ignoresSafeArea()
+                }
             }
             .task(id: camera.state) {
                 await camera.refreshCameraStatusPeriodically()
             }
         }
     }
+
+    private var exportLogButton: some View {
+        Button {
+            exportConnectionLog()
+        } label: {
+            Label("导出连接日志", systemImage: "square.and.arrow.up")
+                .font(.headline)
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.glass)
+        .accessibilityIdentifier("exportConnectionLogButton")
+    }
+
+    private func exportConnectionLog() {
+        let fileName = "ZLinks-连接日志-\(Self.exportFileDateFormatter.string(from: Date())).txt"
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+        let contents = camera.debugLog.isEmpty ? "暂无连接日志\n" : camera.debugLog + "\n"
+
+        do {
+            try contents.write(to: url, atomically: true, encoding: .utf8)
+            exportedLogURL = url
+            isShareSheetPresented = true
+        } catch {
+            // The temporary directory is expected to be writable. If it is not,
+            // leave the current screen in place rather than presenting an empty share sheet.
+        }
+    }
+
+    private static let exportFileDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        return formatter
+    }()
 
     private var cameraStatusCard: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -593,7 +632,7 @@ struct MyCameraView: View {
     }
 }
 
-private struct CameraConnectionSheet: View {
+struct CameraConnectionSheet: View {
     enum ConnectionMode: String, CaseIterable, Identifiable {
         case accessPoint = "AP 模式"
         case station = "STA 模式"
@@ -934,51 +973,14 @@ private struct CameraConnectionSheet: View {
     }
 }
 
-private struct CameraDebugLogView: View {
-    @ObservedObject var camera: CameraConnectionService
-    @Environment(\.dismiss) private var dismiss
+private struct ActivityViewController: UIViewControllerRepresentable {
+    let activityItems: [Any]
 
-    var body: some View {
-        NavigationStack {
-            Group {
-                if camera.debugLog.isEmpty {
-                    ContentUnavailableView(
-                        "暂无连接日志",
-                        systemImage: "doc.text.magnifyingglass",
-                        description: Text("WI-FI 与 USB 的设备发现、权限、会话、协议报文和失败原因会显示在这里。")
-                    )
-                } else {
-                    ScrollView([.vertical, .horizontal]) {
-                        Text(camera.debugLog)
-                            .font(.system(size: 12, design: .monospaced))
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(16)
-                    }
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color(.systemGroupedBackground))
-            .navigationTitle("连接日志")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button {
-                        camera.clearDebugLog()
-                    } label: {
-                        Image(systemName: "trash")
-                    }
-                    .disabled(camera.debugLog.isEmpty)
-                    .accessibilityLabel("清空连接日志")
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("完成") {
-                        dismiss()
-                    }
-                }
-            }
-        }
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
     }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
 private struct GuidePanel: View {
