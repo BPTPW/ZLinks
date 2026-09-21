@@ -37,6 +37,76 @@ private struct HistogramData: Equatable, Sendable {
     var isEmpty: Bool { red.isEmpty }
 }
 
+struct CurvePoint: Codable, Equatable, Sendable {
+    var x: Float
+    var y: Float
+
+    static let identity: [CurvePoint] = [
+        CurvePoint(x: 0, y: 0),
+        CurvePoint(x: 1, y: 1)
+    ]
+}
+
+extension CurvePoint {
+    nonisolated static func interpolatedValue(at x: Float, in points: [CurvePoint]) -> Float {
+        let sorted = points.sorted { $0.x < $1.x }
+        guard let first = sorted.first, let last = sorted.last, sorted.count > 1 else {
+            return sorted.first?.y ?? x
+        }
+        if x <= first.x { return max(0, min(1, first.y)) }
+        if x >= last.x { return max(0, min(1, last.y)) }
+
+        for index in 1..<sorted.count {
+            let right = sorted[index]
+            guard x <= right.x else { continue }
+            let left = sorted[index - 1]
+            let previous = index > 1 ? sorted[index - 2] : left
+            let next = index + 1 < sorted.count ? sorted[index + 1] : right
+            let span = max(right.x - left.x, 0.0001)
+            let t = min(1, max(0, (x - left.x) / span))
+            let t2 = t * t
+            let t3 = t2 * t
+            let leftSlope = (right.y - previous.y) / max(right.x - previous.x, 0.0001)
+            let rightSlope = (next.y - left.y) / max(next.x - left.x, 0.0001)
+            let h00 = 2 * t3 - 3 * t2 + 1
+            let h10 = t3 - 2 * t2 + t
+            let h01 = -2 * t3 + 3 * t2
+            let h11 = t3 - t2
+            let value = h00 * left.y + h10 * span * leftSlope
+                + h01 * right.y + h11 * span * rightSlope
+            return max(0, min(1, value))
+        }
+        return x
+    }
+}
+
+enum CurveChannel: CaseIterable, Identifiable {
+    case rgb
+    case red
+    case green
+    case blue
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .rgb: return "RGB"
+        case .red: return "红"
+        case .green: return "绿"
+        case .blue: return "蓝"
+        }
+    }
+
+    var systemColor: Color {
+        switch self {
+        case .rgb: return .primary
+        case .red: return .red
+        case .green: return .green
+        case .blue: return .blue
+        }
+    }
+}
+
 private enum HistogramChannel: CaseIterable {
     case red
     case green
@@ -111,6 +181,9 @@ private struct HistogramOverlay: View {
     let recipe: EditRecipe
     let rawDefaults: RawAdjustmentDefaults?
     let revision: Int
+    var onData: ((HistogramData) -> Void)? = nil
+    var baseRecipe: EditRecipe? = nil
+    var onBaseData: ((HistogramData) -> Void)? = nil
 
     @State private var data = HistogramData.empty
     @State private var channel: HistogramChannel = .all
@@ -169,6 +242,7 @@ private struct HistogramOverlay: View {
             .padding(1)
         }
         .task(id: request) {
+            let taskRequest = request
             let input = HistogramCalculationInput(
                 image: image,
                 sourceURL: sourceURL,
@@ -176,7 +250,21 @@ private struct HistogramOverlay: View {
                 rawDefaults: rawDefaults
             )
             await processor.submit(input) { result in
+                guard taskRequest == request else { return }
                 data = result
+                onData?(result)
+            }
+            if let baseRecipe {
+                let baseInput = HistogramCalculationInput(
+                    image: image,
+                    sourceURL: sourceURL,
+                    recipe: baseRecipe,
+                    rawDefaults: rawDefaults
+                )
+                await processor.submit(baseInput) { result in
+                    guard taskRequest == request else { return }
+                    onBaseData?(result)
+                }
             }
         }
     }
@@ -227,6 +315,223 @@ private struct HistogramCanvas: View {
             }
         }
         .accessibilityHidden(true)
+    }
+}
+
+private struct CurveAdjustmentPanel: View {
+    @Binding var recipe: EditRecipe
+    @Binding var selectedChannel: CurveChannel
+    let histogram: HistogramData
+    private var points: Binding<[CurvePoint]> {
+        Binding(
+            get: { recipe.curve(for: selectedChannel) },
+            set: { newValue in
+                switch selectedChannel {
+                case .rgb: recipe.curveRGB = newValue
+                case .red: recipe.curveRed = newValue
+                case .green: recipe.curveGreen = newValue
+                case .blue: recipe.curveBlue = newValue
+                }
+            }
+        )
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 13) {
+                ForEach(CurveChannel.allCases) { channel in
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.12)) {
+                            selectedChannel = channel
+                        }
+                    } label: {
+                        Circle()
+                            .fill(channel == .rgb ? Color.clear : channel.systemColor.opacity(0.16))
+                            .frame(width: 29, height: 29)
+                            .overlay {
+                                Circle()
+                                    .stroke(channel.systemColor, lineWidth: channel == selectedChannel ? 2.8 : 1.5)
+                            }
+                            .overlay {
+                                if channel == selectedChannel {
+                                    Circle().stroke(Color.blue.opacity(0.8), lineWidth: 1).padding(-4)
+                                }
+                            }
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("曲线\(channel.title)通道")
+                    .accessibilityAddTraits(channel == selectedChannel ? .isSelected : [])
+                }
+
+                Text(selectedChannel.title)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 2)
+            }
+
+            CurveEditor(points: points, histogram: histogram, channel: selectedChannel)
+                .frame(maxWidth: .infinity)
+                .aspectRatio(1, contentMode: .fit)
+                .padding(.horizontal, 10)
+                .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 3, style: .continuous)
+                        .stroke(.primary.opacity(0.16), lineWidth: 0.7)
+                }
+        }
+    }
+}
+
+private struct CurveEditor: View {
+    @Binding var points: [CurvePoint]
+    let histogram: HistogramData
+    let channel: CurveChannel
+
+    @State private var activeIndex: Int?
+
+    private var histogramValues: [Float] {
+        switch channel {
+        case .rgb: return histogram.luminance
+        case .red: return histogram.red
+        case .green: return histogram.green
+        case .blue: return histogram.blue
+        }
+    }
+
+    var body: some View {
+        GeometryReader { proxy in
+            let side = min(proxy.size.width, proxy.size.height)
+            ZStack {
+                Canvas { context, size in
+                    drawGrid(context: &context, size: size)
+                    drawHistogram(context: &context, size: size)
+                    drawCurve(context: &context, size: size)
+                }
+
+                Color.clear
+                    .contentShape(Rectangle())
+                    .gesture(dragGesture(side: side))
+                    .simultaneousGesture(tapGesture(side: side))
+            }
+        }
+        .background(Color(uiColor: .secondarySystemBackground).opacity(0.72))
+    }
+
+    private func drawGrid(context: inout GraphicsContext, size: CGSize) {
+        var path = Path()
+        for step in 1..<4 {
+            let position = size.width * CGFloat(step) / 4
+            path.move(to: CGPoint(x: position, y: 0))
+            path.addLine(to: CGPoint(x: position, y: size.height))
+            path.move(to: CGPoint(x: 0, y: position))
+            path.addLine(to: CGPoint(x: size.width, y: position))
+        }
+        context.stroke(path, with: .color(.primary.opacity(0.16)), style: StrokeStyle(lineWidth: 0.55))
+    }
+
+    private func drawHistogram(context: inout GraphicsContext, size: CGSize) {
+        guard !histogramValues.isEmpty else { return }
+        let maximum = histogramValues.max() ?? 1
+        guard maximum > 0 else { return }
+        var path = Path()
+        path.move(to: CGPoint(x: 0, y: size.height))
+        for (index, value) in histogramValues.enumerated() {
+            let x = size.width * CGFloat(index) / CGFloat(max(histogramValues.count - 1, 1))
+            let y = size.height - CGFloat(value / maximum) * size.height * 0.92
+            path.addLine(to: CGPoint(x: x, y: y))
+        }
+        path.addLine(to: CGPoint(x: size.width, y: size.height))
+        path.closeSubpath()
+        context.fill(path, with: .color(channel.systemColor.opacity(0.19)))
+    }
+
+    private func drawCurve(context: inout GraphicsContext, size: CGSize) {
+        let sorted = points.sorted { $0.x < $1.x }
+        guard sorted.count > 1 else { return }
+        var line = Path()
+        let sampleCount = max(48, (sorted.count - 1) * 24)
+        for index in 0...sampleCount {
+            let x = Float(index) / Float(sampleCount)
+            let y = CurvePoint.interpolatedValue(at: x, in: sorted)
+            let location = CGPoint(x: CGFloat(x) * size.width, y: (1 - CGFloat(y)) * size.height)
+            if index == 0 {
+                line.move(to: location)
+            } else {
+                line.addLine(to: location)
+            }
+        }
+        context.stroke(line, with: .color(channel.systemColor), style: StrokeStyle(lineWidth: 2.1, lineCap: .round, lineJoin: .round))
+
+        for point in sorted {
+            let location = CGPoint(x: CGFloat(point.x) * size.width, y: (1 - CGFloat(point.y)) * size.height)
+            context.fill(Path(ellipseIn: CGRect(x: location.x - 5, y: location.y - 5, width: 10, height: 10)), with: .color(.white))
+            context.stroke(Path(ellipseIn: CGRect(x: location.x - 5, y: location.y - 5, width: 10, height: 10)), with: .color(channel.systemColor), style: StrokeStyle(lineWidth: 1.6))
+        }
+    }
+
+    private func dragGesture(side: CGFloat) -> some Gesture {
+        DragGesture(minimumDistance: 6)
+            .onChanged { value in
+                let location = normalizedLocation(value.location, side: side)
+                if activeIndex == nil {
+                    let nearest = points.enumerated().min {
+                        distance(to: $0.element, from: location, side: side) < distance(to: $1.element, from: location, side: side)
+                    }
+                    if let nearest, distance(to: nearest.element, from: location, side: side) < 24 {
+                        activeIndex = nearest.offset
+                    } else {
+                        let newPoint = CurvePoint(x: location.x, y: location.y)
+                        points.append(newPoint)
+                        points.sort { $0.x < $1.x }
+                        activeIndex = points.firstIndex(of: newPoint)
+                    }
+                }
+                guard let activeIndex, points.indices.contains(activeIndex) else { return }
+                var point = points[activeIndex]
+                let lower = activeIndex == 0 ? 0 : points[activeIndex - 1].x + 0.004
+                let upper = activeIndex == points.count - 1 ? 1 : points[activeIndex + 1].x - 0.004
+                point.x = min(upper, max(lower, location.x))
+                point.y = location.y
+                points[activeIndex] = point
+            }
+            .onEnded { _ in
+                activeIndex = nil
+            }
+    }
+
+    private func tapGesture(side: CGFloat) -> some Gesture {
+        SpatialTapGesture(count: 2)
+            .onEnded { value in
+                let location = normalizedLocation(value.location, side: side)
+                guard let nearest = points.enumerated().min(by: {
+                    distance(to: $0.element, from: location, side: side) < distance(to: $1.element, from: location, side: side)
+                }), nearest.offset > 0, nearest.offset < points.count - 1,
+                distance(to: nearest.element, from: location, side: side) < 24 else { return }
+                activeIndex = nil
+                points.remove(at: nearest.offset)
+            }
+            .exclusively(before: SpatialTapGesture(count: 1).onEnded { value in
+                let location = normalizedLocation(value.location, side: side)
+                let isNearExistingPoint = points.contains {
+                    distance(to: $0, from: location, side: side) < 24
+                }
+                guard !isNearExistingPoint else { return }
+                points.append(CurvePoint(x: location.x, y: location.y))
+                points.sort { $0.x < $1.x }
+            })
+    }
+
+    private func normalizedLocation(_ location: CGPoint, side: CGFloat) -> CurvePoint {
+        CurvePoint(
+            x: Float(min(1, max(0, location.x / max(side, 1)))),
+            y: Float(min(1, max(0, 1 - location.y / max(side, 1))))
+        )
+    }
+
+    private func distance(to point: CurvePoint, from location: CurvePoint, side: CGFloat) -> CGFloat {
+        let dx = CGFloat(point.x - location.x) * side
+        let dy = CGFloat(point.y - location.y) * side
+        return hypot(dx, dy)
     }
 }
 
@@ -510,7 +815,50 @@ private enum ImageEditPipeline {
             filter.amount = max(-1, min(1, recipe.saturation / 100))
             result = filter.outputImage ?? result
         }
+
+        if recipe.hasCurveAdjustments {
+            let dimension = 32
+            var cube = [Float]()
+            cube.reserveCapacity(dimension * dimension * dimension * 4)
+            let rgb = Self.curveLUT(recipe.curveRGB)
+            let red = Self.curveLUT(recipe.curveRed)
+            let green = Self.curveLUT(recipe.curveGreen)
+            let blue = Self.curveLUT(recipe.curveBlue)
+
+            // Core Image's cube layout uses red as the fastest-changing
+            // component and stores RGBA float values for every entry.
+            for blueIndex in 0..<dimension {
+                let blueInput = Float(blueIndex) / Float(dimension - 1)
+                for greenIndex in 0..<dimension {
+                    let greenInput = Float(greenIndex) / Float(dimension - 1)
+                    for redIndex in 0..<dimension {
+                        let redInput = Float(redIndex) / Float(dimension - 1)
+                        let redValue = rgb[Int((redInput * 255).rounded())]
+                        let greenValue = rgb[Int((greenInput * 255).rounded())]
+                        let blueValue = rgb[Int((blueInput * 255).rounded())]
+                        cube.append(red[Int((redValue * 255).rounded())])
+                        cube.append(green[Int((greenValue * 255).rounded())])
+                        cube.append(blue[Int((blueValue * 255).rounded())])
+                        cube.append(1)
+                    }
+                }
+            }
+
+            let cubeFilter = CIFilter.colorCubeWithColorSpace()
+            cubeFilter.inputImage = result
+            cubeFilter.cubeDimension = Float(dimension)
+            cubeFilter.cubeData = cube.withUnsafeBufferPointer { Data(buffer: $0) }
+            cubeFilter.colorSpace = CGColorSpaceCreateDeviceRGB()
+            result = cubeFilter.outputImage ?? result
+        }
         return result
+    }
+
+    private nonisolated static func curveLUT(_ points: [CurvePoint]) -> [Float] {
+        return (0..<256).map { index in
+            let x = Float(index) / 255
+            return CurvePoint.interpolatedValue(at: x, in: points)
+        }
     }
 
     nonisolated static func previewImage(_ image: CIImage, drawableSize: CGSize) -> CIImage {
@@ -557,10 +905,39 @@ struct EditRecipe: Codable, Equatable, Sendable {
     var temperature: Float = 0
     var tint: Float = 0
     var saturation: Float = 0
+    var curveRGB: [CurvePoint] = CurvePoint.identity
+    var curveRed: [CurvePoint] = CurvePoint.identity
+    var curveGreen: [CurvePoint] = CurvePoint.identity
+    var curveBlue: [CurvePoint] = CurvePoint.identity
+
+    nonisolated var hasCurveAdjustments: Bool {
+        curveRGB != CurvePoint.identity
+            || curveRed != CurvePoint.identity
+            || curveGreen != CurvePoint.identity
+            || curveBlue != CurvePoint.identity
+    }
+
+    nonisolated func curve(for channel: CurveChannel) -> [CurvePoint] {
+        switch channel {
+        case .rgb: return curveRGB
+        case .red: return curveRed
+        case .green: return curveGreen
+        case .blue: return curveBlue
+        }
+    }
+
+    var withoutCurves: EditRecipe {
+        var copy = self
+        copy.curveRGB = CurvePoint.identity
+        copy.curveRed = CurvePoint.identity
+        copy.curveGreen = CurvePoint.identity
+        copy.curveBlue = CurvePoint.identity
+        return copy
+    }
 }
 
 private enum AdjustmentSection: String, CaseIterable, Identifiable {
-    case brightness, advancedBrightness, color
+    case brightness, advancedBrightness, color, curves
 
     var id: String { rawValue }
     var title: String {
@@ -568,6 +945,7 @@ private enum AdjustmentSection: String, CaseIterable, Identifiable {
         case .brightness: return "亮度"
         case .advancedBrightness: return "高级亮度"
         case .color: return "颜色"
+        case .curves: return "曲线"
         }
     }
 
@@ -576,6 +954,7 @@ private enum AdjustmentSection: String, CaseIterable, Identifiable {
         case .brightness: return "lightbulb.max"
         case .advancedBrightness: return "sun.max"
         case .color: return "thermometer.sun"
+        case .curves: return "chart.xyaxis.line"
         }
     }
 }
@@ -660,6 +1039,8 @@ struct ImageEditorView: View {
     @State private var previewOpacity: Double = 1
     @State private var isImageTransforming = false
     @State private var editRecipe = EditRecipe()
+    @State private var curveBaseHistogram = HistogramData.empty
+    @State private var selectedCurveChannel: CurveChannel = .rgb
     @State private var rawAdjustmentDefaults: RawAdjustmentDefaults?
     @State private var selectedAdjustmentSection: AdjustmentSection = .brightness
     @State private var usesRawSource = false
@@ -732,14 +1113,15 @@ struct ImageEditorView: View {
                         recipe: editRecipe,
                         rawDefaults: rawAdjustmentDefaults
                     )
-                    .padding(.horizontal, 18)
 
                     HistogramOverlay(
                         image: previewImage,
                         sourceURL: previewSourceURL,
                         recipe: editRecipe,
                         rawDefaults: rawAdjustmentDefaults,
-                        revision: cropRevision
+                        revision: cropRevision,
+                        baseRecipe: editRecipe.withoutCurves,
+                        onBaseData: { curveBaseHistogram = $0 }
                     )
                     .padding(.leading, 27)
                     .padding(.top, 16)
@@ -750,7 +1132,6 @@ struct ImageEditorView: View {
                     .resizable()
                     .scaledToFit()
                     .allowedDynamicRange(.high)
-                    .padding(.horizontal, 18)
                     .transition(.opacity)
             }
         } else {
@@ -865,12 +1246,18 @@ struct ImageEditorView: View {
                         defaultValue: rawAdjustmentDefaults?.tint ?? 0
                     )
                     adjustmentRow("饱和度", value: $editRecipe.saturation)
+                case .curves:
+                    CurveAdjustmentPanel(
+                        recipe: $editRecipe,
+                        selectedChannel: $selectedCurveChannel,
+                        histogram: curveBaseHistogram
+                    )
                 }
             }
         }
         .padding(.horizontal, 18)
         .padding(.top, 2)
-        .frame(maxHeight: 258)
+        .frame(maxHeight: selectedAdjustmentSection == .curves ? 474 : 258)
     }
 
     private func adjustmentRow(
