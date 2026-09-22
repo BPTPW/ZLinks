@@ -11,6 +11,43 @@ import Photos
 import SwiftUI
 import UIKit
 
+private struct LUTAsset: Sendable {
+    let id: String
+    let dimension: Int
+    let rgb16: [UInt16]
+}
+
+private enum LUTLibrary {
+    static let ids = ["无", "FJ1", "FJ2", "FJ3", "FJ4", "FJ5", "A5", "HK", "K1", "K2", "OSK", "TK", "鲜冷", "鲜明", "鲜暖"]
+    private static let lock = NSLock()
+    private nonisolated(unsafe) static var cache: [String: LUTAsset] = [:]
+
+    nonisolated static func load(_ id: String) -> LUTAsset? {
+        guard id != "无" else { return nil }
+        let url = Bundle.main.url(forResource: id, withExtension: "lutbin")
+            ?? Bundle.main.url(forResource: id, withExtension: "lutbin", subdirectory: "LUTs")
+            ?? Bundle.main.urls(forResourcesWithExtension: "lutbin", subdirectory: nil)?.first {
+                $0.deletingPathExtension().lastPathComponent == id
+            }
+        guard let url,               let data = try? Data(contentsOf: url), data.count >= 8 else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached = cache[id] { return cached }
+        let dimension = Int(data.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }.littleEndian)
+        let expected = dimension * dimension * dimension * 3
+        guard dimension > 1, data.count >= 8 + expected * 2 else { return nil }
+        var values = [UInt16](repeating: 0, count: expected)
+        data.withUnsafeBytes { raw in
+            for index in 0..<expected {
+                values[index] = UInt16(littleEndian: raw.loadUnaligned(fromByteOffset: 8 + index * 2, as: UInt16.self))
+            }
+        }
+        let asset = LUTAsset(id: id, dimension: dimension, rgb16: values)
+        cache[id] = asset
+        return asset
+    }
+}
+
 struct ImageEditorAsset: Identifiable {
     let id = UUID()
     let url: URL
@@ -779,6 +816,10 @@ enum ImageEditPipeline {
     ) -> CIImage {
         var result = image
 
+        if let lutID = recipe.lutID, let lut = LUTLibrary.load(lutID) {
+            result = applyLUT(lut, to: result)
+        }
+
         if abs(recipe.exposure) > 0.001 {
             let filter = CIFilter.exposureAdjust()
             filter.inputImage = result
@@ -907,6 +948,25 @@ enum ImageEditPipeline {
         return result
     }
 
+    private nonisolated static func applyLUT(_ lut: LUTAsset, to image: CIImage) -> CIImage {
+        let dimension = lut.dimension
+        var cube = [Float](repeating: 0, count: dimension * dimension * dimension * 4)
+        for index in 0..<(dimension * dimension * dimension) {
+            let source = index * 3
+            let destination = index * 4
+            cube[destination] = Float(lut.rgb16[source]) / 65535
+            cube[destination + 1] = Float(lut.rgb16[source + 1]) / 65535
+            cube[destination + 2] = Float(lut.rgb16[source + 2]) / 65535
+            cube[destination + 3] = 1
+        }
+        let filter = CIFilter.colorCubeWithColorSpace()
+        filter.inputImage = image
+        filter.cubeDimension = Float(dimension)
+        filter.cubeData = cube.withUnsafeBufferPointer { Data(buffer: $0) }
+        filter.colorSpace = CGColorSpaceCreateDeviceRGB()
+        return filter.outputImage ?? image
+    }
+
     private nonisolated static func curveLUT(_ points: [CurvePoint]) -> [Float] {
         return (0..<256).map { index in
             let x = Float(index) / 255
@@ -1012,6 +1072,7 @@ extension ImageEditRenderer {
 /// The complete edit state. Values exposed to the controls use the familiar
 /// -100...100 range; the renderer maps them to Core Image's native ranges.
 struct EditRecipe: Codable, Equatable, Sendable {
+    var lutID: String? = nil
     var exposure: Float = 0
     var brightness: Float = 0
     var contrast: Float = 0
@@ -1027,6 +1088,28 @@ struct EditRecipe: Codable, Equatable, Sendable {
     var curveRed: [CurvePoint] = CurvePoint.identity
     var curveGreen: [CurvePoint] = CurvePoint.identity
     var curveBlue: [CurvePoint] = CurvePoint.identity
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        lutID = try values.decodeIfPresent(String.self, forKey: .lutID)
+        exposure = try values.decodeIfPresent(Float.self, forKey: .exposure) ?? 0
+        brightness = try values.decodeIfPresent(Float.self, forKey: .brightness) ?? 0
+        contrast = try values.decodeIfPresent(Float.self, forKey: .contrast) ?? 0
+        contrastBase = try values.decodeIfPresent(Float.self, forKey: .contrastBase) ?? 0
+        whites = try values.decodeIfPresent(Float.self, forKey: .whites) ?? 0
+        highlights = try values.decodeIfPresent(Float.self, forKey: .highlights) ?? 0
+        shadows = try values.decodeIfPresent(Float.self, forKey: .shadows) ?? 0
+        blacks = try values.decodeIfPresent(Float.self, forKey: .blacks) ?? 0
+        temperature = try values.decodeIfPresent(Float.self, forKey: .temperature) ?? 0
+        tint = try values.decodeIfPresent(Float.self, forKey: .tint) ?? 0
+        saturation = try values.decodeIfPresent(Float.self, forKey: .saturation) ?? 0
+        curveRGB = try values.decodeIfPresent([CurvePoint].self, forKey: .curveRGB) ?? CurvePoint.identity
+        curveRed = try values.decodeIfPresent([CurvePoint].self, forKey: .curveRed) ?? CurvePoint.identity
+        curveGreen = try values.decodeIfPresent([CurvePoint].self, forKey: .curveGreen) ?? CurvePoint.identity
+        curveBlue = try values.decodeIfPresent([CurvePoint].self, forKey: .curveBlue) ?? CurvePoint.identity
+    }
 
     nonisolated var hasCurveAdjustments: Bool {
         curveRGB != CurvePoint.identity
@@ -1051,6 +1134,95 @@ struct EditRecipe: Codable, Equatable, Sendable {
         copy.curveGreen = CurvePoint.identity
         copy.curveBlue = CurvePoint.identity
         return copy
+    }
+}
+
+private struct FilterThumbnail: View {
+    let image: UIImage
+    let sourceURL: URL?
+    let recipe: EditRecipe
+    let lutID: String
+    let index: Int
+    let loader: FilterThumbnailLoader
+    @State private var rendered: UIImage?
+    @State private var isVisible = false
+
+    private struct RenderInput: @unchecked Sendable {
+        let image: UIImage
+        let sourceURL: URL?
+        let recipe: EditRecipe
+        let lutID: String
+    }
+
+    var body: some View {
+        Group {
+            if let rendered {
+                Image(uiImage: rendered)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                Color.secondary.opacity(0.15)
+            }
+        }
+        .opacity(isVisible ? 1 : 0)
+        .animation(.easeIn(duration: 0.28), value: isVisible)
+        .frame(width: 74, height: 74)
+        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .stroke(isSelected ? Color.orange : Color.clear, lineWidth: 2)
+        }
+        .task(id: lutID + String(ObjectIdentifier(image).hashValue)) {
+            await loader.waitForTurn(index)
+            guard !Task.isCancelled else {
+                loader.finished(index)
+                return
+            }
+            var previewRecipe = recipe
+            previewRecipe.lutID = lutID == "无" ? nil : lutID
+            let input = RenderInput(image: image, sourceURL: sourceURL, recipe: previewRecipe, lutID: lutID)
+            let result = await Task.detached(priority: .utility) { () -> UIImage? in
+                guard let source = ImageEditPipeline.sourceImage(uiImage: input.image, sourceURL: input.sourceURL, maximumPixelSize: 240) else { return nil }
+                let adjusted = ImageEditPipeline.adjustedImage(source, recipe: input.recipe, rawDefaults: nil)
+                let context = CIContext(options: [.cacheIntermediates: false])
+                guard let cgImage = context.createCGImage(adjusted, from: adjusted.extent) else { return nil }
+                return UIImage(cgImage: cgImage)
+            }.value
+            guard !Task.isCancelled else {
+                loader.finished(index)
+                return
+            }
+            rendered = result
+            withAnimation(.easeIn(duration: 0.28)) {
+                isVisible = result != nil
+            }
+            loader.finished(index)
+        }
+    }
+
+    private var isSelected: Bool {
+        (recipe.lutID == nil && lutID == "无") || recipe.lutID == lutID
+    }
+}
+
+@MainActor
+private final class FilterThumbnailLoader {
+    private var nextIndex = 0
+
+    func reset() {
+        nextIndex = 0
+    }
+
+    func waitForTurn(_ index: Int) async {
+        while nextIndex != index {
+            if Task.isCancelled { return }
+            try? await Task.sleep(for: .milliseconds(16))
+        }
+    }
+
+    func finished(_ index: Int) {
+        guard nextIndex == index else { return }
+        nextIndex += 1
     }
 }
 
@@ -1164,6 +1336,7 @@ struct ImageEditorView: View {
     @State private var transformOperations: [ImageTransformOperation] = []
     @State private var saveError: String?
     @State private var isExporting = false
+    @State private var filterThumbnailLoader = FilterThumbnailLoader()
 
     var body: some View {
         GeometryReader { proxy in
@@ -1272,11 +1445,20 @@ struct ImageEditorView: View {
                 }
                 .transition(.opacity)
             } else {
-                Image(uiImage: croppedPreview ?? ImageEditRenderer.crop(image, to: normalizedCrop))
-                    .resizable()
-                    .scaledToFit()
-                    .allowedDynamicRange(.high)
-                    .transition(.opacity)
+                let previewImage = croppedPreview ?? ImageEditRenderer.crop(image, to: normalizedCrop)
+                let previewSourceURL = usesRawSource && croppedPreview == nil ? asset.url : nil
+                ZStack {
+                    AdjustmentPreview(
+                        image: previewImage,
+                        sourceURL: previewSourceURL,
+                        recipe: editRecipe,
+                        rawDefaults: rawAdjustmentDefaults
+                    )
+                    if selectedTool == .filters {
+                        Color.clear
+                    }
+                }
+                .transition(.opacity)
             }
         } else {
             ProgressView()
@@ -1341,6 +1523,9 @@ struct ImageEditorView: View {
             } else if selectedTool == .adjustments {
                 adjustmentPanel
                     .transition(.move(edge: .bottom).combined(with: .opacity))
+            } else if selectedTool == .filters {
+                filterPanel
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
             }
 
             toolBar
@@ -1350,6 +1535,45 @@ struct ImageEditorView: View {
         .frame(maxWidth: .infinity)
         .background(Color(uiColor: .systemBackground).ignoresSafeArea(edges: .bottom))
         .animation(.easeInOut(duration: 0.2), value: selectedTool)
+    }
+
+    private var filterPanel: some View {
+        let previewImage = croppedPreview ?? image
+        return ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(Array(LUTLibrary.ids.enumerated()), id: \.element) { index, id in
+                    Button {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        editRecipe.lutID = id == "无" ? nil : id
+                    } label: {
+                        VStack(spacing: 6) {
+                            if let previewImage {
+                                FilterThumbnail(
+                                    image: previewImage,
+                                    sourceURL: usesRawSource && croppedPreview == nil ? asset.url : nil,
+                                    recipe: editRecipe,
+                                    lutID: id,
+                                    index: index,
+                                    loader: filterThumbnailLoader
+                                )
+                            } else {
+                                Color.secondary.opacity(0.15)
+                                    .aspectRatio(1, contentMode: .fit)
+                            }
+                            Text(id)
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle((editRecipe.lutID == nil && id == "无") || editRecipe.lutID == id ? .orange : .primary)
+                        }
+                        .frame(width: 74)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.top, 4)
+            .padding(.horizontal, 4)
+        }
+        .frame(height: 116)
+        .onAppear { filterThumbnailLoader.reset() }
     }
 
     private var adjustmentPanel: some View {
