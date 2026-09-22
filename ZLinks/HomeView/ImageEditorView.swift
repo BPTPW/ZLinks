@@ -216,9 +216,6 @@ private struct HistogramOverlay: View {
     let recipe: EditRecipe
     let rawDefaults: RawAdjustmentDefaults?
     let revision: Int
-    var onData: ((HistogramData) -> Void)? = nil
-    var baseRecipe: EditRecipe? = nil
-    var onBaseData: ((HistogramData) -> Void)? = nil
 
     @State private var data = HistogramData.empty
     @State private var channel: HistogramChannel = .all
@@ -287,19 +284,6 @@ private struct HistogramOverlay: View {
             await processor.submit(input) { result in
                 guard taskRequest == request else { return }
                 data = result
-                onData?(result)
-            }
-            if let baseRecipe {
-                let baseInput = HistogramCalculationInput(
-                    image: image,
-                    sourceURL: sourceURL,
-                    recipe: baseRecipe,
-                    rawDefaults: rawDefaults
-                )
-                await processor.submit(baseInput) { result in
-                    guard taskRequest == request else { return }
-                    onBaseData?(result)
-                }
             }
         }
     }
@@ -356,7 +340,22 @@ private struct HistogramCanvas: View {
 private struct CurveAdjustmentPanel: View {
     @Binding var recipe: EditRecipe
     @Binding var selectedChannel: CurveChannel
-    let histogram: HistogramData
+    let image: UIImage
+    let sourceURL: URL?
+    let rawDefaults: RawAdjustmentDefaults?
+    let revision: Int
+
+    @State private var histogram = HistogramData.empty
+
+    private var histogramRequest: HistogramRequest {
+        HistogramRequest(
+            imageID: ObjectIdentifier(image),
+            revision: revision,
+            recipe: recipe.withoutCurves,
+            sourcePath: sourceURL?.path
+        )
+    }
+
     private var points: Binding<[CurvePoint]> {
         Binding(
             get: { recipe.curve(for: selectedChannel) },
@@ -413,6 +412,25 @@ private struct CurveAdjustmentPanel: View {
                     RoundedRectangle(cornerRadius: 3, style: .continuous)
                         .stroke(.primary.opacity(0.16), lineWidth: 0.7)
                 }
+        }
+        .task(id: histogramRequest) {
+            let request = histogramRequest
+            let input = HistogramCalculationInput(
+                image: image,
+                sourceURL: sourceURL,
+                recipe: request.recipe,
+                rawDefaults: rawDefaults
+            )
+            let result = await Task.detached(priority: .utility) {
+                HistogramCalculator.calculate(
+                    image: input.image,
+                    sourceURL: input.sourceURL,
+                    recipe: input.recipe,
+                    rawDefaults: input.rawDefaults
+                )
+            }.value
+            guard !Task.isCancelled, request == histogramRequest else { return }
+            histogram = result
         }
     }
 }
@@ -1139,7 +1157,6 @@ struct ImageEditorView: View {
     @State private var previewOpacity: Double = 1
     @State private var isImageTransforming = false
     @State private var editRecipe = EditRecipe()
-    @State private var curveBaseHistogram = HistogramData.empty
     @State private var selectedCurveChannel: CurveChannel = .rgb
     @State private var rawAdjustmentDefaults: RawAdjustmentDefaults?
     @State private var selectedAdjustmentSection: AdjustmentSection = .brightness
@@ -1248,9 +1265,7 @@ struct ImageEditorView: View {
                         sourceURL: previewSourceURL,
                         recipe: editRecipe,
                         rawDefaults: rawAdjustmentDefaults,
-                        revision: cropRevision,
-                        baseRecipe: editRecipe.withoutCurves,
-                        onBaseData: { curveBaseHistogram = $0 }
+                        revision: cropRevision
                     )
                     .padding(.leading, 27)
                     .padding(.top, 16)
@@ -1394,11 +1409,16 @@ struct ImageEditorView: View {
                     )
                     adjustmentRow("饱和度", value: $editRecipe.saturation)
                 case .curves:
-                    CurveAdjustmentPanel(
-                        recipe: $editRecipe,
-                        selectedChannel: $selectedCurveChannel,
-                        histogram: curveBaseHistogram
-                    )
+                    if let image {
+                        CurveAdjustmentPanel(
+                            recipe: $editRecipe,
+                            selectedChannel: $selectedCurveChannel,
+                            image: croppedPreview ?? image,
+                            sourceURL: usesRawSource && croppedPreview == nil ? asset.url : nil,
+                            rawDefaults: rawAdjustmentDefaults,
+                            revision: cropRevision
+                        )
+                    }
                 }
             }
         }
