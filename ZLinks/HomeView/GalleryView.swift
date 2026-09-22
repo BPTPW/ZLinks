@@ -1407,11 +1407,11 @@ private struct GalleryPreviewView: View {
     private func beginEditing() {
         guard !isEditOriginalTransferring else { return }
 
-        let source: (handle: UInt32, filename: String)?
+        let source: (handle: UInt32, filename: String, format: ThumbnailCacheService.OriginalFormat)?
         if let handle = item.rawHandle, let filename = item.rawFilename {
-            source = (handle, filename)
+            source = (handle, filename, .raw)
         } else if let handle = item.jpegHandle, let filename = item.jpegFilename {
-            source = (handle, filename)
+            source = (handle, filename, .jpeg)
         } else {
             source = nil
         }
@@ -1426,7 +1426,7 @@ private struct GalleryPreviewView: View {
 
         Task {
             do {
-                let data = try await camera.objectData(for: source.handle) { received, total in
+                let data = try await camera.objectData(for: source.handle, format: source.format) { received, total in
                     guard total > 0 else { return }
                     editTransferProgress = min(Double(received) / Double(total), 1)
                 }
@@ -2363,7 +2363,17 @@ private final class GalleryDownloadStore: ObservableObject {
         let started = Date()
         let id = taskItem.id
         do {
-            let data = try await camera.objectData(for: taskItem.handle) { [weak self] received, total in
+            let originalFormat: ThumbnailCacheService.OriginalFormat? = {
+                switch taskItem.format {
+                case .raw: return .raw
+                case .jpeg: return .jpeg
+                case .editedJPEG: return nil
+                }
+            }()
+            let data = try await camera.objectData(
+                for: taskItem.handle,
+                format: originalFormat
+            ) { [weak self] received, total in
                 guard let self, let current = self.items.firstIndex(where: { $0.id == id }) else { return }
                 self.items[current].receivedBytes = received
                 self.items[current].speed = Date().timeIntervalSince(started) > 0

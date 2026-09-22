@@ -1601,8 +1601,27 @@ final class CameraConnectionService: ObservableObject {
     }
 
     /// Downloads the original object bytes without decoding or recompressing them.
-    func objectData(for handle: UInt32) async -> Data? {
-        if let cached = objectImageCache[handle] { return cached }
+    func objectData(
+        for handle: UInt32,
+        format: ThumbnailCacheService.OriginalFormat? = nil
+    ) async -> Data? {
+        let originalFormat = format ?? originalFormat(for: handle)
+        if let cached = objectImageCache[handle] {
+            if let originalFormat {
+                ThumbnailCacheService.shared.persistOriginalIfEnabled(
+                    cached,
+                    handle: handle,
+                    format: originalFormat
+                )
+            }
+            return cached
+        }
+        ThumbnailCacheService.shared.prepareForOriginalWork()
+        if let originalFormat,
+           let cached = ThumbnailCacheService.shared.loadOriginal(handle: handle, format: originalFormat) {
+            objectImageCache[handle] = cached
+            return cached
+        }
         guard case .connected = state else { return nil }
 
         if linkKind == .usb, usbLink.hasObject(handle: handle) {
@@ -1610,6 +1629,9 @@ final class CameraConnectionService: ObservableObject {
                 let data = try await usbLink.readObjectData(forHandle: handle)
                 guard !data.isEmpty else { return nil }
                 objectImageCache[handle] = data
+                if let originalFormat {
+                    _ = ThumbnailCacheService.shared.storeOriginal(data, handle: handle, format: originalFormat)
+                }
                 return data
             } catch {
                 appendLog(
@@ -1625,6 +1647,9 @@ final class CameraConnectionService: ObservableObject {
             let response = try await operation(.getObject, parameters: [handle], dataPhase: .receive, on: channel, logStyle: .silent)
             guard response.code == PTPResponseCode.ok.rawValue, let data = response.data, !data.isEmpty else { return nil }
             objectImageCache[handle] = data
+            if let originalFormat {
+                _ = ThumbnailCacheService.shared.storeOriginal(data, handle: handle, format: originalFormat)
+            }
             return data
         } catch {
             appendLog("[图库] 原始文件下载失败 handle=0x\(String(format: "%08X", handle)) error=\(error.localizedDescription)")
@@ -1633,7 +1658,30 @@ final class CameraConnectionService: ObservableObject {
     }
 
     /// Reads an object in chunks and reports the number of bytes received after each chunk.
-    func objectData(for handle: UInt32, progress: @escaping @MainActor (UInt64, UInt64) -> Void) async throws -> Data {
+    func objectData(
+        for handle: UInt32,
+        format: ThumbnailCacheService.OriginalFormat? = nil,
+        progress: @escaping @MainActor (UInt64, UInt64) -> Void
+    ) async throws -> Data {
+        let originalFormat = format ?? originalFormat(for: handle)
+        if let cached = objectImageCache[handle] {
+            if let originalFormat {
+                ThumbnailCacheService.shared.persistOriginalIfEnabled(
+                    cached,
+                    handle: handle,
+                    format: originalFormat
+                )
+            }
+            progress(UInt64(cached.count), UInt64(cached.count))
+            return cached
+        }
+        ThumbnailCacheService.shared.prepareForOriginalWork()
+        if let originalFormat,
+           let cached = ThumbnailCacheService.shared.loadOriginal(handle: handle, format: originalFormat) {
+            objectImageCache[handle] = cached
+            progress(UInt64(cached.count), UInt64(cached.count))
+            return cached
+        }
         guard case .connected = state else {
             throw CameraConnectionError.connectionCancelled
         }
@@ -1642,17 +1690,27 @@ final class CameraConnectionService: ObservableObject {
 
         // USB 优先走系统的大块读取通道，吞吐远高于逐条 PTP 轮询。
         if linkKind == .usb, usbLink.hasObject(handle: handle) {
-            return try await usbLink.readObjectData(forHandle: handle) { received, reportedTotal in
+            let data = try await usbLink.readObjectData(forHandle: handle) { received, reportedTotal in
                 progress(received, reportedTotal > 0 ? reportedTotal : total)
             }
+            objectImageCache[handle] = data
+            if let originalFormat {
+                _ = ThumbnailCacheService.shared.storeOriginal(data, handle: handle, format: originalFormat)
+            }
+            return data
         }
 
         guard let channel = commandChannel else {
             throw CameraConnectionError.connectionCancelled
         }
-        return try await fetchPartialObject(handle: handle, on: channel) { received in
+        let data = try await fetchPartialObject(handle: handle, on: channel) { received in
             progress(received, total)
         }
+        objectImageCache[handle] = data
+        if let originalFormat {
+            _ = ThumbnailCacheService.shared.storeOriginal(data, handle: handle, format: originalFormat)
+        }
+        return data
     }
 
     /// Deletes every object belonging to each selected photo. A RAW+JPEG item
@@ -1811,6 +1869,20 @@ final class CameraConnectionService: ObservableObject {
     /// Loads and caches the original image with standard PTP partial-object reads.
     func objectImage(for handle: UInt32) async -> UIImage? {
         if let cached = objectImageCache[handle], let image = UIImage(data: cached) {
+            if let format = originalFormat(for: handle) {
+                ThumbnailCacheService.shared.persistOriginalIfEnabled(
+                    cached,
+                    handle: handle,
+                    format: format
+                )
+            }
+            return image
+        }
+        ThumbnailCacheService.shared.prepareForOriginalWork()
+        if let format = originalFormat(for: handle),
+           let cached = ThumbnailCacheService.shared.loadOriginal(handle: handle, format: format),
+           let image = UIImage(data: cached) {
+            objectImageCache[handle] = cached
             return image
         }
         guard case .connected = state else { return nil }
@@ -1827,6 +1899,9 @@ final class CameraConnectionService: ObservableObject {
                     return nil
                 }
                 objectImageCache[handle] = data
+                if let format = originalFormat(for: handle) {
+                    _ = ThumbnailCacheService.shared.storeOriginal(data, handle: handle, format: format)
+                }
                 return image
             } catch {
                 appendLog(
@@ -1845,11 +1920,25 @@ final class CameraConnectionService: ObservableObject {
                 return nil
             }
             objectImageCache[handle] = data
+            if let format = originalFormat(for: handle) {
+                _ = ThumbnailCacheService.shared.storeOriginal(data, handle: handle, format: format)
+            }
             return image
         } catch {
             appendLog("[图库] 分块原图异常 \(galleryItemLabel(handle: handle, filename: filename)) error=\(error.localizedDescription)")
             return nil
         }
+    }
+
+    private func originalFormat(for handle: UInt32) -> ThumbnailCacheService.OriginalFormat? {
+        for item in galleryItems {
+            if item.rawHandle == handle { return .raw }
+            if item.jpegHandle == handle { return .jpeg }
+            if item.rawHandle == nil && item.jpegHandle == nil && item.handle == handle {
+                return item.filename.lowercased().hasSuffix(".nef") ? .raw : .jpeg
+            }
+        }
+        return nil
     }
 
     private func fetchPartialObject(

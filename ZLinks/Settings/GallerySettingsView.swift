@@ -12,10 +12,15 @@ struct GallerySettingsView: View {
     private var cacheLimitBytes = Int(ThumbnailCacheService.defaultLimitBytes)
     @AppStorage(ThumbnailCacheService.cacheExpirationKey)
     private var cacheExpirationDays = ThumbnailCacheService.defaultExpirationDays
+    @AppStorage(ThumbnailCacheService.originalCacheEnabledKey) private var useOriginalCache = false
+    @AppStorage(ThumbnailCacheService.originalCacheLimitKey)
+    private var originalCacheLimitBytes = Int(ThumbnailCacheService.defaultOriginalLimitBytes)
+    @AppStorage(ThumbnailCacheService.originalCacheExpirationKey)
+    private var originalCacheExpirationDays = ThumbnailCacheService.defaultExpirationDays
 
     var body: some View {
         Form {
-            Section("缓存") {
+            Section("缩略图缓存") {
                 Toggle("使用缩略图缓存", isOn: $useThumbnailCache)
 
                 Picker("缩略图缓存上限", selection: $cacheLimitBytes) {
@@ -44,6 +49,35 @@ struct GallerySettingsView: View {
                 .disabled(thumbnailCache.cachedSize == 0)
             }
 
+            Section("原图缓存") {
+                Toggle("使用原图缓存", isOn: $useOriginalCache)
+
+                Picker("原图缓存上限", selection: $originalCacheLimitBytes) {
+                    ForEach(ThumbnailCacheService.originalCacheLimits) { option in
+                        Text(option.title).tag(Int(option.bytes))
+                    }
+                }
+
+                Picker("原图缓存时限", selection: $originalCacheExpirationDays) {
+                    ForEach(ThumbnailCacheService.expirationOptions, id: \.self) { days in
+                        Text("\(days)天").tag(days)
+                    }
+                }
+
+                HStack {
+                    Text("已缓存大小")
+                    Spacer()
+                    Text(thumbnailCache.originalCachedSizeText)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+
+                Button("清除原图缓存", role: .destructive) {
+                    thumbnailCache.clearOriginalCache()
+                }
+                .disabled(thumbnailCache.originalCachedSize == 0)
+            }
+
             Section("编辑") {
                 NavigationLink {
                     EditedImageListView()
@@ -55,6 +89,10 @@ struct GallerySettingsView: View {
         .navigationTitle("图库")
         .onAppear {
             thumbnailCache.refreshStats()
+            thumbnailCache.prepareForOriginalWork()
+        }
+        .onChange(of: useOriginalCache) { _, _ in
+            thumbnailCache.prepareForOriginalWork()
         }
     }
 }
