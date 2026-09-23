@@ -19,6 +19,7 @@ struct MyCameraView: View {
                     cameraStatusCard
                     storageInfoCard
                     lensInfoCard
+                    bluetoothGPSCard
                     exportLogButton
                 }
                 .padding(.horizontal, 20)
@@ -192,6 +193,96 @@ struct MyCameraView: View {
                 .strokeBorder(.primary.opacity(0.12), lineWidth: 1)
         }
     }
+
+    private var bluetoothGPSCard: some View {
+        let gps = camera.bluetoothGPS
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 10) {
+                Image(systemName: "location.north.circle.fill")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(bluetoothGPSTint)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("蓝牙 GPS 同步")
+                        .font(.title3.bold())
+                    Text("手机持续向相机推送位置，相机自主拍摄时使用最近一次 GPS")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 8)
+                Text(gps.state.title)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(bluetoothGPSTint)
+            }
+
+            if let cameraName = gps.cameraName {
+                detailRow("蓝牙相机", value: cameraName)
+            }
+            if let location = gps.lastLocation {
+                detailRow("最近位置", value: String(format: "%.5f, %.5f", location.coordinate.latitude, location.coordinate.longitude))
+            }
+            if let lastSyncDate = gps.lastSyncDate {
+                detailRow("最近推送", value: Self.gpsDateFormatter.string(from: lastSyncDate))
+            }
+
+            if case let .failed(message) = gps.state {
+                Text(message)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack(spacing: 10) {
+                Button {
+                    camera.startBluetoothGPS()
+                } label: {
+                    Label("连接蓝牙相机", systemImage: "dot.radiowaves.left.and.right")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.glassProminent)
+                .tint(bluetoothGPSTint)
+                .disabled(gps.state == .scanning || gps.state == .connecting || gps.state == .pairing || gps.state == .ready)
+
+                Button {
+                    camera.stopBluetoothGPS()
+                } label: {
+                    Image(systemName: "xmark")
+                        .frame(width: 40, height: 40)
+                }
+                .buttonStyle(.glass)
+                .accessibilityLabel("断开蓝牙 GPS")
+                .disabled(gps.state == .idle)
+            }
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(.clear)
+                .glassEffect(.regular, in: .rect(cornerRadius: 24))
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .strokeBorder(.primary.opacity(0.12), lineWidth: 1)
+        }
+    }
+
+    private var bluetoothGPSTint: Color {
+        switch camera.bluetoothGPS.state {
+        case .ready: return .green
+        case .scanning, .connecting, .pairing: return .blue
+        case .failed: return .red
+        case .unavailable: return .orange
+        case .idle: return .secondary
+        }
+    }
+
+    private static let gpsDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter
+    }()
 
     private func lensMetricModule(title: String, value: String) -> some View {
         VStack(alignment: .leading, spacing: 10) {

@@ -6,11 +6,34 @@
 //
 
 import Foundation
+import CoreLocation
 import Testing
 import UIKit
 @testable import ZLinks
 
 struct ZLinksTests {
+    @Test @MainActor func nikonGeoPayloadHasExpectedWireLayout() {
+        let date = Date(timeIntervalSince1970: 1_735_732_800) // 2025-01-01 12:00:00 UTC
+        let location = CLLocation(
+            coordinate: CLLocationCoordinate2D(latitude: 34.123456, longitude: -118.654321),
+            altitude: 123,
+            horizontalAccuracy: 4,
+            verticalAccuracy: 3,
+            timestamp: date
+        )
+
+        let payload = NikonBluetoothGPSService.makeGeoPayload(location: location, date: date)
+
+        #expect(payload.count == 41)
+        #expect(Array(payload.prefix(2)) == [0x7F, 0x00])
+        #expect(payload[2] == Character("N").asciiValue)
+        #expect(payload[7] == Character("W").asciiValue)
+        #expect(payload[13] == Character("P").asciiValue)
+        #expect(String(data: payload[25..<31], encoding: .ascii) == "WGS-84")
+        #expect(payload[24] == 1)
+        #expect(payload[31..<41].allSatisfy { $0 == 0 })
+    }
+
     @Test @MainActor func editStateRoundTripsCropTransformsAndAdjustments() throws {
         var recipe = EditRecipe()
         recipe.exposure = 23

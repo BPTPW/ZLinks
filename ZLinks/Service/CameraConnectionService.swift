@@ -450,6 +450,8 @@ final class CameraConnectionService: ObservableObject {
 
     /// 当前链路类型：Wi-Fi 或 USB 有线。
     @Published private(set) var linkKind: CameraLinkKind = .wifi
+    /// Nikon Z smart-device BLE GPS link. This is independent from Wi-Fi/USB PTP.
+    let bluetoothGPS = NikonBluetoothGPSService()
     /// USB 有线链路：设备发现、PTP 直通与内容目录。
     let usbLink = USBCameraLink()
     private var commandChannel: (any PTPChannel)?
@@ -458,6 +460,7 @@ final class CameraConnectionService: ObservableObject {
     private var usesUSBFastConnect = false
     private var isUsingUSBCatalogGallery = false
     private var usbLinkObserver: AnyCancellable?
+    private var bluetoothGPSObserver: AnyCancellable?
     private var transactionID: UInt32 = 0
     private var isOperationBusy = false
     private var foregroundOperationWaiters: [CheckedContinuation<Void, Never>] = []
@@ -503,6 +506,12 @@ final class CameraConnectionService: ObservableObject {
     private static let liveViewRefreshIntervalKey = "capture.liveViewRefreshInterval"
 
     init() {
+        bluetoothGPS.setLogHandler { [weak self] message in
+            self?.appendLog(message)
+        }
+        bluetoothGPSObserver = bluetoothGPS.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
         if let rawValue = UserDefaults.standard.string(forKey: Self.liveViewRefreshIntervalKey),
            let interval = LiveViewRefreshInterval(rawValue: rawValue)
         {
@@ -1980,6 +1989,15 @@ final class CameraConnectionService: ObservableObject {
 
     func clearDebugLog() {
         debugLog = ""
+    }
+
+    func startBluetoothGPS() {
+        appendLog("[ble-gps] 用户启动蓝牙 GPS；手机将持续向相机 GEO 推送位置")
+        bluetoothGPS.start()
+    }
+
+    func stopBluetoothGPS() {
+        bluetoothGPS.disconnect()
     }
 
     func clearCaptureControlError() {
