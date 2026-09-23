@@ -81,6 +81,7 @@ final class ThumbnailCacheService: ObservableObject {
         try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory
     }()
+
     private lazy var originalIndexURL: URL = originalRootURL.appendingPathComponent("index.json")
     private lazy var dateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -440,7 +441,9 @@ final class ThumbnailCacheService: ObservableObject {
             let bytes = UInt64(max(0, size.int64Value))
             total = total.addingReportingOverflow(bytes).overflow ? UInt64.max : total + bytes
         }
-        for key in staleKeys { originalEntries[key] = nil }
+        for key in staleKeys {
+            originalEntries[key] = nil
+        }
         if !staleKeys.isEmpty { persistOriginalIndex() }
         originalCachedSize = total
     }

@@ -26,8 +26,8 @@ enum AppOrientationController {
         supportedOrientations = orientations
 
         for case let windowScene as UIWindowScene in UIApplication.shared.connectedScenes {
-            windowScene.windows.forEach {
-                $0.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+            for window in windowScene.windows {
+                window.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
             }
             windowScene.requestGeometryUpdate(
                 .iOS(interfaceOrientations: orientations)

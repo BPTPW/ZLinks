@@ -663,10 +663,12 @@ struct GalleryView: View {
     ) -> GalleryDownload? {
         let source: (handle: UInt32, filename: String, fileSize: UInt64, record: EditedImageRecord)?
         if let handle = item.rawHandle, let filename = item.rawFilename,
-           let record = editedStore.record(handle: handle, filename: filename) {
+           let record = editedStore.record(handle: handle, filename: filename)
+        {
             source = (handle, filename, item.rawFileSize ?? 0, record)
         } else if let handle = item.jpegHandle, let filename = item.jpegFilename,
-                  let record = editedStore.record(handle: handle, filename: filename) {
+                  let record = editedStore.record(handle: handle, filename: filename)
+        {
             source = (handle, filename, item.jpegFileSize ?? 0, record)
         } else {
             source = nil
@@ -686,7 +688,8 @@ struct GalleryView: View {
 
     private func editedRecord(for item: CameraConnectionService.GalleryItem) -> EditedImageRecord? {
         if let handle = item.rawHandle, let filename = item.rawFilename,
-           let record = editedStore.record(handle: handle, filename: filename) {
+           let record = editedStore.record(handle: handle, filename: filename)
+        {
             return record
         }
         if let handle = item.jpegHandle, let filename = item.jpegFilename {
@@ -1364,7 +1367,8 @@ private struct GalleryPreviewView: View {
     private var isImmersive: Bool { scale > 1.01 || !controlsVisible }
     private var editedRecord: EditedImageRecord? {
         if let handle = item.rawHandle, let filename = item.rawFilename,
-           let record = editedStore.record(handle: handle, filename: filename) {
+           let record = editedStore.record(handle: handle, filename: filename)
+        {
             return record
         }
         if let handle = item.jpegHandle, let filename = item.jpegFilename {
@@ -1372,6 +1376,7 @@ private struct GalleryPreviewView: View {
         }
         return nil
     }
+
     private var isProtected: Bool { protectionOverride ?? item.isProtected }
     private var protectionErrorPresented: Binding<Bool> {
         Binding(
@@ -2082,7 +2087,8 @@ private struct GalleryThumbnailCell: View {
 
     private var editedRecord: EditedImageRecord? {
         if let handle = item.rawHandle, let filename = item.rawFilename,
-           let record = editedStore.record(handle: handle, filename: filename) {
+           let record = editedStore.record(handle: handle, filename: filename)
+        {
             return record
         }
         if let handle = item.jpegHandle, let filename = item.jpegFilename {

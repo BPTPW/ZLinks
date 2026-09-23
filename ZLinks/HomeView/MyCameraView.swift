@@ -3,9 +3,9 @@
 //  ZLinks
 //
 
+import MapKit
 import SwiftUI
 import UIKit
-import MapKit
 
 struct MyCameraView: View {
     @EnvironmentObject private var camera: CameraConnectionService
@@ -1079,7 +1079,6 @@ private struct BluetoothGPSConnectionView: View {
                         RoundedRectangle(cornerRadius: 22, style: .continuous)
                             .strokeBorder(.primary.opacity(0.12), lineWidth: 1)
                     }
-
                 }
                 .padding(.horizontal, 20)
                 .padding(.bottom, 28)

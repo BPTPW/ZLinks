@@ -29,7 +29,7 @@ private enum LUTLibrary {
             ?? Bundle.main.urls(forResourcesWithExtension: "lutbin", subdirectory: nil)?.first {
                 $0.deletingPathExtension().lastPathComponent == id
             }
-        guard let url,               let data = try? Data(contentsOf: url), data.count >= 8 else { return nil }
+        guard let url, let data = try? Data(contentsOf: url), data.count >= 8 else { return nil }
         lock.lock()
         defer { lock.unlock() }
         if let cached = cache[id] { return cached }
@@ -1013,9 +1013,9 @@ extension ImageEditRenderer {
         {
             let width = (properties[kCGImagePropertyPixelWidth as String] as? NSNumber)?.intValue ?? 0
             let height = (properties[kCGImagePropertyPixelHeight as String] as? NSNumber)?.intValue ?? 0
-            maximumPixelSize = max(width, height, 16_384)
+            maximumPixelSize = max(width, height, 16384)
         } else {
-            maximumPixelSize = 16_384
+            maximumPixelSize = 16384
         }
 
         return editedPreview(

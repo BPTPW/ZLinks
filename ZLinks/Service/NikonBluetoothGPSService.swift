@@ -3,10 +3,10 @@
 //  ZLinks
 //
 
+import Combine
+import CommonCrypto
 import CoreBluetooth
 import CoreLocation
-import CommonCrypto
-import Combine
 import Foundation
 
 /// Nikon Z smart-device BLE GPS transport.
@@ -268,7 +268,7 @@ final class NikonBluetoothGPSService: NSObject, ObservableObject {
             stage1Nonce = savedNonce.uint32Value
             appendLog("[ble-gps] 复用已保存的控制器身份")
         } else {
-            stage1Device = (UInt32.random(in: UInt32.min...UInt32.max) & 0xFFFFFF00) | 0x01
+            stage1Device = (UInt32.random(in: UInt32.min...UInt32.max) & 0xffffff00) | 0x01
             stage1Nonce = UInt32.random(in: UInt32.min...UInt32.max)
             defaults.set(UInt64(stage1Device), forKey: Self.controllerDeviceKey)
             defaults.set(UInt64(stage1Nonce), forKey: Self.controllerNonceKey)
@@ -297,19 +297,19 @@ final class NikonBluetoothGPSService: NSObject, ObservableObject {
 
     static func makeGeoPayload(location: CLLocation, date: Date) -> Data {
         var bytes = [UInt8](repeating: 0, count: 41)
-        bytes[0] = 0x7F; bytes[1] = 0x00
-        encodeCoordinate(location.coordinate.latitude, directionPositive: 0x4E, directionNegative: 0x53, into: &bytes, offset: 2)
+        bytes[0] = 0x7f; bytes[1] = 0x00
+        encodeCoordinate(location.coordinate.latitude, directionPositive: 0x4e, directionNegative: 0x53, into: &bytes, offset: 2)
         encodeCoordinate(location.coordinate.longitude, directionPositive: 0x45, directionNegative: 0x57, into: &bytes, offset: 7)
         let accuracy = location.horizontalAccuracy
         bytes[12] = accuracy <= 5 ? 12 : accuracy <= 10 ? 10 : accuracy <= 25 ? 8 : accuracy <= 50 ? 6 : 4
         let altitude = location.verticalAccuracy >= 0 ? location.altitude : 0
-        bytes[13] = altitude < 0 ? 0x4D : 0x50
+        bytes[13] = altitude < 0 ? 0x4d : 0x50
         let absoluteAltitude = UInt16(min(max(abs(Int(altitude.rounded())), 0), Int(UInt16.max)))
-        bytes[14] = UInt8(absoluteAltitude & 0xFF); bytes[15] = UInt8(absoluteAltitude >> 8)
+        bytes[14] = UInt8(absoluteAltitude & 0xff); bytes[15] = UInt8(absoluteAltitude >> 8)
         var calendar = Calendar(identifier: .gregorian); calendar.timeZone = TimeZone(secondsFromGMT: 0)!
         let components = calendar.dateComponents([.year, .month, .day, .hour, .minute, .second], from: date)
         let year = UInt16(min(max(components.year ?? 1970, 0), Int(UInt16.max)))
-        bytes[16] = UInt8(year & 0xFF); bytes[17] = UInt8(year >> 8)
+        bytes[16] = UInt8(year & 0xff); bytes[17] = UInt8(year >> 8)
         bytes[18] = UInt8(components.month ?? 1); bytes[19] = UInt8(components.day ?? 1)
         bytes[20] = UInt8(components.hour ?? 0); bytes[21] = UInt8(components.minute ?? 0); bytes[22] = UInt8(components.second ?? 0)
         bytes[23] = UInt8((date.timeIntervalSince1970 * 100).rounded().truncatingRemainder(dividingBy: 100))
@@ -331,8 +331,8 @@ final class NikonBluetoothGPSService: NSObject, ObservableObject {
         let ourTimestamp = readLE64(stage1, at: 1)
         let cameraDevice = readLE32(stage2, at: 9)
         let cameraNonce = readLE32(stage2, at: 13)
-        let camLo = UInt32(cameraTimestamp & 0xFFFFFFFF), camHi = UInt32(cameraTimestamp >> 32)
-        let ourLo = UInt32(ourTimestamp & 0xFFFFFFFF), ourHi = UInt32(ourTimestamp >> 32)
+        let camLo = UInt32(cameraTimestamp & 0xffffffff), camHi = UInt32(cameraTimestamp >> 32)
+        let ourLo = UInt32(ourTimestamp & 0xffffffff), ourHi = UInt32(ourTimestamp >> 32)
         var matched: Int?
         for (index, salt) in salts.enumerated() {
             let hash = blowfishHash([salt.0, salt.1, camLo.byteSwapped, camHi.byteSwapped, ourLo.byteSwapped, ourHi.byteSwapped])
@@ -391,7 +391,7 @@ extension NikonBluetoothGPSService: CBCentralManagerDelegate {
         }
     }
 
-    nonisolated func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
+    nonisolated func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
         Task { @MainActor [weak self] in
             guard let self, self.shouldStayConnected, self.state == .scanning, self.peripheral == nil else { return }
             let serviceUUIDs = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
@@ -409,7 +409,7 @@ extension NikonBluetoothGPSService: CBCentralManagerDelegate {
         }
     }
 
-    nonisolated func centralManager(_ central: CBCentralManager, willRestoreState dict: [String : Any]) {
+    nonisolated func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
         Task { @MainActor [weak self] in
             guard let self else { return }
             let restored = (dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral])?.first
@@ -452,7 +452,7 @@ extension NikonBluetoothGPSService: CBCentralManagerDelegate {
         idWriteTask?.cancel(); idWriteTask = nil
         pairingConfirmationTask?.cancel(); pairingConfirmationTask = nil
         pendingStage1 = nil; matchedSaltIndex = nil
-        if !wasReady { self.peripheral = nil }
+        if !wasReady { peripheral = nil }
         reconnectTask?.cancel(); reconnectTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(3))
             guard let self, !Task.isCancelled, self.shouldStayConnected else { return }
@@ -481,7 +481,9 @@ extension NikonBluetoothGPSService: CBPeripheralDelegate {
     nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         Task { @MainActor [weak self] in
             guard let self else { return }; if let error { self.failAndRetry("特征发现失败 error=\(error.localizedDescription)"); return }
-            for characteristic in service.characteristics ?? [] { switch characteristic.uuid { case Self.pairUUID: self.pairCharacteristic = characteristic; peripheral.setNotifyValue(true, for: characteristic); case Self.idUUID: self.idCharacteristic = characteristic; case Self.geoUUID: self.geoCharacteristic = characteristic; case Self.not1UUID: self.not1Characteristic = characteristic; peripheral.setNotifyValue(true, for: characteristic); default: break } }
+            for characteristic in service.characteristics ?? [] {
+                switch characteristic.uuid { case Self.pairUUID: self.pairCharacteristic = characteristic; peripheral.setNotifyValue(true, for: characteristic); case Self.idUUID: self.idCharacteristic = characteristic; case Self.geoUUID: self.geoCharacteristic = characteristic; case Self.not1UUID: self.not1Characteristic = characteristic; peripheral.setNotifyValue(true, for: characteristic); default: break }
+            }
             guard self.pairCharacteristic != nil, self.geoCharacteristic != nil else { self.failAndRetry("缺少 PAIR/GEO 特征"); return }
             self.state = .pairing; self.appendLog("[ble-gps] 特征已发现；如相机要求首次配对，将等待 PAIR challenge")
             self.startSyncLoop()
@@ -558,6 +560,7 @@ extension NikonBluetoothGPSService: CLLocationManagerDelegate {
             if manager.authorizationStatus == .authorizedWhenInUse { self.requestLocationAuthorization() }
         }
     }
+
     nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -565,6 +568,7 @@ extension NikonBluetoothGPSService: CLLocationManagerDelegate {
             if self.canWriteGeo { await self.writeLatestLocationIfAvailable() }
         }
     }
+
     nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         Task { @MainActor [weak self] in self?.appendLog("[ble-gps] 定位失败 error=\(error.localizedDescription)") }
     }

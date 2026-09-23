@@ -39,13 +39,13 @@ struct ImageCropEditorView: View {
                     recipe: recipe,
                     rawDefaults: rawDefaults
                 )
-                    .frame(width: imageFrame.width, height: imageFrame.height)
-                    .position(x: imageFrame.midX, y: imageFrame.midY)
-                    .rotationEffect(previewRotation)
-                    .scaleEffect(x: previewScaleX, y: previewScaleY)
-                    .opacity(imageOpacity)
-                    .gesture(imageDragGesture)
-                    .simultaneousGesture(imageMagnificationGesture)
+                .frame(width: imageFrame.width, height: imageFrame.height)
+                .position(x: imageFrame.midX, y: imageFrame.midY)
+                .rotationEffect(previewRotation)
+                .scaleEffect(x: previewScaleX, y: previewScaleY)
+                .opacity(imageOpacity)
+                .gesture(imageDragGesture)
+                .simultaneousGesture(imageMagnificationGesture)
 
                 cropOverlay
 
@@ -421,14 +421,14 @@ enum ImageEditRenderer {
         }
     }
 
-    nonisolated private static func normalizedImage(_ image: UIImage) -> UIImage {
+    private nonisolated static func normalizedImage(_ image: UIImage) -> UIImage {
         guard image.imageOrientation != .up else { return image }
         return render(size: image.size, scale: image.scale) { _ in
             image.draw(in: CGRect(origin: .zero, size: image.size))
         }
     }
 
-    nonisolated private static func render(
+    private nonisolated static func render(
         size: CGSize,
         scale: CGFloat,
         drawing: (CGContext) -> Void
