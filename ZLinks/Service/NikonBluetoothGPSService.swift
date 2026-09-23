@@ -24,6 +24,7 @@ final class NikonBluetoothGPSService: NSObject, ObservableObject {
         case scanning
         case connecting
         case pairing
+        case reconnecting
         case ready
         case failed(String)
 
@@ -31,10 +32,9 @@ final class NikonBluetoothGPSService: NSObject, ObservableObject {
             switch self {
             case .unavailable: return "蓝牙不可用"
             case .idle: return "未连接"
-            case .scanning: return "正在搜索相机"
-            case .connecting: return "正在连接"
-            case .pairing: return "等待相机确认"
-            case .ready: return "GPS 已同步"
+            case .scanning, .connecting, .pairing: return "连接中"
+            case .reconnecting: return "重新连接"
+            case .ready: return "连接成功"
             case .failed: return "连接失败"
             }
         }
@@ -45,6 +45,20 @@ final class NikonBluetoothGPSService: NSObject, ObservableObject {
     @Published private(set) var lastLocation: CLLocation?
     @Published private(set) var lastSyncDate: Date?
     @Published private(set) var lastError: String?
+
+    var connectionStepDescription: String {
+        switch state {
+        case .unavailable: return "请打开蓝牙并允许定位权限。"
+        case .idle: return "点击连接后，手机会持续向相机同步定位。"
+        case .scanning: return "正在搜索 Nikon Smart Device。"
+        case .connecting: return "正在建立相机的 BLE 连接并发现服务。"
+        case .pairing: return "正在完成 Nikon 配对握手并等待相机确认。"
+        case .reconnecting: return "相机连接已中断，正在自动重新连接。"
+        case .ready: return "手机会持续向相机推送最近一次定位。"
+        case .failed:
+            return "首次连接或曾使用过 SnapBridge，请前往设置手动忽略相机蓝牙。"
+        }
+    }
 
     static let serviceUUID = CBUUID(string: "0000DE00-3DD4-4255-8D62-6DC7B9BD5561")
     private static let pairUUID = CBUUID(string: "00002000-3DD4-4255-8D62-6DC7B9BD5561")
@@ -85,6 +99,7 @@ final class NikonBluetoothGPSService: NSObject, ObservableObject {
     private var shouldStayConnected = false
     private static let controllerDeviceKey = "nikon.ble.controller.device"
     private static let controllerNonceKey = "nikon.ble.controller.nonce"
+    private static let peripheralIdentifierKey = "nikon.ble.peripheral.identifier"
 
     init(logHandler: ((String) -> Void)? = nil) {
         self.logHandler = logHandler
@@ -110,7 +125,34 @@ final class NikonBluetoothGPSService: NSObject, ObservableObject {
             appendLog("[ble-gps] 等待蓝牙可用 state=\(centralStateName)")
             return
         }
-        scan()
+        if !connectToKnownPeripheralIfAvailable() { scan() }
+    }
+
+    func retry() {
+        shouldStayConnected = true
+        lastError = nil
+        requestLocationAuthorization()
+        locationManager.startUpdatingLocation()
+        guard central.state == .poweredOn else {
+            state = .connecting
+            return
+        }
+        if !connectToKnownPeripheralIfAvailable() { scan() }
+    }
+
+    @discardableResult
+    private func connectToKnownPeripheralIfAvailable() -> Bool {
+        guard let rawIdentifier = UserDefaults.standard.string(forKey: Self.peripheralIdentifierKey),
+              let identifier = UUID(uuidString: rawIdentifier),
+              let knownPeripheral = central.retrievePeripherals(withIdentifiers: [identifier]).first
+        else { return false }
+        peripheral = knownPeripheral
+        cameraName = knownPeripheral.name ?? cameraName
+        knownPeripheral.delegate = self
+        state = .connecting
+        appendLog("[ble-gps] 尝试恢复已保存的相机标识")
+        central.connect(knownPeripheral, options: connectionOptions)
+        return true
     }
 
     func disconnect() {
@@ -343,7 +385,9 @@ extension NikonBluetoothGPSService: CBCentralManagerDelegate {
         Task { @MainActor [weak self] in
             guard let self else { return }
             self.appendLog("[ble-gps] 蓝牙状态=\(self.centralStateName)")
-            if central.state == .poweredOn, self.shouldStayConnected { self.scan() }
+            if central.state == .poweredOn, self.shouldStayConnected {
+                if !self.connectToKnownPeripheralIfAvailable() { self.scan() }
+            }
         }
     }
 
@@ -357,6 +401,7 @@ extension NikonBluetoothGPSService: CBCentralManagerDelegate {
             } ?? false
             guard serviceUUIDs.contains(Self.serviceUUID) || isNikonManufacturer else { return }
             central.stopScan(); self.peripheral = peripheral; self.cameraName = peripheral.name ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String)
+            UserDefaults.standard.set(peripheral.identifier.uuidString, forKey: Self.peripheralIdentifierKey)
             self.state = .connecting; self.appendLog("[ble-gps] 发现相机 name=\(self.cameraName ?? "--") rssi=\(RSSI)")
             peripheral.delegate = self
             self.appendLog("[ble-gps] 请求连接并启用 BLE→Classic transport bridging")
@@ -384,19 +429,22 @@ extension NikonBluetoothGPSService: CBCentralManagerDelegate {
     }
 
     nonisolated func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        Task { @MainActor [weak self] in self?.failAndRetry("GATT 连接失败 error=\(error?.localizedDescription ?? "unknown")") }
+        Task { @MainActor [weak self] in self?.failAndRetry("GATT 连接失败 error=\(error?.localizedDescription ?? "unknown")", peripheral: peripheral) }
     }
 
     nonisolated func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         Task { @MainActor [weak self] in
             guard let self else { return }
-            self.peripheral = nil
-            self.failAndRetry("GATT 断开 error=\(error?.localizedDescription ?? "none")")
+            self.failAndRetry("GATT 断开 error=\(error?.localizedDescription ?? "none")", peripheral: peripheral)
         }
     }
 
-    private func failAndRetry(_ message: String) {
-        guard shouldStayConnected else { return }; appendLog("[ble-gps] \(message)"); lastError = message; state = .failed(message)
+    private func failAndRetry(_ message: String, peripheral disconnectedPeripheral: CBPeripheral? = nil) {
+        guard shouldStayConnected else { return }
+        let wasReady = state == .ready || state == .reconnecting
+        appendLog("[ble-gps] \(message)")
+        lastError = wasReady ? nil : message
+        state = wasReady ? .reconnecting : .failed(message)
         pairCharacteristic = nil; idCharacteristic = nil; geoCharacteristic = nil; not1Characteristic = nil
         pairNotificationsEnabled = false; not1NotificationsEnabled = false
         canWriteGeo = false
@@ -404,7 +452,20 @@ extension NikonBluetoothGPSService: CBCentralManagerDelegate {
         idWriteTask?.cancel(); idWriteTask = nil
         pairingConfirmationTask?.cancel(); pairingConfirmationTask = nil
         pendingStage1 = nil; matchedSaltIndex = nil
-        reconnectTask?.cancel(); reconnectTask = Task { [weak self] in try? await Task.sleep(for: .seconds(3)); guard let self, !Task.isCancelled else { return }; self.scan() }
+        if !wasReady { self.peripheral = nil }
+        reconnectTask?.cancel(); reconnectTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            guard let self, !Task.isCancelled, self.shouldStayConnected else { return }
+            if wasReady, let disconnectedPeripheral {
+                self.peripheral = disconnectedPeripheral
+                self.state = .reconnecting
+                self.appendLog("[ble-gps] 尝试恢复已知相机连接")
+                self.central.connect(disconnectedPeripheral, options: self.connectionOptions)
+            } else {
+                self.peripheral = nil
+                self.scan()
+            }
+        }
     }
 }
 

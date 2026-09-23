@@ -501,6 +501,8 @@ final class CameraConnectionService: ObservableObject {
     private var capturePropertyRefreshTask: Task<Void, Never>?
     private var capturePropertyDescriptions: [CaptureParameter: CapturePropertyDescription] = [:]
     private var foregroundObserver: NSObjectProtocol?
+    private var shouldResumePTPAfterBluetooth = false
+    private var bluetoothResumeTask: Task<Void, Never>?
 
     private static let lastConnectedHostKey = "camera.lastConnectedHost"
     private static let liveViewRefreshIntervalKey = "capture.liveViewRefreshInterval"
@@ -1998,6 +2000,42 @@ final class CameraConnectionService: ObservableObject {
 
     func stopBluetoothGPS() {
         bluetoothGPS.disconnect()
+    }
+
+    /// BLE GPS and PTP use mutually exclusive camera transports. Keep the
+    /// remembered Wi-Fi endpoint so the PTP session can be restored later.
+    func openBluetoothGPSSession() {
+        bluetoothResumeTask?.cancel()
+        bluetoothResumeTask = nil
+        shouldResumePTPAfterBluetooth = state == .connected
+            && linkKind == .wifi
+            && lastEndpoint != nil
+            && lastDisplayHost != nil
+        if state != .disconnected {
+            appendLog("[ble-gps] 暂停现有 PTP 连接")
+            disconnect(clearRememberedDevice: false)
+        }
+        startBluetoothGPS()
+    }
+
+    func closeBluetoothGPSSession() {
+        stopBluetoothGPS()
+        guard shouldResumePTPAfterBluetooth,
+              lastEndpoint != nil,
+              let displayHost = lastDisplayHost
+        else {
+            shouldResumePTPAfterBluetooth = false
+            return
+        }
+        shouldResumePTPAfterBluetooth = false
+        appendLog("[ble-gps] 已请求恢复 PTP endpoint=\(displayHost):15740")
+        bluetoothResumeTask?.cancel()
+        bluetoothResumeTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1))
+            guard let self, !Task.isCancelled else { return }
+            self.beginAutomaticReconnect(reason: "停止 GPS 同步后恢复 PTP")
+            self.bluetoothResumeTask = nil
+        }
     }
 
     func clearCaptureControlError() {

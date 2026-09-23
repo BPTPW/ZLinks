@@ -5,10 +5,12 @@
 
 import SwiftUI
 import UIKit
+import MapKit
 
 struct MyCameraView: View {
     @EnvironmentObject private var camera: CameraConnectionService
     @State private var isConnectionSheetPresented = false
+    @State private var isBluetoothGPSPresented = false
     @State private var isShareSheetPresented = false
     @State private var exportedLogURL: URL?
 
@@ -59,6 +61,11 @@ struct MyCameraView: View {
                     ActivityViewController(activityItems: [exportedLogURL])
                         .ignoresSafeArea()
                 }
+            }
+            .fullScreenCover(isPresented: $isBluetoothGPSPresented, onDismiss: {
+                camera.closeBluetoothGPSSession()
+            }) {
+                BluetoothGPSConnectionView(camera: camera)
             }
             .task(id: camera.state) {
                 await camera.refreshCameraStatusPeriodically()
@@ -195,67 +202,32 @@ struct MyCameraView: View {
     }
 
     private var bluetoothGPSCard: some View {
-        let gps = camera.bluetoothGPS
-        return VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 10) {
-                Image(systemName: "location.north.circle.fill")
-                    .font(.title3.weight(.semibold))
-                    .foregroundStyle(bluetoothGPSTint)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("蓝牙 GPS 同步")
-                        .font(.title3.bold())
-                    Text("手机持续向相机推送位置，相机自主拍摄时使用最近一次 GPS")
-                        .font(.caption)
+        Button {
+            camera.openBluetoothGPSSession()
+            isBluetoothGPSPresented = true
+        } label: {
+            HStack(spacing: 14) {
+                Image(systemName: "mappin.and.ellipse.circle")
+                    .font(.system(size: 27, weight: .semibold))
+                    .foregroundStyle(.cyan)
+                    .frame(width: 42, height: 42)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("GPS同步")
+                        .font(.headline.weight(.semibold))
+                    Text("蓝牙配对相机并进行gps同步")
+                        .font(.subheadline)
                         .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 8)
-                Text(gps.state.title)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(bluetoothGPSTint)
+                Image(systemName: "chevron.right")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.tertiary)
             }
-
-            if let cameraName = gps.cameraName {
-                detailRow("蓝牙相机", value: cameraName)
-            }
-            if let location = gps.lastLocation {
-                detailRow("最近位置", value: String(format: "%.5f, %.5f", location.coordinate.latitude, location.coordinate.longitude))
-            }
-            if let lastSyncDate = gps.lastSyncDate {
-                detailRow("最近推送", value: Self.gpsDateFormatter.string(from: lastSyncDate))
-            }
-
-            if case let .failed(message) = gps.state {
-                Text(message)
-                    .font(.footnote)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            HStack(spacing: 10) {
-                Button {
-                    camera.startBluetoothGPS()
-                } label: {
-                    Label("连接蓝牙相机", systemImage: "dot.radiowaves.left.and.right")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.glassProminent)
-                .tint(bluetoothGPSTint)
-                .disabled(gps.state == .scanning || gps.state == .connecting || gps.state == .pairing || gps.state == .ready)
-
-                Button {
-                    camera.stopBluetoothGPS()
-                } label: {
-                    Image(systemName: "xmark")
-                        .frame(width: 40, height: 40)
-                }
-                .buttonStyle(.glass)
-                .accessibilityLabel("断开蓝牙 GPS")
-                .disabled(gps.state == .idle)
-            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
         .padding(18)
-        .frame(maxWidth: .infinity, alignment: .leading)
         .background {
             RoundedRectangle(cornerRadius: 24, style: .continuous)
                 .fill(.clear)
@@ -266,23 +238,6 @@ struct MyCameraView: View {
                 .strokeBorder(.primary.opacity(0.12), lineWidth: 1)
         }
     }
-
-    private var bluetoothGPSTint: Color {
-        switch camera.bluetoothGPS.state {
-        case .ready: return .green
-        case .scanning, .connecting, .pairing: return .blue
-        case .failed: return .red
-        case .unavailable: return .orange
-        case .idle: return .secondary
-        }
-    }
-
-    private static let gpsDateFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "zh_CN")
-        formatter.dateFormat = "HH:mm:ss"
-        return formatter
-    }()
 
     private func lensMetricModule(title: String, value: String) -> some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1062,6 +1017,136 @@ struct CameraConnectionSheet: View {
         }
         .tint(.primary)
     }
+}
+
+private struct BluetoothGPSConnectionView: View {
+    @ObservedObject var camera: CameraConnectionService
+    @Environment(\.dismiss) private var dismiss
+    @State private var mapPosition: MapCameraPosition = .automatic
+
+    private var gps: NikonBluetoothGPSService { camera.bluetoothGPS }
+
+    var body: some View {
+        ZStack {
+            Color(.systemGroupedBackground).ignoresSafeArea()
+            ScrollView {
+                VStack(spacing: 20) {
+                    Image(systemName: "mappin.and.ellipse.circle.fill")
+                        .font(.system(size: 62, weight: .medium))
+                        .foregroundStyle(statusTint)
+                        .padding(.top, 18)
+
+                    Text("GPS 同步")
+                        .font(.largeTitle.bold())
+
+                    Text(gps.state.title)
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(statusTint)
+
+                    Text(gps.connectionStepDescription)
+                        .font(.subheadline)
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: 520)
+                        .padding(14)
+                        .background(statusTint.opacity(0.12), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+
+                    if case .failed = gps.state {
+                        Button {
+                            gps.retry()
+                        } label: {
+                            Label("重试", systemImage: "arrow.clockwise")
+                                .font(.headline)
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.glassProminent)
+                        .tint(.blue)
+                    }
+
+                    if let location = gps.lastLocation {
+                        locationSummary(location)
+                    }
+
+                    Map(position: $mapPosition) {
+                        if let location = gps.lastLocation {
+                            Marker("当前位置", coordinate: location.coordinate)
+                                .tint(.cyan)
+                        }
+                    }
+                    .frame(minHeight: 260, maxHeight: 340)
+                    .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 22, style: .continuous)
+                            .strokeBorder(.primary.opacity(0.12), lineWidth: 1)
+                    }
+
+                }
+                .padding(.horizontal, 20)
+                .padding(.bottom, 28)
+            }
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            Button(role: .destructive) {
+                dismiss()
+            } label: {
+                Text("停止 GPS 同步")
+                    .font(.headline)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .foregroundStyle(.primary)
+            }
+            .buttonStyle(.glassProminent)
+            .tint(.red)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 10)
+        }
+        .interactiveDismissDisabled()
+        .onAppear { recenterMap() }
+        .onChange(of: gps.lastLocation?.timestamp) { _, _ in recenterMap() }
+    }
+
+    private func locationSummary(_ location: CLLocation) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text(String(format: "纬度 %.6f， 经度 %.6f", location.coordinate.latitude, location.coordinate.longitude))
+                .font(.headline.monospacedDigit())
+            Text(String(format: "误差 %.1f 米", max(location.horizontalAccuracy, 0)))
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            if let date = gps.lastSyncDate {
+                Text("上次同步 \(Self.dateFormatter.string(from: date))")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .background(.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    private func recenterMap() {
+        guard let location = gps.lastLocation else { return }
+        mapPosition = .region(MKCoordinateRegion(
+            center: location.coordinate,
+            span: MKCoordinateSpan(latitudeDelta: 0.02, longitudeDelta: 0.02)
+        ))
+    }
+
+    private var statusTint: Color {
+        switch gps.state {
+        case .ready: return .green
+        case .failed: return .red
+        case .unavailable: return .orange
+        case .idle: return .secondary
+        case .scanning, .connecting, .pairing, .reconnecting: return .blue
+        }
+    }
+
+    private static let dateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter
+    }()
 }
 
 private struct ActivityViewController: UIViewControllerRepresentable {
