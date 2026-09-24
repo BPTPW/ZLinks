@@ -6,7 +6,18 @@
 	objectVersion = 110;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		A1000000000000000000000E /* ZLinksLiveActivity.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = A10000000000000000000001 /* ZLinksLiveActivity.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
+		A1000000000000000000000B /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = C3F8D04D3052BD66000D6D84 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A10000000000000000000004;
+			remoteInfo = ZLinksLiveActivity;
+		};
 		C3F8D0633052BD6B000D6D84 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = C3F8D04D3052BD66000D6D84 /* Project object */;
@@ -23,13 +34,36 @@
 		};
 /* End PBXContainerItemProxy section */
 
+/* Begin PBXCopyFilesBuildPhase section */
+		A1000000000000000000000D /* Embed App Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			dstPath = "";
+			dstSubfolder = PlugIns;
+			files = (
+				A1000000000000000000000E /* ZLinksLiveActivity.appex in Embed App Extensions */,
+			);
+			name = "Embed App Extensions";
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
+		A10000000000000000000001 /* ZLinksLiveActivity.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = ZLinksLiveActivity.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		C3F8D0553052BD66000D6D84 /* ZLinks.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ZLinks.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		C3F8D0623052BD6B000D6D84 /* ZLinksTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ZLinksTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		C3F8D06C3052BD6B000D6D84 /* ZLinksUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ZLinksUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
+		A10000000000000000000002 /* ZLinksLiveActivity */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = ZLinksLiveActivity;
+			sourceTree = "<group>";
+		};
+		A10000000000000000000003 /* Shared */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = Shared;
+			sourceTree = "<group>";
+		};
 		C3F8D0573052BD66000D6D84 /* ZLinks */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = ZLinks;
@@ -48,6 +82,11 @@
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		A10000000000000000000006 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			files = (
+			);
+		};
 		C3F8D0523052BD66000D6D84 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
@@ -70,6 +109,8 @@
 			isa = PBXGroup;
 			children = (
 				C3F8D0573052BD66000D6D84 /* ZLinks */,
+				A10000000000000000000003 /* Shared */,
+				A10000000000000000000002 /* ZLinksLiveActivity */,
 				C3F8D0653052BD6B000D6D84 /* ZLinksTests */,
 				C3F8D06F3052BD6B000D6D84 /* ZLinksUITests */,
 				C3F8D0563052BD66000D6D84 /* Products */,
@@ -80,6 +121,7 @@
 			isa = PBXGroup;
 			children = (
 				C3F8D0553052BD66000D6D84 /* ZLinks.app */,
+				A10000000000000000000001 /* ZLinksLiveActivity.appex */,
 				C3F8D0623052BD6B000D6D84 /* ZLinksTests.xctest */,
 				C3F8D06C3052BD6B000D6D84 /* ZLinksUITests.xctest */,
 			);
@@ -89,6 +131,25 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		A10000000000000000000004 /* ZLinksLiveActivity */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A10000000000000000000008 /* Build configuration list for PBXNativeTarget "ZLinksLiveActivity" */;
+			buildPhases = (
+				A10000000000000000000005 /* Sources */,
+				A10000000000000000000006 /* Frameworks */,
+				A10000000000000000000007 /* Resources */,
+			);
+			buildRules = (
+			);
+			fileSystemSynchronizedGroups = (
+				A10000000000000000000002 /* ZLinksLiveActivity */,
+				A10000000000000000000003 /* Shared */,
+			);
+			name = ZLinksLiveActivity;
+			productName = ZLinksLiveActivity;
+			productReference = A10000000000000000000001 /* ZLinksLiveActivity.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 		C3F8D0543052BD66000D6D84 /* ZLinks */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = C3F8D0743052BD6B000D6D84 /* Build configuration list for PBXNativeTarget "ZLinks" */;
@@ -96,10 +157,15 @@
 				C3F8D0513052BD66000D6D84 /* Sources */,
 				C3F8D0523052BD66000D6D84 /* Frameworks */,
 				C3F8D0533052BD66000D6D84 /* Resources */,
+				A1000000000000000000000D /* Embed App Extensions */,
 			);
 			buildRules = (
 			);
+			dependencies = (
+				A1000000000000000000000C /* PBXTargetDependency */,
+			);
 			fileSystemSynchronizedGroups = (
+				A10000000000000000000003 /* Shared */,
 				C3F8D0573052BD66000D6D84 /* ZLinks */,
 			);
 			name = ZLinks;
@@ -159,6 +225,9 @@
 				LastSwiftUpdateCheck = 2700;
 				LastUpgradeCheck = 2700;
 				TargetAttributes = {
+					A10000000000000000000004 = {
+						CreatedOnToolsVersion = 27.0;
+					};
 					C3F8D0543052BD66000D6D84 = {
 						CreatedOnToolsVersion = 27.0;
 					};
@@ -187,6 +256,7 @@
 			projectRoot = "";
 			targets = (
 				C3F8D0543052BD66000D6D84 /* ZLinks */,
+				A10000000000000000000004 /* ZLinksLiveActivity */,
 				C3F8D0613052BD6B000D6D84 /* ZLinksTests */,
 				C3F8D06B3052BD6B000D6D84 /* ZLinksUITests */,
 			);
@@ -194,6 +264,11 @@
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		A10000000000000000000007 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			files = (
+			);
+		};
 		C3F8D0533052BD66000D6D84 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			files = (
@@ -212,6 +287,11 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		A10000000000000000000005 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			files = (
+			);
+		};
 		C3F8D0513052BD66000D6D84 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			files = (
@@ -230,6 +310,11 @@
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
+		A1000000000000000000000C /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A10000000000000000000004 /* ZLinksLiveActivity */;
+			targetProxy = A1000000000000000000000B /* PBXContainerItemProxy */;
+		};
 		C3F8D0643052BD6B000D6D84 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
 			target = C3F8D0543052BD66000D6D84 /* ZLinks */;
@@ -243,6 +328,70 @@
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
+		A10000000000000000000009 /* Debug configuration for PBXNativeTarget "ZLinksLiveActivity" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 93;
+				DEVELOPMENT_TEAM = CXKUBU37C3;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "ZLinksLiveActivity-Info.plist";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = cn.bptpw.ZLinks.LiveActivity;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		A1000000000000000000000A /* Release configuration for PBXNativeTarget "ZLinksLiveActivity" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 93;
+				DEVELOPMENT_TEAM = CXKUBU37C3;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "ZLinksLiveActivity-Info.plist";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = cn.bptpw.ZLinks.LiveActivity;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
 		C3F8D0723052BD6B000D6D84 /* Debug configuration for PBXProject "ZLinks" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -541,6 +690,14 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		A10000000000000000000008 /* Build configuration list for PBXNativeTarget "ZLinksLiveActivity" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A10000000000000000000009 /* Debug configuration for PBXNativeTarget "ZLinksLiveActivity" */,
+				A1000000000000000000000A /* Release configuration for PBXNativeTarget "ZLinksLiveActivity" */,
+			);
+			defaultConfigurationName = Release;
+		};
 		C3F8D0503052BD66000D6D84 /* Build configuration list for PBXProject "ZLinks" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (

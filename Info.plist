@@ -36,6 +36,8 @@
 	<string>ZLinks 需要获取位置并同步给相机。</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>ZLinks 需要将从相机下载的原始照片保存到你的相册。</string>
+	<key>NSSupportsLiveActivities</key>
+	<true/>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

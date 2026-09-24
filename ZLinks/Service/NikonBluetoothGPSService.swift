@@ -65,16 +65,21 @@ final class NikonBluetoothGPSService: NSObject, ObservableObject {
         }
     }
 
-    @Published private(set) var state: State = .idle
+    @Published private(set) var state: State = .idle {
+        didSet { updateLiveActivity() }
+    }
+
     @Published private(set) var cameraName: String?
     @Published private(set) var lastLocation: CLLocation?
     @Published private(set) var lastSyncDate: Date?
+    @Published private(set) var lastSyncedLocation: CLLocation?
     @Published private(set) var lastError: String?
     @Published var syncStrategy: SyncStrategy = .standard {
         didSet {
             UserDefaults.standard.set(syncStrategy.rawValue, forKey: Self.syncStrategyKey)
             appendLog("[ble-gps] 发送策略=\(syncStrategy.title) 间隔=\(Int(syncStrategy.interval))s")
             if canWriteGeo { startSyncLoop() }
+            updateLiveActivity()
         }
     }
 
@@ -125,12 +130,14 @@ final class NikonBluetoothGPSService: NSObject, ObservableObject {
     private var not1NotificationsEnabled = false
     private var canWriteGeo = false
     private var geoWriteInFlight = false
+    private var pendingGeoLocation: CLLocation?
     private var lastGeoWriteDate: Date?
     private var didReceiveStage4 = false
     private var didReceivePairingSuccess = false
     private var didWriteControllerID = false
     private var logHandler: ((String) -> Void)?
     private var shouldStayConnected = false
+    private let liveActivity = GPSLiveActivityController()
     private static let controllerDeviceKey = "nikon.ble.controller.device"
     private static let controllerNonceKey = "nikon.ble.controller.nonce"
     private static let peripheralIdentifierKey = "nikon.ble.peripheral.identifier"
@@ -160,6 +167,7 @@ final class NikonBluetoothGPSService: NSObject, ObservableObject {
     func start() {
         shouldStayConnected = true
         lastError = nil
+        liveActivity.start(with: liveActivityContentState)
         requestLocationAuthorization()
         locationManager.startUpdatingLocation()
         guard central.state == .poweredOn else {
@@ -209,11 +217,13 @@ final class NikonBluetoothGPSService: NSObject, ObservableObject {
         pairNotificationsEnabled = false; not1NotificationsEnabled = false
         canWriteGeo = false
         geoWriteInFlight = false
+        pendingGeoLocation = nil
         lastGeoWriteDate = nil
         didReceiveStage4 = false; didReceivePairingSuccess = false; didWriteControllerID = false
         pendingStage1 = nil; matchedSaltIndex = nil
         state = .idle
         locationManager.stopUpdatingLocation()
+        liveActivity.end(with: liveActivityContentState)
         appendLog("[ble-gps] 已断开")
     }
 
@@ -264,6 +274,7 @@ final class NikonBluetoothGPSService: NSObject, ObservableObject {
         }
         let payload = Self.makeGeoPayload(location: location, date: location.timestamp)
         geoWriteInFlight = true
+        pendingGeoLocation = location
         appendLog("[ble-gps] GEO 写入 bytes=\(payload.count) lat=\(location.coordinate.latitude) lon=\(location.coordinate.longitude)")
         peripheral.writeValue(payload, for: characteristic, type: .withResponse)
     }
@@ -339,6 +350,21 @@ final class NikonBluetoothGPSService: NSObject, ObservableObject {
     }
 
     private func appendLog(_ message: String) { logHandler?(message) }
+
+    private var liveActivityContentState: GPSLiveActivityAttributes.ContentState {
+        GPSLiveActivityAttributes.ContentState(
+            connectionStatus: state.title,
+            syncStrategy: syncStrategy.title,
+            lastSyncDate: lastSyncDate,
+            latitude: lastSyncedLocation?.coordinate.latitude,
+            longitude: lastSyncedLocation?.coordinate.longitude
+        )
+    }
+
+    private func updateLiveActivity() {
+        guard shouldStayConnected else { return }
+        liveActivity.update(with: liveActivityContentState)
+    }
 
     private var connectionOptions: [String: Any] {
         [
@@ -501,6 +527,7 @@ extension NikonBluetoothGPSService: CBCentralManagerDelegate {
         pairNotificationsEnabled = false; not1NotificationsEnabled = false
         canWriteGeo = false
         geoWriteInFlight = false
+        pendingGeoLocation = nil
         lastGeoWriteDate = nil
         didReceiveStage4 = false; didReceivePairingSuccess = false; didWriteControllerID = false
         idWriteTask?.cancel(); idWriteTask = nil
@@ -574,7 +601,10 @@ extension NikonBluetoothGPSService: CBPeripheralDelegate {
             guard let self else { return }
             if let error {
                 self.appendLog("[ble-gps] 写入失败 uuid=\(characteristic.uuid) error=\(error.localizedDescription)")
-                if characteristic.uuid == Self.geoUUID { self.geoWriteInFlight = false }
+                if characteristic.uuid == Self.geoUUID {
+                    self.geoWriteInFlight = false
+                    self.pendingGeoLocation = nil
+                }
                 if characteristic.uuid == Self.geoUUID { self.lastError = "相机拒绝 GPS：\(error.localizedDescription)"; self.state = .failed(self.lastError!) }
                 return
             }
@@ -596,6 +626,8 @@ extension NikonBluetoothGPSService: CBPeripheralDelegate {
             }
             if characteristic.uuid == Self.geoUUID {
                 self.geoWriteInFlight = false
+                self.lastSyncedLocation = self.pendingGeoLocation
+                self.pendingGeoLocation = nil
                 self.lastGeoWriteDate = Date()
                 self.lastSyncDate = Date()
                 if self.didReceivePairingSuccess {
@@ -604,6 +636,7 @@ extension NikonBluetoothGPSService: CBPeripheralDelegate {
                 } else {
                     self.appendLog("[ble-gps] GEO 的 GATT 写入已确认，但尚无 NOT1；不判定相机配对成功")
                 }
+                self.updateLiveActivity()
             }
         }
     }
