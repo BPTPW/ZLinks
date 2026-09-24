@@ -1111,7 +1111,7 @@ private struct BluetoothGPSConnectionView: View {
                     .font(.headline)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 10)
-                    .foregroundStyle(.primary)
+                    .foregroundStyle(Color(red: 1.5, green: 1, blue: 1))
             }
             .buttonStyle(.glassProminent)
             .tint(.red)
