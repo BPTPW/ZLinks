@@ -1983,15 +1983,11 @@ private struct GalleryMetadataMapView: View {
         .frame(maxWidth: .infinity)
         .frame(height: 200)
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .task(id: coordinateIdentifier) {
+        .task(id: mapCoordinateIdentifier) {
             if let name = await fetchPlaceName() {
                 placeName = name
             }
         }
-    }
-
-    private var coordinateIdentifier: String {
-        "\(coordinate.latitude),\(coordinate.longitude)"
     }
 
     private var mapCoordinateIdentifier: String {
@@ -2006,16 +2002,18 @@ private struct GalleryMetadataMapView: View {
     }
 
     private func fetchPlaceName() async -> String? {
-        let geocoder = CLGeocoder()
-        // CLGeocoder expects the source WGS-84 coordinate. Only the Map view
-        // uses the GCJ-02-adjusted coordinate; passing that value here would
-        // make the resolved place name drift by the map offset.
-        let location = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
+        let location = CLLocation(
+            latitude: mapCoordinate.latitude,
+            longitude: mapCoordinate.longitude
+        )
+        guard let request = MKReverseGeocodingRequest(location: location) else {
+            return nil
+        }
 
         do {
-            let placemarks = try await geocoder.reverseGeocodeLocation(location)
-            guard let placemark = placemarks.first else { return nil }
-            return placemark.name ?? placemark.locality
+            let mapItems = try await request.mapItems
+            guard let mapItem = mapItems.first else { return nil }
+            return mapItem.name ?? mapItem.addressRepresentations?.cityName
         } catch {
             return nil
         }
