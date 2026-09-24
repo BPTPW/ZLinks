@@ -1022,6 +1022,8 @@ struct CameraConnectionSheet: View {
 private struct BluetoothGPSConnectionView: View {
     @ObservedObject var camera: CameraConnectionService
     @Environment(\.dismiss) private var dismiss
+    @AppStorage(MapOffsetCorrectionMode.preferenceKey)
+    private var mapOffsetCorrectionMode = MapOffsetCorrectionMode.automatic
     @State private var mapPosition: MapCameraPosition = .automatic
 
     private var gps: NikonBluetoothGPSService { camera.bluetoothGPS }
@@ -1069,7 +1071,7 @@ private struct BluetoothGPSConnectionView: View {
 
                     Map(position: $mapPosition) {
                         if let location = gps.lastLocation {
-                            Marker("当前位置", coordinate: location.coordinate)
+                            Marker("当前位置", coordinate: mapCoordinate(for: location))
                                 .tint(.cyan)
                         }
                     }
@@ -1119,6 +1121,7 @@ private struct BluetoothGPSConnectionView: View {
         .interactiveDismissDisabled()
         .onAppear { recenterMap() }
         .onChange(of: gps.lastLocation?.timestamp) { _, _ in recenterMap() }
+        .onChange(of: mapOffsetCorrectionMode) { _, _ in recenterMap() }
     }
 
     private func locationSummary(_ location: CLLocation) -> some View {
@@ -1142,9 +1145,16 @@ private struct BluetoothGPSConnectionView: View {
     private func recenterMap() {
         guard let location = gps.lastLocation else { return }
         mapPosition = .region(MKCoordinateRegion(
-            center: location.coordinate,
+            center: mapCoordinate(for: location),
             span: MKCoordinateSpan(latitudeDelta: 0.02, longitudeDelta: 0.02)
         ))
+    }
+
+    private func mapCoordinate(for location: CLLocation) -> CLLocationCoordinate2D {
+        MapCoordinateCorrection.coordinateForMap(
+            location.coordinate,
+            mode: mapOffsetCorrectionMode
+        )
     }
 
     private var statusTint: Color {

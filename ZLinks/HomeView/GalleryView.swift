@@ -1966,17 +1966,20 @@ private struct GalleryMetadataSheet: View {
 
 private struct GalleryMetadataMapView: View {
     let coordinate: CLLocationCoordinate2D
+    @AppStorage(MapOffsetCorrectionMode.preferenceKey)
+    private var mapOffsetCorrectionMode = MapOffsetCorrectionMode.automatic
     @State private var placeName = "拍摄位置"
 
     var body: some View {
         Map(initialPosition: .region(
             MKCoordinateRegion(
-                center: coordinate,
+                center: mapCoordinate,
                 span: MKCoordinateSpan(latitudeDelta: 0.02, longitudeDelta: 0.02)
             )
         )) {
-            Marker(placeName, coordinate: coordinate)
+            Marker(placeName, coordinate: mapCoordinate)
         }
+        .id(mapCoordinateIdentifier)
         .frame(maxWidth: .infinity)
         .frame(height: 200)
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
@@ -1991,8 +1994,22 @@ private struct GalleryMetadataMapView: View {
         "\(coordinate.latitude),\(coordinate.longitude)"
     }
 
+    private var mapCoordinateIdentifier: String {
+        "\(mapOffsetCorrectionMode.rawValue),\(mapCoordinate.latitude),\(mapCoordinate.longitude)"
+    }
+
+    private var mapCoordinate: CLLocationCoordinate2D {
+        MapCoordinateCorrection.coordinateForMap(
+            coordinate,
+            mode: mapOffsetCorrectionMode
+        )
+    }
+
     private func fetchPlaceName() async -> String? {
         let geocoder = CLGeocoder()
+        // CLGeocoder expects the source WGS-84 coordinate. Only the Map view
+        // uses the GCJ-02-adjusted coordinate; passing that value here would
+        // make the resolved place name drift by the map offset.
         let location = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
 
         do {

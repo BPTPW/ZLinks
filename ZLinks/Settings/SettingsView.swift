@@ -41,6 +41,16 @@ struct SettingsView: View {
                         tint: .purple
                     )
                 }
+
+                NavigationLink {
+                    MoreSettingsView()
+                } label: {
+                    SettingsEntryLabel(
+                        title: "更多",
+                        symbol: "ellipsis",
+                        tint: .gray
+                    )
+                }
             }
         }
         .navigationTitle("设置")
