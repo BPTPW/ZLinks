@@ -1629,7 +1629,8 @@ final class CameraConnectionService: ObservableObject {
         }
         ThumbnailCacheService.shared.prepareForOriginalWork()
         if let originalFormat,
-           let cached = ThumbnailCacheService.shared.loadOriginal(handle: handle, format: originalFormat) {
+           let cached = ThumbnailCacheService.shared.loadOriginal(handle: handle, format: originalFormat)
+        {
             objectImageCache[handle] = cached
             return cached
         }
@@ -1688,7 +1689,8 @@ final class CameraConnectionService: ObservableObject {
         }
         ThumbnailCacheService.shared.prepareForOriginalWork()
         if let originalFormat,
-           let cached = ThumbnailCacheService.shared.loadOriginal(handle: handle, format: originalFormat) {
+           let cached = ThumbnailCacheService.shared.loadOriginal(handle: handle, format: originalFormat)
+        {
             objectImageCache[handle] = cached
             progress(UInt64(cached.count), UInt64(cached.count))
             return cached
@@ -1892,7 +1894,8 @@ final class CameraConnectionService: ObservableObject {
         ThumbnailCacheService.shared.prepareForOriginalWork()
         if let format = originalFormat(for: handle),
            let cached = ThumbnailCacheService.shared.loadOriginal(handle: handle, format: format),
-           let image = UIImage(data: cached) {
+           let image = UIImage(data: cached)
+        {
             objectImageCache[handle] = cached
             return image
         }

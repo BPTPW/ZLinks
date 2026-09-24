@@ -1079,6 +1079,23 @@ private struct BluetoothGPSConnectionView: View {
                         RoundedRectangle(cornerRadius: 22, style: .continuous)
                             .strokeBorder(.primary.opacity(0.12), lineWidth: 1)
                     }
+
+                    HStack(spacing: 12) {
+                        Label("同步策略", systemImage: "timer")
+                            .font(.headline)
+                        Spacer(minLength: 8)
+                        Picker("同步策略", selection: Binding(
+                            get: { gps.syncStrategy },
+                            set: { gps.syncStrategy = $0 }
+                        )) {
+                            ForEach(NikonBluetoothGPSService.SyncStrategy.allCases) { strategy in
+                                Text(strategy.title).tag(strategy)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .tint(.primary)
+                    }
+                    .padding(.horizontal, 4)
                 }
                 .padding(.horizontal, 20)
                 .padding(.bottom, 28)

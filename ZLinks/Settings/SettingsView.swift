@@ -13,7 +13,7 @@ struct SettingsView: View {
         List {
             Section {
                 NavigationLink {
-                    ConnectionSettingsView()
+                    ConnectionSettingsView(camera: camera)
                 } label: {
                     SettingsEntryLabel(
                         title: "连接",
