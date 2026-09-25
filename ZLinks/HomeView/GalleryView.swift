@@ -2121,12 +2121,13 @@ private struct GalleryThumbnailCell: View {
 @MainActor
 private final class GalleryDownloadStore: ObservableObject {
     enum Status: String, CaseIterable, Codable {
-        case waiting, downloading, cancelled, failed, completed
+        case waiting, downloading, paused, cancelled, failed, completed
 
         var title: String {
             switch self {
             case .waiting: return "等待"
             case .downloading: return "下载中"
+            case .paused: return "已暂停"
             case .cancelled: return "取消"
             case .failed: return "失败"
             case .completed: return "完成"
@@ -2219,6 +2220,7 @@ private final class GalleryDownloadStore: ObservableObject {
     private var worker: Task<Void, Never>?
     private var camera: CameraConnectionService?
     private var lastPersistedAt = Date.distantPast
+    private var isPaused = false
 
     private var persistenceURL: URL {
         let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -2232,8 +2234,16 @@ private final class GalleryDownloadStore: ObservableObject {
 
     var activeCount: Int {
         items.reduce(into: 0) { count, item in
-            if item.status == .waiting || item.status == .downloading { count += 1 }
+            if item.status == .waiting || item.status == .downloading || item.status == .paused { count += 1 }
         }
+    }
+
+    var canPauseAll: Bool {
+        items.contains { $0.status == .waiting || $0.status == .downloading }
+    }
+
+    var canResumeAll: Bool {
+        items.contains { $0.status == .paused }
     }
 
     func contains(handle: UInt32, format: GalleryDownloadFormat) -> Bool {
@@ -2294,7 +2304,29 @@ private final class GalleryDownloadStore: ObservableObject {
 
     func cameraStateChanged(_ camera: CameraConnectionService) {
         self.camera = camera
-        if case .connected = camera.state { startWorkerIfNeeded() }
+        if case .connected = camera.state, !isPaused { startWorkerIfNeeded() }
+    }
+
+    func pauseAll() {
+        guard canPauseAll else { return }
+        isPaused = true
+        worker?.cancel()
+        for index in items.indices where items[index].status == .waiting || items[index].status == .downloading {
+            items[index].status = .paused
+            items[index].task = nil
+        }
+        persistTasks()
+    }
+
+    func resumeAll() {
+        guard canResumeAll else { return }
+        isPaused = false
+        for index in items.indices where items[index].status == .paused {
+            items[index].status = .waiting
+            items[index].speed = 0
+        }
+        persistTasks()
+        startWorkerIfNeeded()
     }
 
     func cancel(_ id: String) {
@@ -2332,7 +2364,7 @@ private final class GalleryDownloadStore: ObservableObject {
     }
 
     private func startWorkerIfNeeded() {
-        guard worker == nil else { return }
+        guard worker == nil, !isPaused else { return }
         worker = Task { @MainActor [weak self] in
             guard let self else { return }
             while !Task.isCancelled {
@@ -2346,6 +2378,13 @@ private final class GalleryDownloadStore: ObservableObject {
             }
             self.worker = nil
             self.persistTasks()
+            if !self.isPaused,
+               let camera = self.camera,
+               case .connected = camera.state,
+               self.nextIndex != nil
+            {
+                self.startWorkerIfNeeded()
+            }
         }
     }
 
@@ -2438,7 +2477,7 @@ private final class GalleryDownloadStore: ObservableObject {
                 try await saveToPhotos(url: sourceURL)
             }
 
-            if let current = items.firstIndex(where: { $0.id == id }) {
+            if let current = items.firstIndex(where: { $0.id == id }), items[current].status == .downloading {
                 items[current].receivedBytes = items[current].fileSize
                 items[current].status = .completed
                 items[current].task = nil
@@ -2447,11 +2486,16 @@ private final class GalleryDownloadStore: ObservableObject {
             }
         } catch is CancellationError {
             if let current = items.firstIndex(where: { $0.id == id }), items[current].status == .downloading {
-                items[current].status = .cancelled
+                items[current].status = isPaused ? .paused : .cancelled
                 persistTasks()
             }
         } catch {
             if let current = items.firstIndex(where: { $0.id == id }) {
+                if items[current].status == .paused {
+                    items[current].task = nil
+                    persistTasks()
+                    return
+                }
                 if case .connected = camera.state {
                     items[current].status = .failed
                     items[current].errorMessage = error.localizedDescription
@@ -2637,7 +2681,24 @@ private struct DownloadTaskDrawer: View {
             }
             .navigationTitle("任务列表")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("完成") { dismiss() } } }
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    HStack(spacing: 16) {
+                        Button { store.pauseAll() } label: {
+                            Image(systemName: "pause.fill")
+                        }
+                        .disabled(!store.canPauseAll)
+                        .accessibilityLabel("全部暂停")
+
+                        Button { store.resumeAll() } label: {
+                            Image(systemName: "play.fill")
+                        }
+                        .disabled(!store.canResumeAll)
+                        .accessibilityLabel("全部开始")
+                    }
+                }
+                ToolbarItem(placement: .topBarTrailing) { Button("完成") { dismiss() } }
+            }
         }
     }
 
@@ -2651,7 +2712,7 @@ private struct DownloadTaskDrawer: View {
     }
 
     private func rank(_ status: GalleryDownloadStore.Status) -> Int {
-        switch status { case .downloading: return 0; case .waiting: return 1; case .failed: return 2; case .cancelled: return 3; case .completed: return 4 }
+        switch status { case .downloading: return 0; case .waiting: return 1; case .paused: return 2; case .failed: return 3; case .cancelled: return 4; case .completed: return 5 }
     }
 }
 
@@ -2676,11 +2737,13 @@ private struct DownloadTaskRow: View {
                         .foregroundStyle(.red)
                         .lineLimit(2)
                 }
-                if item.status == .downloading {
+                if item.status == .downloading || item.status == .paused {
                     ProgressView(value: item.fileSize > 0 ? Double(item.receivedBytes) / Double(item.fileSize) : 0)
                     HStack {
                         Spacer()
-                        Text("\(formatSpeed(item.speed))  \(formatBytes(item.receivedBytes))/\(formatBytes(item.fileSize))")
+                        Text(item.status == .paused
+                            ? "已暂停  \(formatBytes(item.receivedBytes))/\(formatBytes(item.fileSize))"
+                            : "\(formatSpeed(item.speed))  \(formatBytes(item.receivedBytes))/\(formatBytes(item.fileSize))")
                     }.font(.caption2).foregroundStyle(.secondary)
                 }
             }
