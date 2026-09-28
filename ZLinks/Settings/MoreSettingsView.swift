@@ -8,6 +8,8 @@ import SwiftUI
 struct MoreSettingsView: View {
     @AppStorage(MapOffsetCorrectionMode.preferenceKey)
     private var mapOffsetCorrectionMode = MapOffsetCorrectionMode.automatic
+    @AppStorage(MapLocationMarkerStyle.preferenceKey)
+    private var mapLocationMarkerStyle = MapLocationMarkerStyle.accuracyCircle
 
     var body: some View {
         List {
@@ -18,8 +20,19 @@ struct MoreSettingsView: View {
                     }
                 }
                 .pickerStyle(.menu)
+                .tint(.secondary)
+
+                Picker("标记样式", selection: $mapLocationMarkerStyle) {
+                    ForEach(MapLocationMarkerStyle.allCases) { style in
+                        Text(style.title).tag(style)
+                    }
+                }
+                .pickerStyle(.menu)
+                .tint(.secondary)
+            } header: {
+                Text("地图")
             } footer: {
-                Text("用于修正中国大陆 Apple 地图与 GPS、照片位置之间的坐标偏移。自动模式根据设备地区判断。")
+                Text("· 地图偏移修正: 位于中国大陆时，地图坐标系与实际坐标存在偏差，需要进行修正。")
             }
         }
         .navigationTitle("更多")

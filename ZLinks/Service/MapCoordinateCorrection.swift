@@ -24,6 +24,22 @@ enum MapOffsetCorrectionMode: String, CaseIterable, Identifiable {
     }
 }
 
+enum MapLocationMarkerStyle: String, CaseIterable, Identifiable {
+    case pin
+    case accuracyCircle
+
+    static let preferenceKey = "mapLocationMarkerStyle"
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .pin: "大头针"
+        case .accuracyCircle: "精度圆圈"
+        }
+    }
+}
+
 enum MapCoordinateCorrection {
     private static let earthRadius = 6_378_245.0
     private static let eccentricitySquared = 0.00669342162296594323

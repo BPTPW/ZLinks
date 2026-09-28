@@ -1024,6 +1024,8 @@ private struct BluetoothGPSConnectionView: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage(MapOffsetCorrectionMode.preferenceKey)
     private var mapOffsetCorrectionMode = MapOffsetCorrectionMode.automatic
+    @AppStorage(MapLocationMarkerStyle.preferenceKey)
+    private var mapLocationMarkerStyle = MapLocationMarkerStyle.accuracyCircle
     @State private var mapPosition: MapCameraPosition = .automatic
 
     private var gps: NikonBluetoothGPSService { camera.bluetoothGPS }
@@ -1071,8 +1073,7 @@ private struct BluetoothGPSConnectionView: View {
 
                     Map(position: $mapPosition) {
                         if let location = gps.lastLocation {
-                            Marker("当前位置", coordinate: mapCoordinate(for: location))
-                                .tint(.cyan)
+                            mapLocationContent(for: location)
                         }
                     }
                     .frame(minHeight: 260, maxHeight: 340)
@@ -1155,6 +1156,23 @@ private struct BluetoothGPSConnectionView: View {
             location.coordinate,
             mode: mapOffsetCorrectionMode
         )
+    }
+
+    @MapContentBuilder
+    private func mapLocationContent(for location: CLLocation) -> some MapContent {
+        let coordinate = mapCoordinate(for: location)
+        switch mapLocationMarkerStyle {
+        case .pin:
+            Marker("当前位置", coordinate: coordinate)
+                .tint(.cyan)
+        case .accuracyCircle:
+            MapCircle(
+                center: coordinate,
+                radius: max(location.horizontalAccuracy, 0)
+            )
+            .foregroundStyle(.blue.opacity(0.22))
+            .stroke(.blue, lineWidth: 2)
+        }
     }
 
     private var statusTint: Color {
