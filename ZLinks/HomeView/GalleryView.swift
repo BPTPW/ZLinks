@@ -2682,8 +2682,8 @@ private struct DownloadTaskDrawer: View {
             .navigationTitle("任务列表")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    HStack(spacing: 16) {
+                ToolbarItem(placement: .topBarTrailing) {
+                    HStack(spacing: 26) {
                         Button { store.pauseAll() } label: {
                             Image(systemName: "pause.fill")
                         }
@@ -2696,8 +2696,8 @@ private struct DownloadTaskDrawer: View {
                         .disabled(!store.canResumeAll)
                         .accessibilityLabel("全部开始")
                     }
+                    .padding(.horizontal, 5)
                 }
-                ToolbarItem(placement: .topBarTrailing) { Button("完成") { dismiss() } }
             }
         }
     }
