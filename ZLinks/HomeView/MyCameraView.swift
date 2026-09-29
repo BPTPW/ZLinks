@@ -1101,10 +1101,10 @@ private struct BluetoothGPSConnectionView: View {
                     }
 
                     HStack(spacing: 12) {
-                        Label("同步策略", systemImage: "timer")
+                        Label("同步频率", systemImage: "timer")
                             .font(.headline)
                         Spacer(minLength: 8)
-                        Picker("同步策略", selection: Binding(
+                        Picker("同步频率", selection: Binding(
                             get: { gps.syncStrategy },
                             set: { gps.syncStrategy = $0 }
                         )) {

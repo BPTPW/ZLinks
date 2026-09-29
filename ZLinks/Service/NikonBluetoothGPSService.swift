@@ -27,18 +27,26 @@ final class NikonBluetoothGPSService: NSObject, ObservableObject {
 
         var title: String {
             switch self {
-            case .powerSaving: return "省电"
-            case .standard: return "标准"
-            case .highFrequency: return "高频"
+            case .powerSaving: return "低"
+            case .standard: return "中"
+            case .highFrequency: return "高"
             }
         }
 
-        /// The minimum interval between successful GEO writes.
-        var interval: TimeInterval {
+        var baseDistanceFilter: CLLocationDistance {
             switch self {
-            case .powerSaving: return 60
-            case .standard: return 15
-            case .highFrequency: return 5
+            case .powerSaving: return 50
+            case .standard: return 25
+            case .highFrequency: return 10
+            }
+        }
+
+        func distanceFilter(for speed: CLLocationSpeed) -> CLLocationDistance {
+            guard speed >= 0 else { return baseDistanceFilter }
+            switch self {
+            case .powerSaving: return speed >= 70 ? 200 : speed >= 15 ? 100 : 50
+            case .standard: return speed >= 70 ? 150 : speed >= 15 ? 50 : 25
+            case .highFrequency: return speed >= 70 ? 100 : speed >= 15 ? 30 : 10
             }
         }
     }
@@ -77,8 +85,8 @@ final class NikonBluetoothGPSService: NSObject, ObservableObject {
     @Published var syncStrategy: SyncStrategy = .standard {
         didSet {
             UserDefaults.standard.set(syncStrategy.rawValue, forKey: Self.syncStrategyKey)
-            appendLog("[ble-gps] 发送策略=\(syncStrategy.title) 间隔=\(Int(syncStrategy.interval))s")
-            if canWriteGeo { startSyncLoop() }
+            updateDistanceFilter(using: lastLocation)
+            if canWriteGeo { Task { await writeLatestLocationIfAvailable() } }
             updateLiveActivity()
         }
     }
@@ -118,7 +126,7 @@ final class NikonBluetoothGPSService: NSObject, ObservableObject {
     private var geoCharacteristic: CBCharacteristic?
     private var not1Characteristic: CBCharacteristic?
     private var reconnectTask: Task<Void, Never>?
-    private var syncTask: Task<Void, Never>?
+    private var geoRetryTask: Task<Void, Never>?
     private var idWriteTask: Task<Void, Never>?
     private var pairingConfirmationTask: Task<Void, Never>?
     private var pendingStage1: Data?
@@ -131,7 +139,6 @@ final class NikonBluetoothGPSService: NSObject, ObservableObject {
     private var canWriteGeo = false
     private var geoWriteInFlight = false
     private var pendingGeoLocation: CLLocation?
-    private var lastGeoWriteDate: Date?
     private var didReceiveStage4 = false
     private var didReceivePairingSuccess = false
     private var didWriteControllerID = false
@@ -160,6 +167,11 @@ final class NikonBluetoothGPSService: NSObject, ObservableObject {
         } else {
             syncStrategy = .standard
         }
+        updateDistanceFilter(using: lastLocation)
+    }
+
+    private func updateDistanceFilter(using location: CLLocation?) {
+        locationManager.distanceFilter = syncStrategy.distanceFilter(for: location?.speed ?? -1)
     }
 
     func setLogHandler(_ handler: ((String) -> Void)?) { logHandler = handler }
@@ -208,7 +220,7 @@ final class NikonBluetoothGPSService: NSObject, ObservableObject {
     func disconnect() {
         shouldStayConnected = false
         reconnectTask?.cancel(); reconnectTask = nil
-        syncTask?.cancel(); syncTask = nil
+        geoRetryTask?.cancel(); geoRetryTask = nil
         idWriteTask?.cancel(); idWriteTask = nil
         pairingConfirmationTask?.cancel(); pairingConfirmationTask = nil
         if let peripheral { central.cancelPeripheralConnection(peripheral) }
@@ -218,7 +230,6 @@ final class NikonBluetoothGPSService: NSObject, ObservableObject {
         canWriteGeo = false
         geoWriteInFlight = false
         pendingGeoLocation = nil
-        lastGeoWriteDate = nil
         didReceiveStage4 = false; didReceivePairingSuccess = false; didWriteControllerID = false
         pendingStage1 = nil; matchedSaltIndex = nil
         state = .idle
@@ -248,26 +259,10 @@ final class NikonBluetoothGPSService: NSObject, ObservableObject {
         }
     }
 
-    private func startSyncLoop() {
-        syncTask?.cancel()
-        syncTask = Task { [weak self] in
-            while !Task.isCancelled {
-                if let self, self.canWriteGeo { await self.writeLatestLocationIfAvailable() }
-                let interval = self?.syncStrategy.interval ?? SyncStrategy.standard.interval
-                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
-            }
-        }
-    }
-
-    private func writeLatestLocationIfAvailable(force: Bool = false) async {
+    private func writeLatestLocationIfAvailable() async {
         guard let location = lastLocation, let characteristic = geoCharacteristic,
               let peripheral, peripheral.state == .connected else { return }
         guard !geoWriteInFlight else { return }
-        if !force, let lastGeoWriteDate,
-           Date().timeIntervalSince(lastGeoWriteDate) < syncStrategy.interval
-        {
-            return
-        }
         guard location.horizontalAccuracy >= 0, Date().timeIntervalSince(location.timestamp) < 120 else {
             appendLog("[ble-gps] 跳过过期或无效定位 age=\(Int(Date().timeIntervalSince(location.timestamp)))s accuracy=\(location.horizontalAccuracy)")
             return
@@ -275,8 +270,20 @@ final class NikonBluetoothGPSService: NSObject, ObservableObject {
         let payload = Self.makeGeoPayload(location: location, date: location.timestamp)
         geoWriteInFlight = true
         pendingGeoLocation = location
+        geoRetryTask?.cancel(); geoRetryTask = nil
         appendLog("[ble-gps] GEO 写入 bytes=\(payload.count) lat=\(location.coordinate.latitude) lon=\(location.coordinate.longitude)")
         peripheral.writeValue(payload, for: characteristic, type: .withResponse)
+    }
+
+    private func scheduleGeoRetry() {
+        guard canWriteGeo, let retryLocation = lastLocation else { return }
+        geoRetryTask?.cancel()
+        geoRetryTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(15))
+            guard let self, !Task.isCancelled, self.canWriteGeo,
+                  self.lastLocation?.timestamp == retryLocation.timestamp else { return }
+            await self.writeLatestLocationIfAvailable()
+        }
     }
 
     private func handlePairMessage(_ data: Data) {
@@ -528,7 +535,6 @@ extension NikonBluetoothGPSService: CBCentralManagerDelegate {
         canWriteGeo = false
         geoWriteInFlight = false
         pendingGeoLocation = nil
-        lastGeoWriteDate = nil
         didReceiveStage4 = false; didReceivePairingSuccess = false; didWriteControllerID = false
         idWriteTask?.cancel(); idWriteTask = nil
         pairingConfirmationTask?.cancel(); pairingConfirmationTask = nil
@@ -567,7 +573,7 @@ extension NikonBluetoothGPSService: CBPeripheralDelegate {
             }
             guard self.pairCharacteristic != nil, self.geoCharacteristic != nil else { self.failAndRetry("缺少 PAIR/GEO 特征"); return }
             self.state = .pairing; self.appendLog("[ble-gps] 特征已发现；如相机要求首次配对，将等待 PAIR challenge")
-            self.startSyncLoop()
+            Task { await self.writeLatestLocationIfAvailable() }
         }
     }
 
@@ -581,6 +587,7 @@ extension NikonBluetoothGPSService: CBPeripheralDelegate {
                 self.didReceivePairingSuccess = true
                 self.pairingConfirmationTask?.cancel(); self.pairingConfirmationTask = nil
                 if self.didReceiveStage4 { self.writeControllerID() }
+                if self.canWriteGeo { await self.writeLatestLocationIfAvailable() }
             }
         }
     }
@@ -604,6 +611,7 @@ extension NikonBluetoothGPSService: CBPeripheralDelegate {
                 if characteristic.uuid == Self.geoUUID {
                     self.geoWriteInFlight = false
                     self.pendingGeoLocation = nil
+                    self.scheduleGeoRetry()
                 }
                 if characteristic.uuid == Self.geoUUID { self.lastError = "相机拒绝 GPS：\(error.localizedDescription)"; self.state = .failed(self.lastError!) }
                 return
@@ -626,9 +634,9 @@ extension NikonBluetoothGPSService: CBPeripheralDelegate {
             }
             if characteristic.uuid == Self.geoUUID {
                 self.geoWriteInFlight = false
-                self.lastSyncedLocation = self.pendingGeoLocation
+                let sentLocation = self.pendingGeoLocation
+                self.lastSyncedLocation = sentLocation
                 self.pendingGeoLocation = nil
-                self.lastGeoWriteDate = Date()
                 self.lastSyncDate = Date()
                 if self.didReceivePairingSuccess {
                     self.lastError = nil
@@ -637,6 +645,9 @@ extension NikonBluetoothGPSService: CBPeripheralDelegate {
                     self.appendLog("[ble-gps] GEO 的 GATT 写入已确认，但尚无 NOT1；不判定相机配对成功")
                 }
                 self.updateLiveActivity()
+                if let sentLocation, self.lastLocation?.timestamp != sentLocation.timestamp {
+                    await self.writeLatestLocationIfAvailable()
+                }
             }
         }
     }
@@ -654,7 +665,9 @@ extension NikonBluetoothGPSService: CLLocationManagerDelegate {
     nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         Task { @MainActor [weak self] in
             guard let self else { return }
-            self.lastLocation = locations.last(where: { $0.horizontalAccuracy >= 0 })
+            guard let location = locations.last(where: { $0.horizontalAccuracy >= 0 }) else { return }
+            self.lastLocation = location
+            self.updateDistanceFilter(using: location)
             if self.canWriteGeo { await self.writeLatestLocationIfAvailable() }
         }
     }
