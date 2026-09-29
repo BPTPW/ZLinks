@@ -44,9 +44,9 @@ final class NikonBluetoothGPSService: NSObject, ObservableObject {
         func distanceFilter(for speed: CLLocationSpeed) -> CLLocationDistance {
             guard speed >= 0 else { return baseDistanceFilter }
             switch self {
-            case .powerSaving: return speed >= 70 ? 200 : speed >= 15 ? 100 : 50
-            case .standard: return speed >= 70 ? 150 : speed >= 15 ? 50 : 25
-            case .highFrequency: return speed >= 70 ? 100 : speed >= 15 ? 30 : 10
+            case .powerSaving: return speed >= 15 ? 200 : speed >= 5 ? 100 : 50
+            case .standard: return speed >= 15 ? 150 : speed >= 5 ? 50 : 25
+            case .highFrequency: return speed >= 15 ? 100 : speed >= 5 ? 30 : 10
             }
         }
     }
