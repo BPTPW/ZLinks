@@ -1027,8 +1027,25 @@ private struct BluetoothGPSConnectionView: View {
     @AppStorage(MapLocationMarkerStyle.preferenceKey)
     private var mapLocationMarkerStyle = MapLocationMarkerStyle.accuracyCircle
     @State private var mapPosition: MapCameraPosition = .automatic
+    @State private var coordinateFormat: CoordinateFormat = .degrees
+    @State private var placeName: String?
+    @State private var placeLookupFailed = false
 
     private var gps: NikonBluetoothGPSService { camera.bluetoothGPS }
+
+    private enum CoordinateFormat {
+        case degrees
+        case degreesMinutes
+        case degreesMinutesSeconds
+
+        var next: CoordinateFormat {
+            switch self {
+            case .degrees: .degreesMinutes
+            case .degreesMinutes: .degreesMinutesSeconds
+            case .degreesMinutesSeconds: .degrees
+            }
+        }
+    }
 
     var body: some View {
         ZStack {
@@ -1128,8 +1145,21 @@ private struct BluetoothGPSConnectionView: View {
 
     private func locationSummary(_ location: CLLocation) -> some View {
         VStack(alignment: .leading, spacing: 9) {
-            Text(String(format: "纬度 %.6f， 经度 %.6f", location.coordinate.latitude, location.coordinate.longitude))
-                .font(.headline.monospacedDigit())
+            Button {
+                coordinateFormat = coordinateFormat.next
+            } label: {
+                Text(formattedCoordinates(location.coordinate))
+                    .font(.headline.monospacedDigit())
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("坐标，\(coordinateFormatAccessibilityName)")
+            .accessibilityHint("轻点切换坐标格式")
+            Text(placeName ?? (placeLookupFailed ? "未能识别位置" : "定位中…"))
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
             Text(String(format: "误差 %.1f 米", max(location.horizontalAccuracy, 0)))
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
@@ -1142,6 +1172,79 @@ private struct BluetoothGPSConnectionView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(16)
         .background(.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .task(id: reverseGeocodingKey(for: location.coordinate)) {
+            placeName = nil
+            placeLookupFailed = false
+            guard let name = await fetchPlaceName(for: location.coordinate) else {
+                if !Task.isCancelled { placeLookupFailed = true }
+                return
+            }
+            guard !Task.isCancelled else { return }
+            placeName = name
+        }
+    }
+
+    private func reverseGeocodingKey(for coordinate: CLLocationCoordinate2D) -> String {
+        "\(Int((coordinate.latitude * 1_000).rounded())),\(Int((coordinate.longitude * 1_000).rounded()))"
+    }
+
+    private var coordinateFormatAccessibilityName: String {
+        switch coordinateFormat {
+        case .degrees: "度"
+        case .degreesMinutes: "度分"
+        case .degreesMinutesSeconds: "度分秒"
+        }
+    }
+
+    private func formattedCoordinates(_ coordinate: CLLocationCoordinate2D) -> String {
+        "\(formattedCoordinate(coordinate.latitude, isLatitude: true))    \(formattedCoordinate(coordinate.longitude, isLatitude: false))"
+    }
+
+    private func formattedCoordinate(_ value: CLLocationDegrees, isLatitude: Bool) -> String {
+        let absoluteValue = abs(value)
+        let degrees = Int(absoluteValue)
+        let hemisphere = isLatitude
+            ? (value < 0 ? "S" : "N")
+            : (value < 0 ? "W" : "E")
+
+        switch coordinateFormat {
+        case .degrees:
+            return String(format: "%.5f°%@", locale: Locale(identifier: "en_US_POSIX"), absoluteValue, hemisphere)
+        case .degreesMinutes:
+            let minutes = (absoluteValue - Double(degrees)) * 60
+            return String(format: "%d°%.4f′%@", locale: Locale(identifier: "en_US_POSIX"), degrees, minutes, hemisphere)
+        case .degreesMinutesSeconds:
+            let totalMinutes = (absoluteValue - Double(degrees)) * 60
+            let minutes = Int(totalMinutes)
+            let seconds = (totalMinutes - Double(minutes)) * 60
+            return String(format: "%d°%d′%04.2f″%@", locale: Locale(identifier: "en_US_POSIX"), degrees, minutes, seconds, hemisphere)
+        }
+    }
+
+    private func fetchPlaceName(for coordinate: CLLocationCoordinate2D) async -> String? {
+        let location = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
+        guard let request = MKReverseGeocodingRequest(location: location) else { return nil }
+        do {
+            let mapItems = try await request.mapItems
+            guard let mapItem = mapItems.first else { return nil }
+            let placemark = mapItem.placemark
+            let components = [
+                placemark.administrativeArea,
+                placemark.locality,
+                placemark.subAdministrativeArea ?? placemark.subLocality,
+                mapItem.name ?? placemark.name
+            ]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .reduce(into: [String]()) { uniqueComponents, component in
+                if !uniqueComponents.contains(where: { $0.localizedCaseInsensitiveCompare(component) == .orderedSame }) {
+                    uniqueComponents.append(component)
+                }
+            }
+            return components.isEmpty ? nil : components.joined(separator: " ")
+        } catch {
+            return nil
+        }
     }
 
     private func recenterMap() {
