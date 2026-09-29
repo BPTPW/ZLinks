@@ -1123,6 +1123,7 @@ private struct BluetoothGPSConnectionView: View {
         .onAppear { recenterMap() }
         .onChange(of: gps.lastLocation?.timestamp) { _, _ in recenterMap() }
         .onChange(of: mapOffsetCorrectionMode) { _, _ in recenterMap() }
+        .onChange(of: mapLocationMarkerStyle) { _, _ in recenterMap() }
     }
 
     private func locationSummary(_ location: CLLocation) -> some View {
@@ -1145,10 +1146,36 @@ private struct BluetoothGPSConnectionView: View {
 
     private func recenterMap() {
         guard let location = gps.lastLocation else { return }
-        mapPosition = .region(MKCoordinateRegion(
-            center: mapCoordinate(for: location),
-            span: MKCoordinateSpan(latitudeDelta: 0.02, longitudeDelta: 0.02)
-        ))
+        let coordinate = mapCoordinate(for: location)
+        withAnimation(.smooth(duration: 0.8)) {
+            switch mapLocationMarkerStyle {
+            case .pin:
+                mapPosition = .region(MKCoordinateRegion(
+                    center: coordinate,
+                    span: MKCoordinateSpan(latitudeDelta: 0.02, longitudeDelta: 0.02)
+                ))
+            case .accuracyCircle:
+                mapPosition = .camera(
+                    MapCamera(
+                        centerCoordinate: coordinate,
+                        distance: mapDistance(for: location)
+                    )
+                )
+            }
+        }
+    }
+
+    private func mapDistance(for location: CLLocation) -> CLLocationDistance {
+        let accuracy = mapAccuracy(for: location)
+        let logAccuracy = log10(accuracy)
+        let weight = 1 / (1 + exp(-4 * (logAccuracy - 3)))
+        let distance = (1 - weight) * (2000 * logAccuracy - 1000)
+            + weight * (5 * accuracy)
+        return max(distance, 1000)
+    }
+
+    private func mapAccuracy(for location: CLLocation) -> CLLocationDistance {
+        max(location.horizontalAccuracy, 1)
     }
 
     private func mapCoordinate(for location: CLLocation) -> CLLocationCoordinate2D {
@@ -1168,7 +1195,7 @@ private struct BluetoothGPSConnectionView: View {
         case .accuracyCircle:
             MapCircle(
                 center: coordinate,
-                radius: max(location.horizontalAccuracy, 0)
+                radius: mapAccuracy(for: location)
             )
             .foregroundStyle(.blue.opacity(0.22))
             .stroke(.blue, lineWidth: 2)
