@@ -214,7 +214,7 @@ struct MyCameraView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("GPS同步")
                         .font(.headline.weight(.semibold))
-                    Text("蓝牙配对相机并进行gps同步")
+                    Text("蓝牙配对相机并进行定位同步")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
